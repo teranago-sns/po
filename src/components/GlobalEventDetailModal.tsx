@@ -1,0 +1,612 @@
+import React, { useEffect, useState } from 'react';
+import { 
+  X, 
+  Calendar as CalendarIcon, 
+  Clock, 
+  MapPin, 
+  ExternalLink, 
+  FileText, 
+  Users, 
+  Building2, 
+  Tag, 
+  Edit2, 
+  Paperclip, 
+  Repeat, 
+  Copy, 
+  Trash2, 
+  UserCheck, 
+  Link2,
+  Lock,
+  Eye,
+  HardHat
+} from 'lucide-react';
+import { CalendarEvent, EventType, User, AttachmentFile } from '../types';
+import { getAvatarUrl, handleAvatarError } from '../utils/avatar';
+import { getRecurrenceLabel, isRecurringEvent, isExpandedRecurrenceId, extractDateFromInstanceId } from '../utils/recurrenceUtils';
+import { renderContentWithLinks } from '../utils/renderContentWithLinks';
+import { markEventAsRead } from '../utils/notifications';
+import { triggerOpenUserModal } from '../utils/userModal';
+import { FilePreviewModal } from './FilePreviewModal';
+import { isPreviewable } from '../utils/fileUpload';
+import { formatTimeJST, getLocalDateStr } from '../utils/dateUtils';
+import { RecurrenceActionModal, RecurrenceActionScope } from './RecurrenceActionModal';
+import { ConfirmModal } from './ConfirmModal';
+
+export interface GlobalEventDetailModalProps {
+  isOpen: boolean;
+  event: CalendarEvent | null;
+  onClose: () => void;
+  onEdit?: (event: CalendarEvent) => void;
+  onCopyAndAdd?: (event: CalendarEvent) => void;
+  onDelete?: (event: CalendarEvent, scope?: RecurrenceActionScope, instanceDate?: string) => void;
+  onEditInCalendar?: (eventId: string) => void;
+  onNavigateToSite?: (siteIdOrCode: string) => void;
+  currentUser?: User;
+  teamDeleteMember?: User | null;
+  onRequestTeamDelete?: (event: CalendarEvent, targetMember: User) => void;
+}
+
+const typeStyles: Record<EventType, string> = {
+  personal: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  construction: 'bg-amber-50 text-amber-700 border-amber-200',
+  inspection: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+  replacement: 'bg-cyan-50 text-cyan-700 border-cyan-200',
+  repair: 'bg-rose-50 text-rose-700 border-rose-200',
+  visitor: 'bg-orange-50 text-orange-700 border-orange-200',
+  business_trip: 'bg-sky-50 text-sky-700 border-sky-200',
+  meeting: 'bg-violet-50 text-violet-700 border-violet-200'
+};
+
+const typeLabels: Record<EventType, string> = {
+  personal: '個人用務',
+  construction: '工事予定',
+  inspection: '点検検査',
+  replacement: '機器交換',
+  repair: '修理・保守',
+  visitor: '来客・応対',
+  business_trip: '出張予定',
+  meeting: '会議・打合せ'
+};
+
+export function GlobalEventDetailModal({
+  isOpen,
+  event,
+  onClose,
+  onEdit,
+  onCopyAndAdd,
+  onDelete,
+  onEditInCalendar,
+  onNavigateToSite,
+  currentUser,
+  teamDeleteMember,
+  onRequestTeamDelete,
+}: GlobalEventDetailModalProps) {
+  const [previewFile, setPreviewFile] = useState<AttachmentFile | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [isRecurrenceModalOpen, setIsRecurrenceModalOpen] = useState(false);
+  const [isConfirmDeleteOpen, setIsConfirmDeleteOpen] = useState(false);
+
+  useEffect(() => {
+    if (isOpen && event && currentUser?.id) {
+      markEventAsRead(currentUser.id, event.id);
+      if (event.recurrenceParentId) {
+        markEventAsRead(currentUser.id, event.recurrenceParentId);
+      }
+    }
+  }, [isOpen, event, currentUser?.id]);
+
+  if (!isOpen || !event) return null;
+
+  const isRecurring = Boolean(
+    isRecurringEvent(event) ||
+    isExpandedRecurrenceId(event.id) ||
+    event.recurrenceParentId ||
+    event.instanceDate ||
+    (event.recurrence && event.recurrence.frequency && event.recurrence.frequency !== 'none')
+  );
+
+  const currentInstanceDate = event.instanceDate || (
+    isExpandedRecurrenceId(event.id)
+      ? extractDateFromInstanceId(event.id)
+      : (event.start ? getLocalDateStr(new Date(event.start)) : undefined)
+  );
+
+  const handleDeleteClick = () => {
+    if (!event || !onDelete) return;
+    if (teamDeleteMember && onRequestTeamDelete) {
+      const attendees = event.attendees || [];
+      const uniqueAttendeeIds = new Set(attendees.map(a => String(a.id)));
+      const isTargetIncluded = attendees.some(
+        a => String(a.id) === String(teamDeleteMember.id) || (a.name && a.name === teamDeleteMember.name)
+      );
+      const remainingCount = attendees.filter(
+        a => String(a.id) !== String(teamDeleteMember.id)
+      ).length;
+      if (uniqueAttendeeIds.size > 1 && isTargetIncluded && remainingCount > 0) {
+        onRequestTeamDelete(event, teamDeleteMember);
+        return;
+      }
+    }
+    if (isRecurring) {
+      setIsRecurrenceModalOpen(true);
+    } else {
+      setIsConfirmDeleteOpen(true);
+    }
+  };
+
+  const handleConfirmRecurrenceDelete = (scope: RecurrenceActionScope) => {
+    setIsRecurrenceModalOpen(false);
+    if (event && onDelete) {
+      onDelete(event, scope, currentInstanceDate);
+      onClose();
+    }
+  };
+
+  const handleConfirmSingleDelete = () => {
+    setIsConfirmDeleteOpen(false);
+    if (event && onDelete) {
+      onDelete(event, 'all', currentInstanceDate);
+      onClose();
+    }
+  };
+
+  const formatDateWithDay = (isoStr?: string, includeTime = true) => {
+    if (!isoStr) return '';
+    const d = new Date(isoStr);
+    if (isNaN(d.getTime())) return isoStr;
+    const days = ['日', '月', '火', '水', '木', '金', '土'];
+    const ymd = getLocalDateStr(d);
+    if (!ymd) return isoStr;
+    const [y, m, date] = ymd.split('-').map(Number);
+    const jstNoon = new Date(`${ymd}T12:00:00+09:00`);
+    const day = days[jstNoon.getDay()];
+    if (!includeTime) {
+      return `${y}年${m}月${date}日(${day})`;
+    }
+    const timeStr = formatTimeJST(d);
+    return `${y}年${m}月${date}日(${day}) ${timeStr}`;
+  };
+
+  const formatTimeOnly = (isoStr?: string) => {
+    if (!isoStr) return '';
+    return formatTimeJST(isoStr);
+  };
+
+  const getStyle = () => {
+    return typeStyles[event.type] || 'bg-slate-50 text-slate-700 border-slate-200';
+  };
+
+  const getLabel = () => {
+    return typeLabels[event.type] || '予定';
+  };
+
+  const isSameDay = (startIso?: string, endIso?: string) => {
+    if (!startIso || !endIso) return true;
+    return getLocalDateStr(startIso) === getLocalDateStr(endIso);
+  };
+
+  const isIcal = event.isIcal === true;
+
+  return (
+    <div 
+      onClick={onClose}
+      className="fixed inset-0 z-[100] flex items-center justify-center p-3 sm:p-4 bg-slate-900/60 backdrop-blur-xs"
+    >
+      <div 
+        onClick={(e) => e.stopPropagation()}
+        className="relative w-full max-w-lg sm:max-w-xl bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden animate-in fade-in-50 zoom-in-95 duration-200 flex flex-col max-h-[90vh]"
+      >
+        
+        {/* Header bar */}
+        <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/80 shrink-0">
+          <div className="flex items-center flex-wrap gap-2">
+            <span className={`px-2.5 py-1 rounded-lg text-xs font-bold border ${getStyle()}`}>
+              {getLabel()}
+            </span>
+            {event.isAllDay && (
+              <span className="px-2 py-0.5 rounded-md text-[11px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                終日
+              </span>
+            )}
+            {isRecurringEvent(event) && event.recurrence && event.recurrence.frequency !== 'none' && (
+              <span className="px-2 py-0.5 rounded-md text-[11px] font-bold bg-purple-50 text-purple-700 border border-purple-200 flex items-center gap-1">
+                <Repeat className="w-3 h-3" />
+                定期予定
+              </span>
+            )}
+            {(event.isPrivate || (event as any).isSecret) && (
+              <span className="px-2 py-0.5 rounded-md text-[11px] font-bold bg-amber-50 text-amber-800 border border-amber-200 flex items-center gap-1">
+                <Lock className="w-3 h-3 text-amber-600" />
+                非公開（他人から隠す）
+              </span>
+            )}
+            {isIcal && (
+              <span className="px-2 py-0.5 rounded-md text-[11px] font-bold bg-slate-100 text-slate-600 border border-slate-200 flex items-center gap-1">
+                <Link2 className="w-3 h-3" />
+                iCal連携
+              </span>
+            )}
+            {event.constructionPhase === 'new' && (
+              <span className="px-2.5 py-0.5 rounded-md text-[11px] font-black bg-emerald-600 text-white shadow-2xs">
+                【新規乗り込み】
+              </span>
+            )}
+            {event.constructionPhase === 'remaining' && (
+              <span className="px-2.5 py-0.5 rounded-md text-[11px] font-black bg-amber-500 text-white shadow-2xs">
+                【残工事】
+              </span>
+            )}
+            {event.constructionPhase === 'shukko' && (
+              <span className="px-2.5 py-0.5 rounded-md text-[11px] font-black bg-indigo-600 text-white shadow-2xs">
+                【出庫有】
+              </span>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-200/60 transition-colors cursor-pointer"
+            title="閉じる"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Scrollable Content */}
+        <div className="p-5 sm:p-6 space-y-4 overflow-y-auto flex-1">
+          {/* Title */}
+          <div>
+            <h3 className="text-lg sm:text-xl font-bold text-slate-900 leading-snug">
+              {event.title}
+            </h3>
+          </div>
+
+          {/* Key Info Card */}
+          <div className="space-y-3 bg-slate-50 p-4 rounded-xl border border-slate-200/70">
+            {/* Start & End Date Time */}
+            <div className="flex items-start gap-2.5 text-sm text-slate-700">
+              <Clock className="w-4.5 h-4.5 text-indigo-500 shrink-0 mt-0.5" />
+              <div>
+                {event.isAllDay ? (
+                  <div className="font-bold text-slate-800">
+                    {isSameDay(event.start, event.end) ? (
+                      formatDateWithDay(event.start, false)
+                    ) : (
+                      <>
+                        {formatDateWithDay(event.start, false)} 〜 {formatDateWithDay(event.end, false)}
+                      </>
+                    )}
+                    <span className="ml-2 text-xs font-semibold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-md">
+                      終日
+                    </span>
+                  </div>
+                ) : (
+                  <div className="font-bold text-slate-800">
+                    {isSameDay(event.start, event.end) ? (
+                      <>
+                        {formatDateWithDay(event.start, true)} 〜 {formatTimeOnly(event.end)}
+                      </>
+                    ) : (
+                      <>
+                        {formatDateWithDay(event.start, true)} 〜 {formatDateWithDay(event.end, true)}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Recurrence Rule Detail */}
+            {isRecurringEvent(event) && event.recurrence && event.recurrence.frequency !== 'none' && (
+              <div className="flex items-center gap-2.5 text-xs text-purple-800 border-t border-slate-200/60 pt-2.5">
+                <Repeat className="w-4 h-4 text-purple-600 shrink-0" />
+                <span className="font-semibold bg-purple-50 text-purple-700 px-2 py-0.5 rounded-md">
+                  繰り返し: {getRecurrenceLabel(event.recurrence)}
+                </span>
+              </div>
+            )}
+
+            {/* Target Office & Division */}
+            {(event.office || event.division) && (
+              <div className="flex items-center gap-2.5 text-xs text-slate-700 border-t border-slate-200/60 pt-2.5">
+                <Building2 className="w-4 h-4 text-slate-400 shrink-0" />
+                <span className="font-medium text-slate-700">
+                  対象: <span className="font-bold">{event.office || '全社'}</span> / <span className="font-bold">{event.division || '全部署'}</span>
+                </span>
+              </div>
+            )}
+
+            {/* Location */}
+            {event.location && (
+              <div className="flex items-center gap-2.5 text-xs text-slate-700 border-t border-slate-200/60 pt-2.5">
+                <MapPin className="w-4 h-4 text-rose-500 shrink-0" />
+                <span className="font-medium text-slate-800">{event.location}</span>
+              </div>
+            )}
+
+            {/* External URL */}
+            {event.url && (
+              <div className="flex items-center gap-2.5 text-xs text-slate-700 border-t border-slate-200/60 pt-2.5">
+                <ExternalLink className="w-4 h-4 text-indigo-500 shrink-0" />
+                <a
+                  href={event.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-semibold text-indigo-600 hover:underline flex items-center gap-1"
+                >
+                  {event.url}
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            )}
+
+            {/* 現場連携情報 */}
+            {(event.siteId || event.siteCode || event.siteName) && (
+              <div className="flex items-start gap-2.5 text-xs text-slate-700 border-t border-slate-200/60 pt-2.5 bg-amber-50/60 -mx-4 -mb-4 p-3 rounded-b-xl border-amber-200/50">
+                <HardHat className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[10px] font-bold px-1.5 py-0.5 bg-amber-200/70 text-amber-900 rounded font-mono">
+                        {event.siteCode || '現場未定'}
+                      </span>
+                      <span className="font-extrabold text-slate-900 truncate">
+                        {event.siteName || '現場名未設定'}
+                      </span>
+                      {event.constructionPhase && (
+                        <span className={`text-[10px] font-black px-1.5 py-0.2 rounded text-white ${
+                          event.constructionPhase === 'new' ? 'bg-emerald-600' :
+                          event.constructionPhase === 'remaining' ? 'bg-amber-500' : 'bg-indigo-600'
+                        }`}>
+                          {event.constructionPhase === 'new' ? '新規' : event.constructionPhase === 'remaining' ? '残' : '出庫有'}
+                        </span>
+                      )}
+                    </div>
+
+                    {onNavigateToSite && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onClose();
+                          onNavigateToSite(event.siteId || event.siteCode || event.siteName || '');
+                        }}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-bold text-amber-900 bg-amber-200/80 hover:bg-amber-300 rounded-lg shadow-2xs hover:shadow-xs transition-all cursor-pointer shrink-0"
+                        title="現場管理画面を開いてこの現場の詳細を確認"
+                      >
+                        <Building2 className="w-3.5 h-3.5 text-amber-800" />
+                        <span>現場管理を開く</span>
+                        <ExternalLink className="w-3 h-3 text-amber-800" />
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    この予定は現場管理システムと連携しています。ボタンを押すと該当現場の進捗・主要部品情報を確認できます。
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Registered / Created by */}
+            {(event.createdBy || event.createdViaInspection || (event.type === 'inspection' && event.targetYearMonth)) && (
+              <div className="flex items-center gap-2.5 text-xs text-slate-600 border-t border-slate-200/60 pt-2.5">
+                <UserCheck className="w-4 h-4 text-slate-400 shrink-0" />
+                <span>
+                  登録者:{' '}
+                  {event.createdBy && !event.createdViaInspection && !(event.type === 'inspection' && event.targetYearMonth) ? (
+                    <button
+                      type="button"
+                      onClick={() => triggerOpenUserModal(event.createdBy!)}
+                      className="font-bold text-slate-800 hover:text-indigo-600 cursor-pointer underline transition-colors"
+                      title={`${event.createdBy.name}のプロフィールを表示`}
+                    >
+                      {event.createdBy.name}
+                    </button>
+                  ) : (
+                    <strong className="text-slate-800">
+                      {(event.createdViaInspection || (event.createdBy && event.createdBy.name === '点検登録') || (event.type === 'inspection' && event.targetYearMonth))
+                        ? '点検登録'
+                        : event.createdBy?.name || '不明'}
+                    </strong>
+                  )}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Attendees */}
+          {event.attendees && event.attendees.length > 0 && (
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
+                <Users className="w-4 h-4 text-indigo-500" />
+                参加者 ({event.attendees.length}名)
+              </h4>
+              <div className="flex flex-wrap gap-2 p-3 bg-white border border-slate-200 rounded-xl">
+                {event.attendees.map((user: User) => (
+                  <div
+                    key={user.id}
+                    onClick={() => triggerOpenUserModal(user)}
+                    className="flex items-center gap-1.5 bg-slate-50 hover:bg-indigo-50/60 border border-slate-150 hover:border-indigo-200 pl-1.5 pr-2.5 py-1 rounded-lg text-xs font-semibold text-slate-700 hover:text-indigo-700 cursor-pointer transition-all group/attendee"
+                    title={`${user.name}のプロフィールを表示`}
+                  >
+                    <img
+                      src={getAvatarUrl(user.id === currentUser?.id ? (currentUser?.avatarUrl || user.avatarUrl) : user.avatarUrl)}
+                      alt={user.name}
+                      onError={handleAvatarError}
+                      referrerPolicy="no-referrer"
+                      className="w-5 h-5 rounded-full object-cover group-hover/attendee:ring-1 ring-indigo-200"
+                    />
+                    <span>{user.name}</span>
+                    {user.department && <span className="text-[10px] text-slate-400">({user.department})</span>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Memo / Description */}
+          {event.memo && (
+            <div className="space-y-2">
+              <h4 className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
+                <FileText className="w-4 h-4 text-indigo-500" />
+                詳細・メモ
+              </h4>
+              <div className="p-4 bg-slate-50 border border-slate-200/80 rounded-xl text-xs text-slate-700 whitespace-pre-wrap leading-relaxed">
+                {renderContentWithLinks(event.memo)}
+              </div>
+            </div>
+          )}
+
+          {/* Attachments Section */}
+          {event.attachments && event.attachments.length > 0 && (
+            <div className="space-y-2 border-t border-slate-100 pt-3">
+              <h4 className="text-xs font-bold text-slate-500 flex items-center gap-1.5">
+                <Paperclip className="w-4 h-4 text-indigo-500" />
+                添付ファイル ({event.attachments.length})
+              </h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {event.attachments.map(att => (
+                  <div
+                    key={att.id}
+                    className="flex items-center justify-between p-3 bg-white border border-slate-200 hover:border-indigo-300 rounded-xl transition-all"
+                  >
+                    <div className="flex items-center gap-2 min-w-0 pr-2">
+                      <Paperclip className="w-4 h-4 text-slate-400 shrink-0" />
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-slate-800 truncate">{att.name}</div>
+                        <div className="text-[10px] text-slate-400">{att.size}</div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {isPreviewable(att.name, att.type) && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setPreviewFile(att);
+                            setIsPreviewOpen(true);
+                          }}
+                          className="px-2.5 py-1 text-[11px] font-bold text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors shrink-0 flex items-center gap-1 cursor-pointer border border-emerald-200"
+                        >
+                          <Eye className="w-3 h-3" />
+                          プレビュー
+                        </button>
+                      )}
+                      <a
+                        href={att.url || '#'}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        download={att.name}
+                        className="px-2.5 py-1 text-[11px] font-bold text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors shrink-0"
+                      >
+                        ダウンロード
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer controls */}
+        <div className="p-4 bg-slate-50 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2.5 shrink-0">
+          <div className="flex items-center gap-2">
+            {onDelete && !isIcal && (
+              <button
+                type="button"
+                onClick={handleDeleteClick}
+                className="flex items-center gap-1.5 px-3 py-2 text-xs font-bold text-rose-600 hover:text-rose-700 hover:bg-rose-50 border border-rose-200 rounded-xl transition-all cursor-pointer"
+                title="予定を削除します"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                削除
+              </button>
+            )}
+            {onEditInCalendar && (
+              <button
+                type="button"
+                onClick={() => {
+                  onEditInCalendar(event.id);
+                  onClose();
+                }}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-slate-700 hover:bg-slate-100 border border-slate-200 rounded-xl transition-all cursor-pointer"
+              >
+                <CalendarIcon className="w-3.5 h-3.5 text-indigo-600" />
+                カレンダーで開く
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            {onCopyAndAdd && (
+              <button
+                type="button"
+                onClick={() => {
+                  onCopyAndAdd(event);
+                  onClose();
+                }}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 hover:border-indigo-300 rounded-xl transition-all shadow-2xs cursor-pointer"
+                title="この予定をもとに複製して新規作成します"
+              >
+                <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                コピーして追加
+              </button>
+            )}
+            {onEdit && !isIcal && (
+              <button
+                type="button"
+                onClick={() => {
+                  onEdit(event);
+                  onClose();
+                }}
+                className="flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl shadow-xs transition-colors cursor-pointer"
+                title="予定を再編集します"
+              >
+                <Edit2 className="w-3.5 h-3.5" />
+                編集
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 font-bold text-xs rounded-xl transition-colors cursor-pointer"
+            >
+              閉じる
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+      <FilePreviewModal
+        isOpen={isPreviewOpen}
+        onClose={() => setIsPreviewOpen(false)}
+        file={previewFile}
+      />
+
+      {/* 定期予定の削除範囲確認モーダル */}
+      {isRecurrenceModalOpen && (
+        <RecurrenceActionModal
+          isOpen={isRecurrenceModalOpen}
+          mode="delete"
+          title="定期予定の削除範囲を選択"
+          instanceDate={currentInstanceDate}
+          onClose={() => setIsRecurrenceModalOpen(false)}
+          onConfirm={handleConfirmRecurrenceDelete}
+        />
+      )}
+
+      {/* 単発予定の削除確認モーダル */}
+      {isConfirmDeleteOpen && (
+        <ConfirmModal
+          isOpen={isConfirmDeleteOpen}
+          title="予定の削除"
+          message={`「${event.title || 'この予定'}」を削除してもよろしいですか？`}
+          confirmText="削除する"
+          cancelText="キャンセル"
+          type="danger"
+          onConfirm={handleConfirmSingleDelete}
+          onClose={() => setIsConfirmDeleteOpen(false)}
+        />
+      )}
+    </div>
+  );
+}

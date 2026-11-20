@@ -1,0 +1,155 @@
+import React from 'react';
+import { Heart, MessageCircle, Share2, MoreHorizontal, Trash2 } from 'lucide-react';
+import { Post, User } from '../types';
+import { formatRelativeTime } from '../utils';
+import { API_BASE_URL } from '../config/api';
+import { getAvatarUrl, handleAvatarError } from '../utils/avatar';
+import { renderContentWithLinks } from '../utils/renderContentWithLinks';
+import { triggerOpenUserModal } from '../utils/userModal';
+
+interface PostCardProps {
+  post: Post;
+  onLike: (postId: string) => void;
+  onTagClick: (tag: string) => void;
+  onDelete?: (postId: string) => void;
+  currentUser?: User;
+}
+
+export const PostCard: React.FC<PostCardProps> = React.memo(({ 
+  post, 
+  onLike, 
+  onTagClick, 
+  onDelete,
+  currentUser
+}) => {
+  return (
+    <article className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm hover:shadow-md transition-shadow">
+      {/* Header */}
+      <div className="flex items-start justify-between mb-4">
+        <div className="flex items-center gap-3 w-full">
+          <button
+            type="button"
+            onClick={() => post.author && triggerOpenUserModal(post.author)}
+            className="cursor-pointer hover:opacity-80 transition-opacity shrink-0"
+            title={`${post.author?.name || '社員'}のプロフィールを表示`}
+          >
+            <img
+              src={getAvatarUrl(post.author?.id === currentUser?.id ? (currentUser?.avatarUrl || post.author?.avatarUrl) : post.author?.avatarUrl)}
+              alt={post.author?.name || '匿名'}
+              onError={handleAvatarError}
+              className="w-10 h-10 rounded-full object-cover border border-slate-100 bg-slate-100"
+            />
+          </button>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between w-full gap-1 sm:gap-4">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => post.author && triggerOpenUserModal(post.author)}
+                className="font-bold text-slate-800 hover:text-indigo-600 cursor-pointer text-left transition-colors"
+                title={`${post.author?.name || '社員'}のプロフィールを表示`}
+              >
+                {post.author?.name || '匿名'}
+              </button>
+              <span className="text-xs px-2 py-0.5 bg-slate-100 text-slate-500 rounded">{post.author?.department || '未設定'}</span>
+            </div>
+            <span className="text-xs text-slate-400">{formatRelativeTime(post.createdAt)}</span>
+          </div>
+        </div>
+        <div className="flex items-center gap-1 shrink-0 ml-2">
+          {onDelete && currentUser && (currentUser.isAdmin || currentUser.role === 'admin' || currentUser.id === post.author?.id) && (
+            <button
+              onClick={(e) => {
+                e.preventDefault();
+                onDelete(post.id);
+              }}
+              className="text-slate-400 hover:text-red-500 hover:bg-red-50 p-1.5 rounded-full transition-colors"
+              title="投稿を削除"
+            >
+              <Trash2 className="w-4 h-4" />
+            </button>
+          )}
+          <button className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-50 transition-colors">
+            <MoreHorizontal className="w-5 h-5" />
+          </button>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="mb-4">
+        <div className="mt-2 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+          {renderContentWithLinks(post.content)}
+        </div>
+        
+        {post.nasLink && (
+          <div className="mt-3 p-3 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between gap-2">
+            <div className="flex items-start gap-2 min-w-0">
+              <span className="text-xs font-bold text-slate-500 bg-white border border-slate-200 px-1.5 py-0.5 rounded shadow-sm shrink-0">NAS</span>
+              <a 
+                href={`${API_BASE_URL}/nas-file?path=${encodeURIComponent(post.nasLink)}`} 
+                target="_blank" 
+                rel="noopener noreferrer"
+                className="text-sm text-indigo-600 hover:underline break-all font-semibold" 
+                title="NASファイルを開く/ダウンロード"
+              >
+                {post.nasLink}
+              </a>
+            </div>
+            <button
+              onClick={(e) => {
+                e.preventDefault();
+                navigator.clipboard.writeText(post.nasLink || '');
+                // Simple feedback can be shown
+              }}
+              className="text-[11px] font-bold text-slate-500 hover:text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 px-2 py-1 rounded shrink-0 transition-colors"
+              title="NASパスをコピー"
+            >
+              パスをコピー
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Tags */}
+      {post.tags.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-2 mb-4">
+          {post.tags.map((tag) => (
+            <button
+              key={tag}
+              onClick={() => onTagClick(tag)}
+              className="text-xs text-indigo-600 font-medium bg-indigo-50 hover:bg-indigo-100 px-2 py-0.5 rounded transition-colors"
+            >
+              #{tag}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Actions */}
+      <div className="flex items-center gap-6 pt-3 border-t border-slate-100">
+        <button
+          onClick={() => onLike(post.id)}
+          className={`flex items-center gap-1.5 text-xs font-medium transition-colors ${
+            post.isLiked
+              ? 'text-pink-600'
+              : 'text-slate-500 hover:text-pink-600'
+          }`}
+        >
+          <Heart
+            className={`w-4 h-4 ${post.isLiked ? 'fill-current' : ''}`}
+          />
+          <span>{post.likes > 0 ? post.likes : 'いいね'}</span>
+        </button>
+
+        <button className="flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-indigo-600 transition-colors">
+          <MessageCircle className="w-4 h-4" />
+          <span>コメント</span>
+        </button>
+
+        <button className="flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-emerald-600 transition-colors ml-auto">
+          <Share2 className="w-4 h-4" />
+          <span className="hidden sm:inline">共有</span>
+        </button>
+      </div>
+    </article>
+  );
+});

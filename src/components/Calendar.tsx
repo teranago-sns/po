@@ -1,0 +1,5779 @@
+import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
+import { CalendarEvent, EventType, User, OfficeMaster, DivisionMaster, Memo, RequirementType, MemoUserRecipientStatus, CalendarPreset, CalendarViewSettings, CalendarMemberGroup, AssetInspectionScheduleEvent } from '../types';
+import { Site } from '../types/site';
+import { API_BASE_URL } from '../config/api';
+import { getAvatarUrl, handleAvatarError } from '../utils/avatar';
+import { ChevronLeft, ChevronRight, List as ListIcon, Calendar as CalendarIcon, Plus, MapPin, Video, AlignLeft, RefreshCw, Clock, Link as LinkIcon, Loader2, Building2, Users, User as UserIcon, Paperclip, MessageSquare, Phone, X, Monitor, Maximize2, Minimize2, FileSpreadsheet, Share2, Check, Star, Trash2, Pin, BookmarkCheck, CalendarDays, SlidersHorizontal, Filter, ChevronDown, Navigation, HardHat, Settings } from 'lucide-react';
+import { EventModal } from './EventModal';
+import { GlobalEventDetailModal } from './GlobalEventDetailModal';
+import { CalendarSettingsModal } from './CalendarSettingsModal';
+import { MobileTeamSettingsModal } from './MobileTeamSettingsModal';
+import { PersonalMemberSettingsModal } from './PersonalMemberSettingsModal';
+import { CalendarConstructionTimeline } from './CalendarConstructionTimeline';
+import { renderWithClickableLinks } from '../utils/linkify';
+import { renderContentWithLinks } from '../utils/renderContentWithLinks';
+import { UrlPastePopup, useUrlPasteHandler } from './common/UrlPastePopup';
+import { ConfirmModal, ConfirmModalState } from './ConfirmModal';
+import { getLocalDateStr, addMinutesToLocalDatetime, getJstHourAndMinutes, formatDateJST, formatTimeJST, getJstDateParts } from '../utils/dateUtils';
+import { triggerPushNotification } from '../utils/pushNotifications';
+import { expandRecurringEvents, planRecurrenceSave, isExpandedRecurrenceId, extractDateFromInstanceId, extractParentIdFromInstanceId, isRecurringEvent } from '../utils/recurrenceUtils';
+import { RecurrenceActionModal, RecurrenceActionScope } from './RecurrenceActionModal';
+import { TeamEventDeleteModal, TeamDeleteMemberScope } from './TeamEventDeleteModal';
+import { buildAppUrl, copyTextToClipboard, AppQueryParams } from '../utils/urlParams';
+import { upsertBookmarkForUser, removeBookmarkForUser } from '../utils/bookmarks';
+import { TeamDayMemberRow } from './TeamDayMemberRow';
+import { TeamWeekMemberRow } from './TeamWeekMemberRow';
+import { TeamLocationMap } from './TeamLocationMap';
+import { isEventVisibleToUser } from '../utils/eventVisibility';
+import { triggerOpenUserModal } from '../utils/userModal';
+import { SchedulePoll } from '../types/schedulePoll';
+import {
+  doesUserMatchOffice,
+  doesUserMatchDivision,
+  resolveOffice,
+  resolveOfficeName,
+  resolveDivision,
+  resolveDivisionName,
+  getUserOfficeName,
+  getUserDivisionName,
+} from '../utils/masterResolver';
+
+interface CalendarProps {
+  events: CalendarEvent[];
+  sites?: Site[];
+  onAddEvent: (event: Omit<CalendarEvent, 'id'>) => void;
+  onUpdateEvent?: (event: CalendarEvent, scope?: RecurrenceActionScope, originalInstanceDate?: string) => void;
+  onDeleteEvent?: (eventId: string, scope?: RecurrenceActionScope, instanceDate?: string) => void;
+  currentUser?: User;
+  allUsers?: User[];
+  offices?: OfficeMaster[];
+  divisions?: DivisionMaster[];
+  initialEventId?: string;
+  onClearInitialEventId?: () => void;
+  initialOffice?: string;
+  initialDivision?: string;
+  initialGroupId?: string;
+  initialMode?: 'personal' | 'team';
+  initialView?: ViewMode;
+  initialDate?: string;
+  initialTypeFilter?: string;
+  initialTargetUserId?: string;
+  targetUserRequestKey?: number;
+  memos?: Memo[];
+  onUpdateMemos?: (updatedMemos: Memo[]) => void;
+  onRefetchEvents?: (options?: { from?: string; all?: boolean }) => void;
+  onNavigateToInspectionScheduler?: () => void;
+  onNavigateToSite?: (siteIdOrCode: string) => void;
+  onNavigateToAsset?: (assetId: string, subTab?: 'details' | 'inspections' | 'history') => void;
+  onOpenSchedulePollModal?: (pollId?: string) => void;
+  pendingPollCount?: number;
+  openSchedulePolls?: SchedulePoll[];
+  onUpdateUser?: (updatedUser: User) => void;
+}
+
+type ViewMode = 'month' | 'week' | 'day' | 'list';
+
+const typeStyles: Record<EventType, string> = {
+  personal: 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100',
+  construction: 'bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100',
+  inspection: 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100',
+  replacement: 'bg-cyan-50 text-cyan-700 border-cyan-200 hover:bg-cyan-100',
+  repair: 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-rose-100',
+  visitor: 'bg-orange-50 text-orange-700 border-orange-200 hover:bg-orange-100',
+  business_trip: 'bg-sky-50 text-sky-700 border-sky-200 hover:bg-sky-100',
+  meeting: 'bg-violet-50 text-violet-700 border-violet-200 hover:bg-violet-100'
+};
+
+const typeLabels: Record<EventType, string> = {
+  personal: '個人',
+  construction: '工事',
+  inspection: '点検',
+  replacement: '取替',
+  repair: '修理',
+  visitor: '来客',
+  business_trip: '出張',
+  meeting: '会議'
+};
+
+// 初期お気に入りプリセット設定の同期解決（初回描画時の個人ページ・デフォルト表示からのチラつき・二重読み込み防止）
+function getInitialPresetInfo(
+  user?: User,
+  initials?: {
+    initialOffice?: string;
+    initialDivision?: string;
+    initialGroupId?: string;
+    initialMode?: 'personal' | 'team';
+    initialView?: ViewMode;
+    initialTypeFilter?: string;
+    initialTargetUserId?: string;
+    office?: string;
+    division?: string;
+    mode?: 'personal' | 'team';
+    view?: ViewMode;
+    typeFilter?: string;
+  }
+) {
+  const hasExplicitUrlParams = Boolean(
+    initials?.initialMode || initials?.mode ||
+    initials?.initialView || initials?.view ||
+    initials?.initialOffice || initials?.office ||
+    initials?.initialDivision || initials?.division ||
+    initials?.initialGroupId ||
+    initials?.initialTypeFilter || initials?.typeFilter ||
+    initials?.initialTargetUserId
+  );
+  if (hasExplicitUrlParams || !user?.preferences) return null;
+
+  const defaultId = user.preferences.defaultCalendarPresetId;
+  const userPresets = user.preferences.calendarPresets || [];
+  if (!defaultId || !userPresets.length) return null;
+
+  const defaultPreset = userPresets.find(p => p.id === defaultId);
+  if (!defaultPreset) return null;
+
+  const memberGroups = user.preferences.calendarMemberGroups || [];
+  const validGroupId = defaultPreset.groupId && memberGroups.some(g => g.id === defaultPreset.groupId)
+    ? defaultPreset.groupId
+    : 'org';
+
+  return {
+    preset: defaultPreset,
+    groupId: validGroupId
+  };
+}
+
+export function Calendar({
+  events,
+  sites,
+  onAddEvent,
+  onUpdateEvent,
+  onDeleteEvent,
+  currentUser,
+  allUsers,
+  offices = [],
+  divisions = [],
+  initialEventId,
+  onClearInitialEventId,
+  initialOffice,
+  initialDivision,
+  initialGroupId,
+  initialMode,
+  initialView,
+  initialDate,
+  initialTypeFilter,
+  initialTargetUserId,
+  targetUserRequestKey,
+  memos = [],
+  onUpdateMemos,
+  onRefetchEvents,
+  onNavigateToInspectionScheduler,
+  onNavigateToSite,
+  onNavigateToAsset,
+  onOpenSchedulePollModal,
+  pendingPollCount = 0,
+  openSchedulePolls = [],
+  onUpdateUser,
+}: CalendarProps) {
+  // 親から渡された sites または内部でフェッチした sites を管理
+  const [internalSites, setInternalSites] = useState<Site[]>(sites || []);
+
+  useEffect(() => {
+    if (sites && sites.length > 0) {
+      setInternalSites(sites);
+      return;
+    }
+    // 親から sites が渡されていない場合は自動取得
+    let isMounted = true;
+    fetch(`${API_BASE_URL}/sites`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (isMounted && data && Array.isArray(data.sites)) {
+          setInternalSites(data.sites);
+        }
+      })
+      .catch(() => {});
+    return () => { isMounted = false; };
+  }, [sites]);
+
+  // 資産管理からの点検予定スケジュール（個人所有・担当者紐付）を動的取得・自動プロット
+  const [assetSchedules, setAssetSchedules] = useState<AssetInspectionScheduleEvent[]>([]);
+
+  const fetchAssetSchedules = useCallback(() => {
+    fetch(`${API_BASE_URL}/assets/inspection-schedules`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (Array.isArray(data)) {
+          setAssetSchedules(data);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    fetchAssetSchedules();
+    const handleAssetsUpdated = () => fetchAssetSchedules();
+    const handleWindowFocus = () => fetchAssetSchedules();
+    window.addEventListener('teranago:assets-updated', handleAssetsUpdated);
+    window.addEventListener('focus', handleWindowFocus);
+    return () => {
+      window.removeEventListener('teranago:assets-updated', handleAssetsUpdated);
+      window.removeEventListener('focus', handleWindowFocus);
+    };
+  }, [fetchAssetSchedules]);
+
+  // 工事予定の種別バッジ描画（【新規】【残】【出庫有】）
+  const renderConstructionBadge = useCallback((e: CalendarEvent, compact: boolean = false) => {
+    // constructionPhase または type === 'construction' またはタイトルに含まれるキーワードを判定
+    let phase = e.constructionPhase;
+    if (!phase && e.type === 'construction') {
+      if (e.title.includes('新規') || e.title.includes('【新規】') || e.title.includes('[新規]')) {
+        phase = 'new';
+      } else if (e.title.includes('出庫')) {
+        phase = 'shukko';
+      } else if (e.title.includes('残') || e.title.includes('【残】') || e.title.includes('[残]')) {
+        phase = 'remaining';
+      }
+    }
+
+    if (!phase) return null;
+
+    if (phase === 'new') {
+      return (
+        <span
+          className={`font-black rounded shrink-0 shadow-2xs tracking-tighter ${
+            compact
+              ? 'px-1 py-0.2 bg-emerald-600 text-white text-[8px] sm:text-[9px] leading-tight'
+              : 'px-1.5 py-0.5 bg-emerald-600 text-white text-[10px] sm:text-[11px] leading-tight'
+          }`}
+          title="新規乗り込み工事"
+        >
+          {compact ? '新規' : '【新規】'}
+        </span>
+      );
+    }
+
+    if (phase === 'remaining') {
+      return (
+        <span
+          className={`font-black rounded shrink-0 shadow-2xs tracking-tighter ${
+            compact
+              ? 'px-1 py-0.2 bg-amber-500 text-white text-[8px] sm:text-[9px] leading-tight'
+              : 'px-1.5 py-0.5 bg-amber-500 text-white text-[10px] sm:text-[11px] leading-tight'
+          }`}
+          title="残工事（2度目以降）"
+        >
+          {compact ? '残' : '【残】'}
+        </span>
+      );
+    }
+
+    if (phase === 'shukko') {
+      return (
+        <span
+          className={`font-black rounded shrink-0 shadow-2xs tracking-tighter ${
+            compact
+              ? 'px-1 py-0.2 bg-indigo-600 text-white text-[8px] sm:text-[9px] leading-tight'
+              : 'px-1.5 py-0.5 bg-indigo-600 text-white text-[10px] sm:text-[11px] leading-tight'
+          }`}
+          title="出庫有工事"
+        >
+          {compact ? '出庫' : '【出庫有】'}
+        </span>
+      );
+    }
+
+    return null;
+  }, []);
+
+  // ユーザーが最近操作した楽観的更新（D&D、リサイズ、編集）を保持するRef（親からの古いデータによる巻き戻りを完全遮断）
+  const recentOptimisticEventsRef = useRef<Map<string, { event: CalendarEvent; timestamp: number }>>(new Map());
+
+  // 外部からの events プロパティと即座の UI 反映（楽観的更新）を両立するためのローカルステート
+  const [localEvents, setLocalEvents] = useState<CalendarEvent[]>(events);
+
+  useEffect(() => {
+    const now = Date.now();
+    const optMap = recentOptimisticEventsRef.current;
+
+    // 5秒以上経過した古い楽観的データは破棄
+    for (const [id, entry] of optMap.entries()) {
+      if (now - entry.timestamp > 5000) {
+        optMap.delete(id);
+      }
+    }
+
+    if (optMap.size === 0) {
+      setLocalEvents(events);
+      return;
+    }
+
+    // 最新の操作イベントを最優先してマージ（親コンポーネントやAPIから古いデータが一時的に届いても絶対に巻き戻さない）
+    const merged = events.map(ev => {
+      const opt = optMap.get(String(ev.id));
+      if (!opt) return ev;
+      // 親のデータが新時間・参加者に完全に同期されていれば楽観的保持を解除
+      const isSameAttendees =
+        JSON.stringify((ev.attendees || []).map(a => String(a.id))) ===
+        JSON.stringify((opt.event.attendees || []).map(a => String(a.id)));
+      if (ev.start === opt.event.start && ev.end === opt.event.end && isSameAttendees) {
+        optMap.delete(String(ev.id));
+        return ev;
+      }
+      // まだ古い時間の場合は、最新の操作結果（時間・位置）を維持
+      return {
+        ...ev,
+        ...opt.event,
+      };
+    });
+
+    setLocalEvents(merged);
+  }, [events]);
+
+  const [view, setView] = useState<ViewMode>(() => {
+    if (initialView) return initialView;
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter });
+    if (presetInfo?.preset.view) return presetInfo.preset.view;
+    if (initialMode === 'team') return 'week';
+    return 'month';
+  });
+
+  const [currentDate, setCurrentDate] = useState<Date>(() => {
+    if (initialDate) {
+      if (initialDate.toLowerCase() === 'today') return new Date();
+      const d = new Date(initialDate.includes('T') ? initialDate : `${initialDate}T00:00:00`);
+      if (!isNaN(d.getTime())) return d;
+    }
+    return new Date();
+  });
+
+  // デジタルサイネージモード関連の状態
+  const [isSignageMode, setIsSignageMode] = useState<boolean>(false);
+  const [liveClock, setLiveClock] = useState<Date>(new Date());
+  const [lastRefetchedAt, setLastRefetchedAt] = useState<Date>(new Date());
+  const [countdown, setCountdown] = useState<number>(30);
+  const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  
+  // 拠点・部署のプルダウンフィルター状態（初期値はお気に入りプリセット、指定パラメータ、またはログインユーザーの所属拠点・所属部署）
+  const [selectedOffice, setSelectedOffice] = useState<string>(() => {
+    if (initialOffice) return resolveOfficeName(initialOffice, offices) || initialOffice;
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter });
+    if (presetInfo?.preset && presetInfo.preset.mode === 'team' && presetInfo.groupId === 'org' && (presetInfo.preset.officeId || presetInfo.preset.office)) {
+      return resolveOfficeName(presetInfo.preset.officeId || presetInfo.preset.office, offices) || presetInfo.preset.office || '全社';
+    }
+    return getUserOfficeName(currentUser, offices) || '全社';
+  });
+
+  const [selectedDivision, setSelectedDivision] = useState<string>(() => {
+    if (initialDivision) return resolveDivisionName(initialDivision, divisions) || initialDivision;
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter });
+    if (presetInfo?.preset && presetInfo.preset.mode === 'team' && presetInfo.groupId === 'org' && (presetInfo.preset.divisionId || presetInfo.preset.division)) {
+      return resolveDivisionName(presetInfo.preset.divisionId || presetInfo.preset.division, divisions) || presetInfo.preset.division || '全部署';
+    }
+    return getUserDivisionName(currentUser, divisions) || '全部署';
+  });
+
+  const [selectedTypeFilter, setSelectedTypeFilter] = useState<string>(() => {
+    if (initialTypeFilter) return initialTypeFilter;
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter });
+    if (presetInfo?.preset.typeFilter) return presetInfo.preset.typeFilter;
+    return 'all';
+  });
+
+  // currentUserの所属拠点・所属部署の初期反映（initialOffice/initialDivisionがなく、プリセットもない場合のみ）
+  const userInitRef = React.useRef(false);
+  useEffect(() => {
+    if (currentUser && !userInitRef.current && (offices.length > 0 || divisions.length > 0 || currentUser.office || currentUser.division)) {
+      const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter });
+      if (!presetInfo) {
+        const resolvedOff = getUserOfficeName(currentUser, offices);
+        if (!initialOffice && resolvedOff) {
+          setSelectedOffice(resolvedOff);
+        }
+        const resolvedDiv = getUserDivisionName(currentUser, divisions);
+        if (!initialDivision && resolvedDiv) {
+          setSelectedDivision(resolvedDiv);
+        }
+      } else if (presetInfo.preset.mode === 'team' && presetInfo.groupId === 'org') {
+        if (presetInfo.preset.officeId || presetInfo.preset.office) {
+          setSelectedOffice(resolveOfficeName(presetInfo.preset.officeId || presetInfo.preset.office, offices) || presetInfo.preset.office || '全社');
+        }
+        if (presetInfo.preset.divisionId || presetInfo.preset.division) {
+          setSelectedDivision(resolveDivisionName(presetInfo.preset.divisionId || presetInfo.preset.division, divisions) || presetInfo.preset.division || '全部署');
+        }
+      }
+      if (offices.length > 0 || divisions.length > 0) {
+        userInitRef.current = true;
+      }
+    }
+  }, [currentUser, initialOffice, initialDivision, initialMode, initialView, initialTypeFilter, offices, divisions]);
+
+  // カレンダーモード：'personal' (個人表示) or 'team' (チーム表示)
+  const [calendarMode, setCalendarMode] = useState<'personal' | 'team'>(() => {
+    if (initialTargetUserId) return 'personal';
+    if (initialMode) return initialMode;
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter, initialTargetUserId });
+    if (presetInfo?.preset.mode) return presetInfo.preset.mode;
+    return 'personal';
+  });
+
+  // 個人カレンダーで表示対象となっているメンバーID（未指定時は自分自身）
+  const [selectedPersonalUserId, setSelectedPersonalUserId] = useState<string>(() => {
+    if (initialTargetUserId) return String(initialTargetUserId);
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialMode, initialView, initialTypeFilter, initialTargetUserId });
+    if (presetInfo?.preset && presetInfo.preset.mode === 'personal' && presetInfo.preset.targetUserId) {
+      return String(presetInfo.preset.targetUserId);
+    }
+    return currentUser?.id ? String(currentUser.id) : '';
+  });
+
+  useEffect(() => {
+    if (!selectedPersonalUserId && currentUser?.id) {
+      setSelectedPersonalUserId(String(currentUser.id));
+    }
+  }, [currentUser?.id, selectedPersonalUserId]);
+
+  // --- カレンダー表示設定 (平日のみ / 時間帯 / 密度) & マイグループ ---
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [settingsModalTab, setSettingsModalTab] = useState<'display' | 'groups'>('display');
+  // スマホ用チーム表示・マイグループ設定ポップアップ
+  const [isMobileTeamModalOpen, setIsMobileTeamModalOpen] = useState(false);
+  // 個人カレンダー表示対象メンバー選択ポップアップ
+  const [isPersonalModalOpen, setIsPersonalModalOpen] = useState(false);
+
+  const [calendarSettings, setCalendarSettings] = useState<CalendarViewSettings>(() => {
+    const fromUser = currentUser?.preferences?.calendarViewSettings;
+    if (fromUser) return fromUser;
+    try {
+      const cached = localStorage.getItem('teranago_calendar_view_settings');
+      if (cached) return JSON.parse(cached);
+    } catch (_) {}
+    return {
+      hideWeekends: false,
+      isTimeFilterActive: false,
+      workStartHour: 8,
+      workEndHour: 19,
+      density: 'standard',
+    };
+  });
+
+  // マイグループ一覧
+  const [memberGroups, setMemberGroups] = useState<CalendarMemberGroup[]>(() => {
+    const fromUser = currentUser?.preferences?.calendarMemberGroups;
+    if (fromUser && Array.isArray(fromUser)) return fromUser;
+    try {
+      const cached = localStorage.getItem('teranago_calendar_member_groups');
+      if (cached) return JSON.parse(cached);
+    } catch (_) {}
+    return [];
+  });
+
+  // 選択中マイグループ ('org' = 組織/拠点・部署、または group.id)
+  const [selectedGroupId, setSelectedGroupId] = useState<string>(() => {
+    if (initialGroupId && memberGroups.some(g => g.id === initialGroupId)) {
+      return initialGroupId;
+    }
+    const presetInfo = getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialGroupId, initialMode, initialView, initialTypeFilter });
+    if (presetInfo?.groupId) return presetInfo.groupId;
+    return 'org';
+  });
+
+  // currentUserの更新に追従
+  useEffect(() => {
+    if (currentUser?.preferences?.calendarViewSettings) {
+      setCalendarSettings(currentUser.preferences.calendarViewSettings);
+    }
+  }, [currentUser?.preferences?.calendarViewSettings]);
+
+  useEffect(() => {
+    if (currentUser?.preferences?.calendarMemberGroups) {
+      setMemberGroups(currentUser.preferences.calendarMemberGroups);
+    }
+  }, [currentUser?.preferences?.calendarMemberGroups]);
+
+  // 社員詳細ポップアップの「予定を見る」や現場管理・URLパラメータ・お気に入りから対象メンバー・チームが指定された場合の同期
+  // ※ allUsers / offices / divisions / memberGroups 変更（お気に入り保存時の onUpdateUser 等）で現在操作中の画面が強制上書きされないよう、
+  //    外部遷移パラメータ自体の変化時のみ適用する
+  const lastNavSyncSigRef = useRef<string>('');
+  const pendingInitialGroupIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const navSig = JSON.stringify({
+      initialTargetUserId: initialTargetUserId || '',
+      initialMode: initialMode || '',
+      initialOffice: initialOffice || '',
+      initialDivision: initialDivision || '',
+      initialGroupId: initialGroupId || '',
+      initialView: initialView || '',
+      initialTypeFilter: initialTypeFilter || '',
+      initialDate: initialDate || '',
+      targetUserRequestKey: targetUserRequestKey || 0,
+    });
+    if (lastNavSyncSigRef.current === navSig) return;
+    lastNavSyncSigRef.current = navSig;
+
+    if (initialTargetUserId) {
+      setCalendarMode('personal');
+      setSelectedPersonalUserId(String(initialTargetUserId));
+      if (initialGroupId && memberGroups.some(g => g.id === initialGroupId)) {
+        setSelectedGroupId(initialGroupId);
+        pendingInitialGroupIdRef.current = null;
+      } else {
+        pendingInitialGroupIdRef.current = initialGroupId || null;
+        setSelectedGroupId('org');
+      }
+      const targetU = (allUsers || []).find(u => String(u.id) === String(initialTargetUserId));
+      if (targetU) {
+        const offName = getUserOfficeName(targetU, offices);
+        if (offName) setSelectedOffice(offName);
+        const divName = getUserDivisionName(targetU, divisions);
+        if (divName) setSelectedDivision(divName);
+      }
+    } else if (initialMode === 'team') {
+      setCalendarMode('team');
+      if (initialGroupId && memberGroups.some(g => g.id === initialGroupId)) {
+        setSelectedGroupId(initialGroupId);
+        pendingInitialGroupIdRef.current = null;
+      } else {
+        pendingInitialGroupIdRef.current = initialGroupId || null;
+        setSelectedGroupId('org');
+        if (initialOffice) {
+          setSelectedOffice(resolveOfficeName(initialOffice, offices) || initialOffice);
+        }
+        if (initialDivision) {
+          setSelectedDivision(resolveDivisionName(initialDivision, divisions) || initialDivision);
+        }
+      }
+      if (initialView) {
+        setView(initialView);
+      } else {
+        setView(prev => (prev === 'day' ? 'day' : 'week'));
+      }
+    } else {
+      if (initialMode) setCalendarMode(initialMode);
+      if (initialView) setView(initialView);
+      if (initialGroupId && memberGroups.some(g => g.id === initialGroupId)) {
+        setSelectedGroupId(initialGroupId);
+        pendingInitialGroupIdRef.current = null;
+      } else {
+        pendingInitialGroupIdRef.current = initialGroupId || null;
+        if (initialOffice || initialDivision) {
+          setSelectedGroupId('org');
+          if (initialOffice) {
+            setSelectedOffice(resolveOfficeName(initialOffice, offices) || initialOffice);
+          }
+          if (initialDivision) {
+            setSelectedDivision(resolveDivisionName(initialDivision, divisions) || initialDivision);
+          }
+        }
+      }
+    }
+
+    if (initialTypeFilter) {
+      setSelectedTypeFilter(initialTypeFilter);
+    }
+
+    if (initialDate) {
+      if (initialDate.toLowerCase() === 'today') {
+        setCurrentDate(new Date());
+      } else {
+        const d = new Date(initialDate.includes('T') ? initialDate : `${initialDate}T00:00:00`);
+        if (!isNaN(d.getTime())) setCurrentDate(d);
+      }
+    }
+  }, [
+    initialTargetUserId,
+    initialMode,
+    initialOffice,
+    initialDivision,
+    initialGroupId,
+    initialView,
+    initialTypeFilter,
+    initialDate,
+    targetUserRequestKey,
+    allUsers,
+    offices,
+    divisions,
+    memberGroups,
+  ]);
+
+  // 初期表示時の groupId が memberGroups の遅延読込後に解決された場合の追従
+  useEffect(() => {
+    const pendingId = pendingInitialGroupIdRef.current;
+    if (pendingId && memberGroups.some(g => g.id === pendingId)) {
+      setSelectedGroupId(pendingId);
+      pendingInitialGroupIdRef.current = null;
+    }
+  }, [memberGroups]);
+
+  // 設定の保存ハンドラー
+  const handleSaveCalendarSettings = async (newSettings: CalendarViewSettings) => {
+    setCalendarSettings(newSettings);
+    try {
+      localStorage.setItem('teranago_calendar_view_settings', JSON.stringify(newSettings));
+    } catch (_) {}
+
+    if (currentUser && onUpdateUser) {
+      const updatedUser: User = {
+        ...currentUser,
+        preferences: {
+          ...(currentUser.preferences || {}),
+          calendarViewSettings: newSettings,
+        },
+      };
+      onUpdateUser(updatedUser);
+    }
+  };
+
+  // マイグループの保存ハンドラー
+  const handleSaveMemberGroups = async (newGroups: CalendarMemberGroup[]) => {
+    setMemberGroups(newGroups);
+    try {
+      localStorage.setItem('teranago_calendar_member_groups', JSON.stringify(newGroups));
+    } catch (_) {}
+
+    // もし選択中のグループが削除されていたら 'org' に戻す
+    if (selectedGroupId !== 'org' && !newGroups.some(g => g.id === selectedGroupId)) {
+      setSelectedGroupId('org');
+    }
+
+    if (currentUser && onUpdateUser) {
+      const updatedUser: User = {
+        ...currentUser,
+        preferences: {
+          ...(currentUser.preferences || {}),
+          calendarMemberGroups: newGroups,
+        },
+      };
+      onUpdateUser(updatedUser);
+    }
+  };
+
+  // --- カレンダー表示設定のお気に入り機能 ---
+  const [isFavoritesOpen, setIsFavoritesOpen] = useState(false);
+  const [customPresetName, setCustomPresetName] = useState('');
+  const [favoritesFeedback, setFavoritesFeedback] = useState<string | null>(null);
+  const [shareWithDateAction, setShareWithDateAction] = useState<{
+    dateStr: string;
+    shortLabel: string;
+    shareParams: AppQueryParams;
+    bookmarkParams: AppQueryParams;
+    title: string;
+    typeSubtitle?: string;
+    createdDatelessBookmarkId?: string;
+  } | null>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
+  const favoritesRef = useRef<HTMLDivElement>(null);
+
+  const presets: CalendarPreset[] = useMemo(() => {
+    return currentUser?.preferences?.calendarPresets || [];
+  }, [currentUser?.preferences?.calendarPresets]);
+
+  const defaultPresetId = currentUser?.preferences?.defaultCalendarPresetId;
+
+  // 初期ロード時：URLパラメータで明示指定がない場合、ユーザーの「初期表示」プリセット（defaultCalendarPresetId）を自動適用
+  const hasAppliedDefaultPresetRef = useRef(Boolean(getInitialPresetInfo(currentUser, { initialOffice, initialDivision, initialGroupId, initialMode, initialView, initialTypeFilter, initialTargetUserId })));
+  useEffect(() => {
+    if (hasAppliedDefaultPresetRef.current) return;
+    if (!currentUser?.preferences) return;
+
+    // URLでの明示的な指定があるかチェック
+    const hasExplicitUrlParams = Boolean(initialMode || initialView || initialOffice || initialDivision || initialGroupId || initialTypeFilter || initialTargetUserId);
+    if (hasExplicitUrlParams) {
+      hasAppliedDefaultPresetRef.current = true;
+      return;
+    }
+
+    const defaultId = currentUser.preferences.defaultCalendarPresetId;
+    const userPresets = currentUser.preferences.calendarPresets || [];
+    if (defaultId) {
+      const defaultPreset = userPresets.find(p => p.id === defaultId);
+      if (defaultPreset) {
+        setCalendarMode(defaultPreset.mode);
+        setView(defaultPreset.view);
+        if (defaultPreset.mode === 'team') {
+          if (defaultPreset.groupId && (currentUser.preferences.calendarMemberGroups || []).some(g => g.id === defaultPreset.groupId)) {
+            setSelectedGroupId(defaultPreset.groupId);
+          } else {
+            setSelectedGroupId('org');
+            if (defaultPreset.office) setSelectedOffice(defaultPreset.office);
+            if (defaultPreset.division) setSelectedDivision(defaultPreset.division);
+          }
+        } else {
+          const targetUid = defaultPreset.targetUserId || String(currentUser.id);
+          setSelectedPersonalUserId(targetUid);
+          if (defaultPreset.groupId && (currentUser.preferences.calendarMemberGroups || []).some(g => g.id === defaultPreset.groupId)) {
+            setSelectedGroupId(defaultPreset.groupId);
+          } else {
+            setSelectedGroupId('org');
+            if (defaultPreset.office) setSelectedOffice(defaultPreset.office);
+            if (defaultPreset.division) setSelectedDivision(defaultPreset.division);
+          }
+        }
+        if (defaultPreset.typeFilter) setSelectedTypeFilter(defaultPreset.typeFilter);
+        hasAppliedDefaultPresetRef.current = true;
+      }
+    }
+  }, [currentUser, initialMode, initialView, initialOffice, initialDivision, initialTypeFilter, initialTargetUserId]);
+
+  // お気に入りポップオーバー外クリックで閉じる
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (favoritesRef.current && !favoritesRef.current.contains(event.target as Node)) {
+        setIsFavoritesOpen(false);
+      }
+    };
+    if (isFavoritesOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, [isFavoritesOpen]);
+
+  // モバイル用お気に入り表示設定メニュー開閉
+  const [isFavoritesMobileOpen, setIsFavoritesMobileOpen] = useState(false);
+  const favoritesMobileRef = useRef<HTMLDivElement>(null);
+
+  // モバイル月表示用：選択中の日付 (Googleカレンダー風：タップで下部にその日の予定一覧を表示)
+  const [selectedMobileDate, setSelectedMobileDate] = useState<string>(() => getLocalDateStr(new Date()));
+
+  // モバイル週表示用：3日表示 / 7日表示モード、および選択中の曜日インデックス
+  const [mobileWeekMode, setMobileWeekMode] = useState<'3day' | '7day'>('3day');
+  const [mobileWeekActiveDay, setMobileWeekActiveDay] = useState<number>(() => {
+    const today = new Date();
+    return today.getDay();
+  });
+
+  // モバイルお気に入りポップオーバー外タップ・クリックで閉じる
+  useEffect(() => {
+    const handleClickOutsideMobileFavs = (event: MouseEvent | TouchEvent) => {
+      if (favoritesMobileRef.current && !favoritesMobileRef.current.contains(event.target as Node)) {
+        setIsFavoritesMobileOpen(false);
+      }
+    };
+    if (isFavoritesMobileOpen) {
+      document.addEventListener('mousedown', handleClickOutsideMobileFavs);
+      document.addEventListener('touchstart', handleClickOutsideMobileFavs);
+    }
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutsideMobileFavs);
+      document.removeEventListener('touchstart', handleClickOutsideMobileFavs);
+    };
+  }, [isFavoritesMobileOpen]);
+
+  // イベント区分ごとのドット色（Googleカレンダー風のミニマムインジケータ用）
+  const getEventDotColor = useCallback((type?: EventType) => {
+    switch (type) {
+      case 'personal': return 'bg-emerald-500';
+      case 'construction': return 'bg-amber-500';
+      case 'inspection': return 'bg-indigo-500';
+      case 'replacement': return 'bg-cyan-500';
+      case 'repair': return 'bg-rose-500';
+      case 'visitor': return 'bg-orange-500';
+      case 'business_trip': return 'bg-sky-500';
+      case 'meeting': return 'bg-violet-500';
+      default: return 'bg-indigo-500';
+    }
+  }, []);
+
+  // 選択中マイグループのオブジェクト
+  const activeSelectedGroup = useMemo(() => {
+    if (selectedGroupId === 'org') return null;
+    return memberGroups.find(g => g.id === selectedGroupId) || null;
+  }, [memberGroups, selectedGroupId]);
+
+  // 個人カレンダーで現在表示対象となっているメンバー（未選択時はログインユーザー自身）
+  const activePersonalUser = useMemo(() => {
+    if (!selectedPersonalUserId) return currentUser;
+    const found = (allUsers || []).find(u => String(u.id) === String(selectedPersonalUserId));
+    return found || currentUser;
+  }, [selectedPersonalUserId, allUsers, currentUser]);
+
+  // 個人カレンダーでの選択候補メンバー一覧（選択中の所属拠点・部署またはマイグループに属するメンバー）
+  const personalCandidateUsers = useMemo(() => {
+    let list: User[] = [];
+    if (activeSelectedGroup) {
+      const userMap = new Map((allUsers || []).map(u => [String(u.id), u]));
+      list = activeSelectedGroup.memberIds
+        .map(id => userMap.get(String(id)))
+        .filter((u): u is User => Boolean(u));
+    } else {
+      list = (allUsers || []).filter(u => {
+        const matchOff = !selectedOffice || selectedOffice === '全社' || selectedOffice === '全拠点' || doesUserMatchOffice(u, selectedOffice, offices);
+        const matchDiv = !selectedDivision || selectedDivision === '全部署' || doesUserMatchDivision(u, selectedDivision, divisions);
+        return matchOff && matchDiv;
+      });
+    }
+    if (activePersonalUser && !list.some(u => String(u.id) === String(activePersonalUser.id))) {
+      return [activePersonalUser, ...list];
+    }
+    return list;
+  }, [allUsers, activeSelectedGroup, selectedOffice, selectedDivision, offices, divisions, activePersonalUser]);
+
+  // 拠点変更時に個人モード対象メンバーも自動追従させるハンドラー
+  const handleChangeOfficeWithSync = useCallback((nextOffice: string) => {
+    setSelectedOffice(nextOffice);
+    if (calendarMode === 'personal') {
+      const matching = (allUsers || []).filter(u => {
+        const matchOff = !nextOffice || nextOffice === '全社' || nextOffice === '全拠点' || doesUserMatchOffice(u, nextOffice, offices);
+        const matchDiv = !selectedDivision || selectedDivision === '全部署' || doesUserMatchDivision(u, selectedDivision, divisions);
+        return matchOff && matchDiv;
+      });
+      if (matching.length > 0) {
+        if (!matching.some(u => String(u.id) === String(selectedPersonalUserId))) {
+          const preferred = matching.find(u => currentUser && String(u.id) === String(currentUser.id)) || matching[0];
+          setSelectedPersonalUserId(String(preferred.id));
+        }
+      } else {
+        const officeUsers = (allUsers || []).filter(u => doesUserMatchOffice(u, nextOffice, offices));
+        if (officeUsers.length > 0) {
+          const preferred = officeUsers.find(u => currentUser && String(u.id) === String(currentUser.id)) || officeUsers[0];
+          const divName = getUserDivisionName(preferred, divisions);
+          if (divName) setSelectedDivision(divName);
+          setSelectedPersonalUserId(String(preferred.id));
+        }
+      }
+    }
+  }, [calendarMode, allUsers, offices, divisions, selectedDivision, selectedPersonalUserId, currentUser]);
+
+  // 部署変更時に個人モード対象メンバーも自動追従させるハンドラー
+  const handleChangeDivisionWithSync = useCallback((nextDivision: string) => {
+    setSelectedDivision(nextDivision);
+    if (calendarMode === 'personal') {
+      const matching = (allUsers || []).filter(u => {
+        const matchOff = !selectedOffice || selectedOffice === '全社' || selectedOffice === '全拠点' || doesUserMatchOffice(u, selectedOffice, offices);
+        const matchDiv = !nextDivision || nextDivision === '全部署' || doesUserMatchDivision(u, nextDivision, divisions);
+        return matchOff && matchDiv;
+      });
+      if (matching.length > 0 && !matching.some(u => String(u.id) === String(selectedPersonalUserId))) {
+        const preferred = matching.find(u => currentUser && String(u.id) === String(currentUser.id)) || matching[0];
+        setSelectedPersonalUserId(String(preferred.id));
+      }
+    }
+  }, [calendarMode, allUsers, offices, divisions, selectedOffice, selectedPersonalUserId, currentUser]);
+
+  // マイグループ変更時に個人モード対象メンバーも自動追従させるハンドラー
+  const handleChangeGroupWithSync = useCallback((nextGroupId: string) => {
+    if (nextGroupId === 'mygroup_new') {
+      setSettingsModalTab('groups');
+      setIsSettingsModalOpen(true);
+      return;
+    }
+    setSelectedGroupId(nextGroupId);
+    if (calendarMode === 'personal') {
+      if (nextGroupId === 'org') {
+        if (activePersonalUser) {
+          const offName = getUserOfficeName(activePersonalUser, offices);
+          if (offName) setSelectedOffice(offName);
+          const divName = getUserDivisionName(activePersonalUser, divisions);
+          if (divName) setSelectedDivision(divName);
+        }
+      } else {
+        const grp = memberGroups.find(g => g.id === nextGroupId);
+        if (grp && grp.memberIds.length > 0) {
+          if (!grp.memberIds.some(id => String(id) === String(selectedPersonalUserId))) {
+            const preferredId = grp.memberIds.find(id => currentUser && String(id) === String(currentUser.id)) || grp.memberIds[0];
+            setSelectedPersonalUserId(String(preferredId));
+          }
+        }
+      }
+    }
+  }, [calendarMode, activePersonalUser, offices, divisions, memberGroups, selectedPersonalUserId, currentUser]);
+
+  // 個人選択変更時に所属拠点・部署の表示も整合させるハンドラー
+  const handleSelectPersonalUserId = useCallback((userId: string) => {
+    setSelectedPersonalUserId(String(userId));
+    if (selectedGroupId === 'org') {
+      const targetU = (allUsers || []).find(u => String(u.id) === String(userId));
+      if (targetU) {
+        const offName = getUserOfficeName(targetU, offices);
+        if (offName) setSelectedOffice(offName);
+        const divName = getUserDivisionName(targetU, divisions);
+        if (divName) setSelectedDivision(divName);
+      }
+    }
+  }, [selectedGroupId, allUsers, offices, divisions]);
+
+  // 現在の設定に合わせたデフォルト名称の生成
+  const getDefaultPresetName = useCallback(() => {
+    const viewLabel = view === 'month' ? '月' : view === 'week' ? '週' : view === 'day' ? '日' : 'リスト';
+    if (calendarMode === 'team') {
+      if (activeSelectedGroup) {
+        return `👥${activeSelectedGroup.name} (${viewLabel})`;
+      }
+      const parts: string[] = [];
+      if (selectedOffice && selectedOffice !== '全社' && selectedOffice !== '全拠点') {
+        parts.push(selectedOffice);
+      }
+      if (selectedDivision && selectedDivision !== '全部署') {
+        parts.push(selectedDivision);
+      }
+      const teamTitle = parts.length > 0 ? parts.join('・') : '全社';
+      return `${teamTitle} (${viewLabel})`;
+    } else {
+      if (activePersonalUser && currentUser && String(activePersonalUser.id) !== String(currentUser.id)) {
+        return `👤${activePersonalUser.name} (${viewLabel})`;
+      }
+      return `個人 (${viewLabel})`;
+    }
+  }, [calendarMode, view, selectedOffice, selectedDivision, activeSelectedGroup, activePersonalUser, currentUser]);
+
+  // プリセットの要約テキスト生成
+  const getPresetSummary = (p: CalendarPreset) => {
+    const parts: string[] = [];
+    parts.push(p.mode === 'team' ? 'チーム' : '個人');
+    const viewMap: Record<string, string> = { month: '月', week: '週', day: '日', list: 'リスト' };
+    parts.push(viewMap[p.view] || p.view);
+    if (p.mode === 'team') {
+      if (p.groupId) {
+        const grp = memberGroups.find(g => g.id === p.groupId);
+        if (grp) parts.push(`👥${grp.name}`);
+      } else {
+        if (p.office && p.office !== '全社' && p.office !== '全拠点') parts.push(p.office);
+        if (p.division && p.division !== '全部署') parts.push(p.division);
+      }
+    } else {
+      const targetName =
+        p.targetUserName ||
+        ((allUsers || []).find(u => String(u.id) === String(p.targetUserId))?.name) ||
+        currentUser?.name;
+      if (targetName) parts.push(`👤${targetName}`);
+    }
+    if (p.typeFilter && p.typeFilter !== 'all' && typeLabels[p.typeFilter as EventType]) {
+      parts.push(typeLabels[p.typeFilter as EventType]);
+    }
+    return parts.join(' / ');
+  };
+
+  // 現在の設定の要約テキスト
+  const getCurrentSummary = () => {
+    const parts: string[] = [];
+    parts.push(calendarMode === 'team' ? 'チーム' : '個人');
+    const viewMap: Record<string, string> = { month: '月', week: '週', day: '日', list: 'リスト' };
+    parts.push(viewMap[view] || view);
+    if (calendarMode === 'team') {
+      if (activeSelectedGroup) {
+        parts.push(`👥${activeSelectedGroup.name}`);
+      } else {
+        if (selectedOffice && selectedOffice !== '全社' && selectedOffice !== '全拠点') parts.push(selectedOffice);
+        if (selectedDivision && selectedDivision !== '全部署') parts.push(selectedDivision);
+      }
+    } else if (activePersonalUser) {
+      parts.push(`👤${activePersonalUser.name}`);
+    }
+    if (selectedTypeFilter && selectedTypeFilter !== 'all' && typeLabels[selectedTypeFilter as EventType]) {
+      parts.push(typeLabels[selectedTypeFilter as EventType]);
+    }
+    return parts.join(' / ');
+  };
+
+  // プリセットの適用
+  const handleApplyPreset = (preset: CalendarPreset) => {
+    setCalendarMode(preset.mode);
+    setView(preset.view);
+    if (preset.mode === 'team') {
+      if (preset.groupId && memberGroups.some(g => g.id === preset.groupId)) {
+        setSelectedGroupId(preset.groupId);
+      } else {
+        setSelectedGroupId('org');
+        const resolvedOff = resolveOfficeName(preset.officeId || preset.office, offices);
+        if (resolvedOff) setSelectedOffice(resolvedOff);
+        const resolvedDiv = resolveDivisionName(preset.divisionId || preset.division, divisions);
+        if (resolvedDiv) setSelectedDivision(resolvedDiv);
+      }
+    } else {
+      const targetUid = preset.targetUserId || (currentUser ? String(currentUser.id) : '');
+      if (targetUid) {
+        setSelectedPersonalUserId(targetUid);
+      }
+      if (preset.groupId && memberGroups.some(g => g.id === preset.groupId)) {
+        setSelectedGroupId(preset.groupId);
+      } else {
+        setSelectedGroupId('org');
+        const targetUserObj = (allUsers || []).find(u => String(u.id) === String(targetUid)) || currentUser;
+        const resolvedOff = resolveOfficeName(preset.officeId || preset.office, offices) || getUserOfficeName(targetUserObj, offices);
+        if (resolvedOff) setSelectedOffice(resolvedOff);
+        const resolvedDiv = resolveDivisionName(preset.divisionId || preset.division, divisions) || getUserDivisionName(targetUserObj, divisions);
+        if (resolvedDiv) setSelectedDivision(resolvedDiv);
+      }
+    }
+    setSelectedTypeFilter(preset.typeFilter || 'all');
+    setIsFavoritesOpen(false);
+    setFavoritesFeedback(`「${preset.name}」を適用しました`);
+    setTimeout(() => setFavoritesFeedback(null), 3000);
+  };
+
+  // 現在の表示をお気に入りとして保存
+  const handleSavePreset = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!currentUser || !onUpdateUser) return;
+    const name = customPresetName.trim() || getDefaultPresetName();
+    const isOrg = selectedGroupId === 'org';
+    const matchedOff = isOrg && selectedOffice !== '全社' && selectedOffice !== '全拠点' ? resolveOffice(selectedOffice, offices) : undefined;
+    const matchedDiv = isOrg && selectedDivision !== '全部署' ? resolveDivision(selectedDivision, divisions) : undefined;
+
+    const newPreset: CalendarPreset = {
+      id: `cal-preset-${Date.now()}`,
+      name,
+      createdAt: new Date().toISOString(),
+      mode: calendarMode,
+      view: view,
+      groupId: selectedGroupId !== 'org' ? selectedGroupId : undefined,
+      officeId: matchedOff?.id,
+      office: isOrg ? (selectedOffice !== '全社' && selectedOffice !== '全拠点' ? (matchedOff?.name || selectedOffice) : undefined) : undefined,
+      divisionId: matchedDiv?.id,
+      division: isOrg ? (selectedDivision !== '全部署' ? (matchedDiv?.name || selectedDivision) : undefined) : undefined,
+      typeFilter: selectedTypeFilter !== 'all' ? selectedTypeFilter : undefined,
+      targetUserId: calendarMode === 'personal' && activePersonalUser ? String(activePersonalUser.id) : undefined,
+      targetUserName: calendarMode === 'personal' && activePersonalUser ? activePersonalUser.name : undefined,
+    };
+
+    const existingPresets = currentUser.preferences?.calendarPresets || [];
+    const updatedUser: User = {
+      ...currentUser,
+      preferences: {
+        ...(currentUser.preferences || {}),
+        calendarPresets: [newPreset, ...existingPresets],
+      },
+    };
+
+    onUpdateUser(updatedUser);
+    setFavoritesFeedback(`「${name}」をお気に入りに登録しました`);
+    setCustomPresetName('');
+    setTimeout(() => setFavoritesFeedback(null), 3000);
+  };
+
+  // プリセットの削除
+  const handleDeletePreset = (presetId: string, presetName: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentUser || !onUpdateUser) return;
+
+    const existingPresets = currentUser.preferences?.calendarPresets || [];
+    const updatedPresets = existingPresets.filter(p => p.id !== presetId);
+    const currentDefault = currentUser.preferences?.defaultCalendarPresetId;
+
+    const updatedUser: User = {
+      ...currentUser,
+      preferences: {
+        ...(currentUser.preferences || {}),
+        calendarPresets: updatedPresets,
+        defaultCalendarPresetId: currentDefault === presetId ? undefined : currentDefault,
+      },
+    };
+
+    onUpdateUser(updatedUser);
+    setFavoritesFeedback(`「${presetName}」を削除しました`);
+    setTimeout(() => setFavoritesFeedback(null), 3000);
+  };
+
+  // プリセットをカレンダー起動時の初期表示にする/解除する
+  const handleToggleDefaultPreset = (presetId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!currentUser || !onUpdateUser) return;
+
+    const currentDefault = currentUser.preferences?.defaultCalendarPresetId;
+    const isSetting = currentDefault !== presetId;
+
+    const updatedUser: User = {
+      ...currentUser,
+      preferences: {
+        ...(currentUser.preferences || {}),
+        defaultCalendarPresetId: isSetting ? presetId : undefined,
+      },
+    };
+
+    onUpdateUser(updatedUser);
+    setFavoritesFeedback(isSetting ? 'カレンダー起動時の初期表示に設定しました' : '初期表示の設定を解除しました');
+    setTimeout(() => setFavoritesFeedback(null), 3000);
+  };
+
+  const showFeedbackToast = useCallback((message: string, durationMs = 3000) => {
+    setFavoritesFeedback(message);
+    if (feedbackTimerRef.current) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFavoritesFeedback(null);
+      setShareWithDateAction(null);
+      feedbackTimerRef.current = null;
+    }, durationMs);
+  }, []);
+
+  // 共有リンクコピー＆個人ブックマーク自動ストック（デフォルトは日付なし・常に今日を開く）
+  const handleShareCalendarView = async () => {
+    const currentDateStr = getLocalDateStr(currentDate);
+    const [, mPart, dPart] = currentDateStr.split('-');
+    const shortLabel = mPart && dPart ? `${Number(mPart)}/${Number(dPart)}` : currentDateStr;
+    const isUsingMyGroup = selectedGroupId !== 'org' && Boolean(activeSelectedGroup);
+
+    const shareParams: AppQueryParams = {
+      tab: 'calendar',
+      mode: calendarMode,
+      view: view,
+    };
+    if (isUsingMyGroup && activeSelectedGroup) {
+      shareParams.groupId = activeSelectedGroup.id;
+    }
+    if (calendarMode === 'team') {
+      if (!isUsingMyGroup) {
+        if (selectedOffice && selectedOffice !== '全社' && selectedOffice !== '全拠点') {
+          shareParams.office = selectedOffice;
+        }
+        if (selectedDivision && selectedDivision !== '全部署') {
+          shareParams.division = selectedDivision;
+        }
+      }
+    } else if (activePersonalUser) {
+      shareParams.targetUserId = String(activePersonalUser.id);
+    }
+    if (selectedTypeFilter && selectedTypeFilter !== 'all') {
+      shareParams.type = selectedTypeFilter;
+    }
+
+    const url = buildAppUrl(shareParams);
+    const ok = await copyTextToClipboard(url);
+    if (ok) {
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2500);
+    }
+
+    if (currentUser && onUpdateUser) {
+      const viewLabelMap: Record<'month' | 'week' | 'day' | 'list', string> = {
+        month: '月表示',
+        week: '週表示',
+        day: '日表示',
+        list: 'リスト',
+      };
+      const viewLabel = viewLabelMap[view] || view;
+      const title =
+        calendarMode === 'team'
+          ? isUsingMyGroup && activeSelectedGroup
+            ? `チーム予定 (👥${activeSelectedGroup.name}・${viewLabel})`
+            : `チーム予定 (${selectedOffice} / ${selectedDivision}・${viewLabel})`
+          : `${activePersonalUser?.name || '個人'}の予定 (${viewLabel})`;
+      const typeSubtitle =
+        selectedTypeFilter && selectedTypeFilter !== 'all'
+          ? typeLabels[selectedTypeFilter as EventType] || selectedTypeFilter
+          : undefined;
+      const subtitleParts = ['常に今日表示', ...(typeSubtitle ? [typeSubtitle] : [])];
+
+      const bookmarkParams: AppQueryParams = {
+        ...shareParams,
+        groupId: isUsingMyGroup && activeSelectedGroup ? activeSelectedGroup.id : undefined,
+        office: isUsingMyGroup ? '全社' : (selectedOffice || '全社'),
+        division: isUsingMyGroup ? '全部署' : (selectedDivision || '全部署'),
+        type: selectedTypeFilter || 'all',
+      };
+
+      const { updatedUser, bookmark, isNew } = upsertBookmarkForUser(currentUser, {
+        category: 'calendar',
+        title,
+        subtitle: subtitleParts.join(' ・ '),
+        params: bookmarkParams,
+      });
+      onUpdateUser(updatedUser);
+      setShareWithDateAction({
+        dateStr: currentDateStr,
+        shortLabel,
+        shareParams,
+        bookmarkParams,
+        title,
+        typeSubtitle,
+        createdDatelessBookmarkId: isNew ? bookmark.id : undefined,
+      });
+      showFeedbackToast('共有リンク（日付なし）をコピーし、お気に入りにストックしました', 6000);
+    } else {
+      setShareWithDateAction(null);
+      showFeedbackToast('共有リンク（日付なし）をコピーしました', 3000);
+    }
+  };
+
+  // レアケース用：共有直後の通知バーから「表示中の日付を含めて再コピー＆お気に入り更新」
+  const handleIncludeDateInShare = async () => {
+    if (!shareWithDateAction) return;
+    const {
+      dateStr,
+      shareParams,
+      bookmarkParams,
+      title,
+      typeSubtitle,
+      createdDatelessBookmarkId,
+    } = shareWithDateAction;
+
+    const datedShareParams: AppQueryParams = { ...shareParams, date: dateStr };
+    const datedUrl = buildAppUrl(datedShareParams);
+    const ok = await copyTextToClipboard(datedUrl);
+    if (ok) {
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2500);
+    }
+
+    if (currentUser && onUpdateUser) {
+      let baseUser = currentUser;
+      if (createdDatelessBookmarkId) {
+        baseUser = removeBookmarkForUser(baseUser, createdDatelessBookmarkId);
+      }
+      const datedBookmarkParams: AppQueryParams = { ...bookmarkParams, date: dateStr };
+      const subtitleParts = [dateStr, ...(typeSubtitle ? [typeSubtitle] : [])];
+      const { updatedUser } = upsertBookmarkForUser(baseUser, {
+        category: 'calendar',
+        title,
+        subtitle: subtitleParts.join(' ・ '),
+        params: datedBookmarkParams,
+      });
+      onUpdateUser(updatedUser);
+    }
+
+    setShareWithDateAction(null);
+    showFeedbackToast(`表示中の日付（${dateStr}）を含めて再コピー・お気に入りを更新しました`, 3500);
+  };
+
+  // チーム・日表示以外に変更されたらサイネージモードを自動解除
+  useEffect(() => {
+    if (calendarMode !== 'team' || view !== 'day') {
+      if (isSignageMode) {
+        setIsSignageMode(false);
+      }
+    }
+  }, [calendarMode, view, isSignageMode]);
+
+  // サイネージモード作動中のタイマー（1秒ごとの時計・カウントダウン & 30秒ごとの自動データ更新）
+  useEffect(() => {
+    if (!isSignageMode) return;
+
+    const timerId = setInterval(() => {
+      setLiveClock(new Date());
+      setCountdown(prev => {
+        if (prev <= 1) {
+          if (onRefetchEvents) {
+            onRefetchEvents();
+            setLastRefetchedAt(new Date());
+          }
+          return 30;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timerId);
+  }, [isSignageMode, onRefetchEvents]);
+
+  // サイネージモード切り替えハンドラー
+  const handleToggleSignageMode = (enable: boolean) => {
+    setIsSignageMode(enable);
+    if (enable) {
+      if (onRefetchEvents) {
+        onRefetchEvents();
+        setLastRefetchedAt(new Date());
+      }
+      setCountdown(30);
+      try {
+        if (document.documentElement.requestFullscreen) {
+          document.documentElement.requestFullscreen().catch(() => {});
+        }
+      } catch (_) {}
+    } else {
+      try {
+        if (document.fullscreenElement) {
+          document.exitFullscreen().catch(() => {});
+        }
+      } catch (_) {}
+    }
+  };
+
+  // ブラウザのEscキー等によるフルスクリーン解除の監視
+  useEffect(() => {
+    const handleFsChange = () => {
+      if (!document.fullscreenElement && isSignageMode) {
+        setIsSignageMode(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', handleFsChange);
+    return () => document.removeEventListener('fullscreenchange', handleFsChange);
+  }, [isSignageMode]);
+
+  // 新規伝言メモ追加モーダルの状態
+  const [isMemoModalOpen, setIsMemoModalOpen] = useState(false);
+  const [memoTargetUser, setMemoTargetUser] = useState<User | null>(null);
+  const [confirmModal, setConfirmModal] = useState<ConfirmModalState>({ isOpen: false, title: '', message: '' });
+
+  // EventModalの初期参加者
+  const [preselectedAttendees, setPreselectedAttendees] = useState<User[] | undefined>(undefined);
+
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [editingEvent, setEditingEvent] = useState<CalendarEvent | null>(null);
+  const [editingEventMember, setEditingEventMember] = useState<User | null>(null);
+  const [selectedDetailEvent, setSelectedDetailEvent] = useState<CalendarEvent | null>(null);
+  const [selectedDetailMember, setSelectedDetailMember] = useState<User | null>(null);
+  const [teamDeleteState, setTeamDeleteState] = useState<{
+    step: 'member_scope' | 'recurrence_scope';
+    event: CalendarEvent;
+    targetMember: User;
+    memberScope?: TeamDeleteMemberScope;
+    isRecurring: boolean;
+    instanceDate?: string;
+  } | null>(null);
+  const [isCopyMode, setIsCopyMode] = useState<boolean>(false);
+  const [selectedInitialDate, setSelectedInitialDate] = useState<string | undefined>(undefined);
+  const [selectedEndDate, setSelectedEndDate] = useState<string | undefined>(undefined);
+  const [selectedIsAllDay, setSelectedIsAllDay] = useState<boolean | undefined>(undefined);
+
+  // マウスドラッグによる複数日範囲選択状態
+  const [selectionStart, setSelectionStart] = useState<string | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<string | null>(null);
+  const [isSelectingRange, setIsSelectingRange] = useState<boolean>(false);
+  const [selectionAttendees, setSelectionAttendees] = useState<User[] | undefined>(undefined);
+  const [selectionMemberId, setSelectionMemberId] = useState<string | null>(null);
+
+  // 伝言メモ用の入力状態
+  const [fromName, setFromName] = useState('');
+  const [fromCompany, setFromCompany] = useState('');
+  const [fromPhone, setFromPhone] = useState('');
+  const [requirementType, setRequirementType] = useState<RequirementType>('phone_called');
+  const [customRequirementText, setCustomRequirementText] = useState('');
+  const [content, setContent] = useState('');
+  const memoContentPasteHandler = useUrlPasteHandler(content, setContent);
+
+  // チーム表示・日の表示切替 (タイムライン / 工事タイムライン / 現在地マップ / 簡易エリア別カード)
+  const [teamDaySubView, setTeamDaySubView] = useState<'timeline' | 'construction' | 'map' | 'cards'>('timeline');
+
+  // チームタイムラインの各時間枠（実測X軸座標・幅）の管理
+  const [hourLayouts, setHourLayouts] = useState<Record<number, { left: number; width: number }>>({});
+  const [timelineTotalWidth, setTimelineTotalWidth] = useState<number>(0);
+  const hoursHeaderRef = React.useRef<HTMLDivElement>(null);
+
+  // リサイズ中に目盛り・時間軸を固定するためのRef（確定するまで動的伸縮をフリーズ）
+  const lockedTimelineHoursRef = useRef<number[] | null>(null);
+  const lockedActiveHoursSetRef = useRef<Set<number> | null>(null);
+
+  const measureHourLayouts = useCallback(() => {
+    // リサイズ中は時間のメモリを完全固定するため、再測定・再設定をスキップ
+    if (resizingEventRef.current) return;
+    if (!hoursHeaderRef.current) return;
+    const container = hoursHeaderRef.current;
+    const containerRect = container.getBoundingClientRect();
+    const containerLeft = containerRect.left;
+    const totalW = container.clientWidth || container.scrollWidth;
+
+    const elements = container.querySelectorAll<HTMLElement>('[data-hour]');
+    const layouts: Record<number, { left: number; width: number }> = {};
+
+    elements.forEach((el) => {
+      const hStr = el.getAttribute('data-hour');
+      if (hStr !== null) {
+        const h = Number(hStr);
+        const elRect = el.getBoundingClientRect();
+        layouts[h] = {
+          left: Math.round((elRect.left - containerLeft) * 10) / 10,
+          width: Math.round(elRect.width * 10) / 10,
+        };
+      }
+    });
+
+    if (Object.keys(layouts).length > 0) {
+      setHourLayouts(layouts);
+      setTimelineTotalWidth(totalW);
+    }
+  }, []);
+
+  // ブラウザ描画（Paint）前に同期的にDOM実測を完了し、2段階描画・チラつきを完全排除
+  useLayoutEffect(() => {
+    measureHourLayouts();
+    if (!hoursHeaderRef.current) return;
+
+    const ro = new ResizeObserver(() => {
+      measureHourLayouts();
+    });
+    ro.observe(hoursHeaderRef.current);
+
+    window.addEventListener('resize', measureHourLayouts);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measureHourLayouts);
+    };
+  }, [measureHourLayouts, currentDate, localEvents, calendarMode, view, teamDaySubView, selectedOffice, selectedDivision, selectedGroupId, isSignageMode]);
+
+  // Drag and drop state
+  const [draggedEventId, setDraggedEventId] = useState<string | null>(null);
+  const draggedEventIdRef = useRef<string | null>(null);
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null);
+  const [draggedFromMemberId, setDraggedFromMemberId] = useState<string | null>(null);
+  const dragOverKeyRef = useRef<string | null>(null);
+  const rafDragOverRef = useRef<number | null>(null);
+
+  const setDragOverKeyThrottled = useCallback((newKey: string | null) => {
+    if (dragOverKeyRef.current === newKey) return;
+    dragOverKeyRef.current = newKey;
+    if (rafDragOverRef.current !== null) return;
+    rafDragOverRef.current = requestAnimationFrame(() => {
+      setDragOverKey(dragOverKeyRef.current);
+      rafDragOverRef.current = null;
+    });
+  }, []);
+
+  // リサイズ（ドラッグによる時間延長・短縮）状態
+  const [resizingEvent, setResizingEvent] = useState<{
+    event: CalendarEvent;
+    direction: 'horizontal' | 'vertical';
+    initialStartX: number;
+    initialStartY: number;
+    initialEndMs: number;
+    currentEndMs: number;
+    slotWidthPx?: number;
+    slotHeightPx?: number;
+    dateStr?: string;
+    initialEndX?: number;
+    hourLayouts?: Record<number, { left: number; width: number }>;
+  } | null>(null);
+
+  // D&D または リサイズ変更時の繰り返しスコープ決定モーダル用ステート
+  const [pendingRecurrenceUpdate, setPendingRecurrenceUpdate] = useState<{
+    updatedEvent: CalendarEvent;
+    originalInstanceDate?: string;
+  } | null>(null);
+
+  // リサイズ後の不必要なクリックイベント発火を防ぐためのフラグ
+  const wasResizedRef = useRef<boolean>(false);
+  // リサイズ中の最新状態を保持するためのRef（クロージャの古い状態を参照するのを防ぐ）
+  const resizingEventRef = useRef<typeof resizingEvent>(resizingEvent);
+  // リサイズ中の最新の終了ミリ秒タイムスタンプを直接保持するRef
+  const latestEndMsRef = useRef<number | null>(null);
+
+  // onUpdateEvent を最新に保つためのRef（useEffectの再実行によるリスナー破棄を防ぐ）
+  const onUpdateEventRef = useRef(onUpdateEvent);
+  useEffect(() => {
+    onUpdateEventRef.current = onUpdateEvent;
+  }, [onUpdateEvent]);
+
+  // 同期的にリサイズ状態を開始するためのヘルパー関数
+  const startResize = useCallback((params: NonNullable<typeof resizingEvent>) => {
+    resizingEventRef.current = params;
+    latestEndMsRef.current = params.currentEndMs;
+    setResizingEvent(params);
+  }, []);
+
+  // リサイズ操作中のマウス移動 & マウスアップのグローバルリスナー
+  useEffect(() => {
+    if (!resizingEvent) return;
+
+    // リサイズ中のテキスト選択やカーソルのちらつきを防止
+    const originalUserSelect = document.body.style.userSelect;
+    const originalCursor = document.body.style.cursor;
+    document.body.style.userSelect = 'none';
+    document.body.style.cursor = resizingEvent.direction === 'horizontal' ? 'ew-resize' : 'ns-resize';
+
+    const handleMouseMove = (e: MouseEvent) => {
+      const currentResizing = resizingEventRef.current;
+      if (!currentResizing) return;
+
+      if (e.cancelable) e.preventDefault();
+      wasResizedRef.current = true; // リサイズが行われたことを記録
+
+      const deltaX = e.clientX - currentResizing.initialStartX;
+      const deltaY = e.clientY - currentResizing.initialStartY;
+      const startMs = new Date(currentResizing.event.start).getTime();
+
+      let newEndMs = currentResizing.initialEndMs;
+      if (currentResizing.direction === 'horizontal' && currentResizing.hourLayouts && currentResizing.initialEndX !== undefined) {
+        const currentX = currentResizing.initialEndX + deltaX;
+        const layouts = currentResizing.hourLayouts;
+        let targetHour = 0;
+        let found = false;
+        let frac = 0;
+        const hours = Object.keys(layouts).map(Number).sort((a,b) => a - b);
+        for (const h of hours) {
+          const layout = layouts[h];
+          if (currentX >= layout.left && currentX <= layout.left + layout.width) {
+            targetHour = h;
+            frac = (currentX - layout.left) / layout.width;
+            found = true;
+            break;
+          }
+        }
+        
+        const newDate = new Date(currentResizing.event.start);
+        if (found) {
+          newDate.setHours(targetHour);
+          const rawMinutes = frac * 60;
+          newDate.setMinutes(Math.round(rawMinutes / 15) * 15);
+        } else if (hours.length > 0) {
+          const minHour = hours[0];
+          const maxHour = hours[hours.length - 1];
+          if (currentX < layouts[minHour].left) {
+            newDate.setHours(minHour);
+            newDate.setMinutes(0);
+          } else {
+            newDate.setHours(maxHour);
+            newDate.setMinutes(60);
+          }
+        }
+        newDate.setSeconds(0);
+        newDate.setMilliseconds(0);
+        newEndMs = newDate.getTime();
+      } else if (currentResizing.direction === 'horizontal') {
+        const slotWidth = currentResizing.slotWidthPx && currentResizing.slotWidthPx > 0 ? currentResizing.slotWidthPx : 100;
+        const rawMinutes = (deltaX / slotWidth) * 60;
+        const deltaMinutes = Math.round(rawMinutes / 15) * 15;
+        newEndMs = currentResizing.initialEndMs + deltaMinutes * 60 * 1000;
+      } else {
+        const slotHeight = currentResizing.slotHeightPx && currentResizing.slotHeightPx > 0 ? currentResizing.slotHeightPx : 50;
+        const rawMinutes = (deltaY / slotHeight) * 60;
+        const deltaMinutes = Math.round(rawMinutes / 15) * 15;
+        newEndMs = currentResizing.initialEndMs + deltaMinutes * 60 * 1000;
+      }
+
+      const minEndMs = startMs + 15 * 60 * 1000;
+      if (newEndMs < minEndMs) {
+        newEndMs = minEndMs;
+      }
+
+      // ★ 最重要: 最新の newEndMs を Ref に同期（handleMouseUp で確実に参照できるようにする）
+      latestEndMsRef.current = newEndMs;
+      currentResizing.currentEndMs = newEndMs;
+      resizingEventRef.current = { ...currentResizing, currentEndMs: newEndMs };
+
+      // 値が変わった時だけstateを更新してUIを再レンダリング
+      if (currentResizing.currentEndMs !== newEndMs || !resizingEvent || resizingEvent.currentEndMs !== newEndMs) {
+        setResizingEvent(prev => prev ? { ...prev, currentEndMs: newEndMs } : null);
+      }
+    };
+
+    const handleMouseUp = () => {
+      const finalResizing = resizingEventRef.current;
+      const finalEndMs = latestEndMsRef.current ?? finalResizing?.currentEndMs;
+
+      if (finalResizing && finalEndMs !== null && finalEndMs !== undefined && finalEndMs !== finalResizing.initialEndMs) {
+        const resizedEv = finalResizing.event;
+        const newEndIso = new Date(finalEndMs).toISOString();
+
+        const isRecurring = !!(resizedEv.recurrence && resizedEv.recurrence.frequency && resizedEv.recurrence.frequency !== 'none') ||
+          !!resizedEv.recurrenceParentId ||
+          isExpandedRecurrenceId(resizedEv.id) ||
+          !!resizedEv.instanceDate ||
+          !!resizedEv.recurrenceOriginalDate;
+
+        const origDate = resizedEv.instanceDate || resizedEv.recurrenceOriginalDate || (isExpandedRecurrenceId(resizedEv.id) ? extractDateFromInstanceId(resizedEv.id) : (resizedEv.start ? getLocalDateStr(resizedEv.start) : undefined));
+
+        const updatedEvObj: CalendarEvent = {
+          ...resizedEv,
+          end: newEndIso,
+        };
+
+        if (isRecurring) {
+          setPendingRecurrenceUpdate({
+            updatedEvent: updatedEvObj,
+            originalInstanceDate: origDate,
+          });
+        } else {
+          // ★ 即座にローカルステートを楽観的更新し、一瞬たりとも元の時間に戻る現象（ちらつき）を完全に防止
+          recentOptimisticEventsRef.current.set(String(updatedEvObj.id), {
+            event: updatedEvObj,
+            timestamp: Date.now(),
+          });
+          setLocalEvents(prev => {
+            const plan = planRecurrenceSave(prev, updatedEvObj, 'all');
+            return plan.updatedEvents;
+          });
+          onUpdateEventRef.current?.(updatedEvObj, 'all');
+        }
+      }
+      
+      latestEndMsRef.current = null;
+      resizingEventRef.current = null;
+      lockedTimelineHoursRef.current = null;
+      lockedActiveHoursSetRef.current = null;
+      setResizingEvent(null);
+      // リサイズ確定後に新しいスケジュールに合わせて時間レイアウトを再測定
+      requestAnimationFrame(() => {
+        measureHourLayouts();
+      });
+      // クリックイベントが処理される時間を待ってからフラグをリセットする
+      setTimeout(() => {
+        wasResizedRef.current = false;
+      }, 150);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove, { passive: false });
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.body.style.userSelect = originalUserSelect;
+      document.body.style.cursor = originalCursor;
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [!!resizingEvent]);
+
+  const officeNames = useMemo(() => {
+    const list = [
+      ...offices.map(o => o.name),
+      ...((allUsers || []).map(u => resolveOfficeName(u.officeId || u.office, offices)).filter(Boolean)),
+      ...(initialOffice ? [resolveOfficeName(initialOffice, offices) || initialOffice] : []),
+      ...(selectedOffice ? [resolveOfficeName(selectedOffice, offices) || selectedOffice] : []),
+    ];
+    return Array.from(new Set(list));
+  }, [offices, allUsers, initialOffice, selectedOffice]);
+
+  const divisionNames = useMemo(() => {
+    const list = [
+      ...divisions.map(d => d.name),
+      ...((allUsers || []).map(u => resolveDivisionName(u.divisionId || u.division, divisions)).filter(Boolean)),
+      ...(initialDivision ? [resolveDivisionName(initialDivision, divisions) || initialDivision] : []),
+      ...(selectedDivision ? [resolveDivisionName(selectedDivision, divisions) || selectedDivision] : []),
+    ];
+    return Array.from(new Set(list));
+  }, [divisions, allUsers, initialDivision, selectedDivision]);
+
+  // 表示期間の前後を含む展開用日付範囲（前後2〜3ヶ月）
+  const viewWindowStart = useMemo(() => new Date(currentDate.getFullYear(), currentDate.getMonth() - 2, 1), [currentDate.getFullYear(), currentDate.getMonth()]);
+  const viewWindowEnd = useMemo(() => new Date(currentDate.getFullYear(), currentDate.getMonth() + 3, 0), [currentDate.getFullYear(), currentDate.getMonth()]);
+  const viewRangeStartStr = useMemo(() => getLocalDateStr(viewWindowStart), [viewWindowStart]);
+  const viewRangeEndStr = useMemo(() => getLocalDateStr(viewWindowEnd), [viewWindowEnd]);
+
+  // 過去月へ遡った際に、未取得の過去期間があればオンデマンドで拡張取得
+  const earliestRequestedFromRef = useRef<string>(
+    getLocalDateStr(new Date(Date.now() - 170 * 24 * 60 * 60 * 1000))
+  );
+  useEffect(() => {
+    if (viewRangeStartStr < earliestRequestedFromRef.current && onRefetchEvents) {
+      earliestRequestedFromRef.current = viewRangeStartStr;
+      onRefetchEvents({ from: viewRangeStartStr });
+    }
+  }, [viewRangeStartStr, onRefetchEvents]);
+
+  // リスト表示の段階的DOM描画件数（月・フィルタ変更時に50件へリセット）
+  const [visibleListCount, setVisibleListCount] = useState<number>(50);
+  useEffect(() => {
+    setVisibleListCount(50);
+  }, [currentDate.getFullYear(), currentDate.getMonth(), selectedTypeFilter, calendarMode, selectedOffice, selectedDivision]);
+
+  const expandedEvents = React.useMemo(() => {
+    return expandRecurringEvents(localEvents, viewWindowStart, viewWindowEnd);
+  }, [localEvents, viewWindowStart, viewWindowEnd]);
+
+  const processedInitialEventIdRef = React.useRef<string | null>(null);
+
+  useEffect(() => {
+    if (initialEventId && processedInitialEventIdRef.current !== initialEventId) {
+      let targetEv = expandedEvents.find(e => e.id === initialEventId);
+      if (!targetEv) {
+        const matchingInstances = expandedEvents.filter(e => e.recurrenceParentId === initialEventId || e.id === initialEventId);
+        if (matchingInstances.length > 0) {
+          const nowMs = Date.now();
+          matchingInstances.sort((a, b) => {
+            const diffA = Math.abs(new Date(a.start).getTime() - nowMs);
+            const diffB = Math.abs(new Date(b.start).getTime() - nowMs);
+            return diffA - diffB;
+          });
+          targetEv = matchingInstances[0];
+        }
+      }
+      if (targetEv) {
+        processedInitialEventIdRef.current = initialEventId;
+        setSelectedDetailEvent(targetEv);
+        if (targetEv.start) {
+          setCurrentDate(new Date(targetEv.start));
+        }
+        if (onClearInitialEventId) {
+          onClearInitialEventId();
+        }
+      }
+    }
+  }, [initialEventId, expandedEvents, onClearInitialEventId]);
+  
+  // イベントのフィルタリング処理をメモ化して再計算を防止
+  const filteredEvents = React.useMemo(() => {
+    const list = expandedEvents.filter(e => {
+      if (selectedTypeFilter !== 'all' && e.type !== selectedTypeFilter) {
+        return false;
+      }
+
+      // 「他人から隠す」(isPrivate または isSecret) が有効な非公開予定の制御
+      // ※ログイン中のユーザー (currentUser) に閲覧権限があるかどうかで厳密に判定を維持
+      if (!isEventVisibleToUser(e, currentUser)) {
+        return false;
+      }
+
+      // 個人カレンダー表示（personal mode）の場合：選択中の対象メンバー（activePersonalUser）が参加者に含まれる予定のみ表示
+      if (calendarMode === 'personal' && activePersonalUser) {
+        const isAttendee = e.attendees ? e.attendees.some(a => {
+          if (!a) return false;
+          return a.id === activePersonalUser.id ||
+            String(a.id) === String(activePersonalUser.id) ||
+            a.name === activePersonalUser.name ||
+            (a.email && activePersonalUser.email && a.email === activePersonalUser.email);
+        }) : false;
+        if (!isAttendee) return false;
+      }
+
+      return true;
+    });
+
+    // 確定前（オープン）の日程調整候補枠をカレンダー予定に常に表示
+    if (openSchedulePolls && openSchedulePolls.length > 0 && selectedTypeFilter === 'all') {
+      openSchedulePolls.forEach(poll => {
+        if (poll.status !== 'open') return;
+        const myId = String(currentUser?.id || '');
+        const targetPersonalId = String(activePersonalUser?.id || myId);
+        const isOrganizer = String(poll.organizerId) === myId;
+        const isTarget = Array.isArray(poll.targetUserIds) && poll.targetUserIds.map(String).includes(myId);
+        const isPersonalUserInvolved =
+          String(poll.organizerId) === targetPersonalId ||
+          (Array.isArray(poll.targetUserIds) && poll.targetUserIds.map(String).includes(targetPersonalId));
+        
+        // 個人モード時は選択中の対象メンバーが主催または参加対象のもののみ
+        if (calendarMode === 'personal' && !isPersonalUserInvolved) return;
+
+        const targetCount = poll.targetUserIds?.length || 0;
+        const ansCount = poll.answeredCount !== undefined
+          ? poll.answeredCount
+          : (poll.answeredUserIds || []).filter(uid => (poll.targetUserIds || []).includes(uid)).length;
+        const isAllDone = targetCount > 0 && ansCount >= targetCount;
+        const hasMyAnswer = (poll.answeredUserIds || []).includes(myId);
+
+        const attendeesList = (allUsers || []).filter(u =>
+          (poll.targetUserIds || []).includes(u.id) || String(u.id) === String(poll.organizerId)
+        );
+
+        (poll.candidates || []).forEach(cand => {
+          if (!cand.startAt) return;
+          const virtualEv: CalendarEvent = {
+            id: `poll_${poll.id}_${cand.id}`,
+            title: `⏳[調整中] ${poll.title} (${ansCount}/${targetCount}人回答)`,
+            start: cand.startAt,
+            end: cand.endAt || cand.startAt,
+            type: 'personal',
+            memo: `【日程調整候補枠】${poll.title}\n主催者: ${poll.organizerName}\n回答状況: ${ansCount} / ${targetCount}人 回答済み\n所要時間: ${poll.durationMinutes}分\n\n※クリックすると日程調整アンケートの詳細・回答・確定画面を開きます。`,
+            attendees: attendeesList,
+            isAllDay: false,
+            isGoogleSynced: false,
+            isSchedulePoll: true,
+            pollId: poll.id,
+            isPollOrganizer: isOrganizer,
+            isPollAllAnswered: isAllDone,
+            hasMyPollAnswer: hasMyAnswer,
+            pollAnsweredCount: ansCount,
+            pollTotalTargetCount: targetCount,
+          };
+          list.push(virtualEv);
+        });
+      });
+    }
+
+    // 資産点検予定を動的オーバーレイ表示（個人所有・使用者指定ありのみ / DB複製なし）
+    if (assetSchedules.length > 0 && (selectedTypeFilter === 'all' || selectedTypeFilter === 'inspection')) {
+      const userById = new Map((allUsers || []).map(u => [String(u.id), u]));
+      const targetPersonalId = String(activePersonalUser?.id || currentUser?.id || '');
+
+      assetSchedules.forEach(sched => {
+        if (!sched.eventDate || sched.isShared || !sched.assigneeUserId) return;
+        const assigneeUid = String(sched.assigneeUserId);
+        if (calendarMode === 'personal' && targetPersonalId && assigneeUid !== targetPersonalId) {
+          return;
+        }
+        const assigneeUser = userById.get(assigneeUid);
+        const virtualEv: CalendarEvent = {
+          id: `asset_insp_${sched.assetId}_${sched.eventDate}`,
+          title: `🔧[資産点検${sched.isDueOrOverdue ? '·要確認' : ''}] ${sched.assetName}${sched.inspectionType ? ` (${sched.inspectionType})` : ''}`,
+          start: `${sched.eventDate}T09:00:00+09:00`,
+          end: `${sched.eventDate}T10:00:00+09:00`,
+          type: 'inspection',
+          memo: [
+            `【資産点検予定】${sched.assetName}${sched.categoryName ? ` (${sched.categoryName})` : ''}`,
+            sched.inspectionType ? `内容: ${sched.inspectionType}` : '',
+            sched.vendor ? `業者: ${sched.vendor}` : '',
+            sched.isDueOrOverdue
+              ? '※予定日到来・実施確認待ち（クリックで資産点検タブを開きます）'
+              : '※クリックで資産管理の点検タブを開きます'
+          ].filter(Boolean).join('\n'),
+          attendees: assigneeUser ? [assigneeUser] : [],
+          isAllDay: true,
+          isGoogleSynced: false,
+          isAssetInspection: true,
+          assetId: sched.assetId,
+          assetLogId: sched.logId,
+          assetDueConfirmation: sched.isDueOrOverdue,
+          assetCategoryName: sched.categoryName,
+        };
+        list.push(virtualEv);
+      });
+    }
+
+    return list;
+  }, [expandedEvents, selectedTypeFilter, currentUser, activePersonalUser, calendarMode, openSchedulePolls, allUsers, assetSchedules]);
+
+  // チーム表示用の所属メンバー抽出をメモ化 (マイグループ選択時はそのメンバー、未選択時は拠点・部署マスターID照合)
+  const teamMembers = React.useMemo(() => {
+    if (activeSelectedGroup) {
+      const userMap = new Map((allUsers || []).map(u => [String(u.id), u]));
+      return activeSelectedGroup.memberIds
+        .map(id => userMap.get(String(id)))
+        .filter((u): u is User => Boolean(u));
+    }
+    return (allUsers || []).filter(u => {
+      if (selectedOffice === '全社' || selectedOffice === '全拠点' || selectedDivision === '全部署') {
+        return false;
+      }
+      return doesUserMatchOffice(u, selectedOffice, offices) && doesUserMatchDivision(u, selectedDivision, divisions);
+    });
+  }, [allUsers, selectedOffice, selectedDivision, activeSelectedGroup, offices, divisions]);
+
+  const handleToggleMode = (mode: 'personal' | 'team') => {
+    setCalendarMode(mode);
+    if (mode === 'team') {
+      let nextOffice = selectedOffice;
+      if (selectedOffice === '全社' || selectedOffice === '全拠点') {
+        const targetOffice = getUserOfficeName(currentUser, offices) || officeNames.find(o => o !== '全社' && o !== '全拠点') || officeNames[0] || '';
+        if (targetOffice) {
+          setSelectedOffice(targetOffice);
+          nextOffice = targetOffice;
+        }
+      }
+      let nextDivision = selectedDivision;
+      if (selectedDivision === '全部署') {
+        const targetDivision = getUserDivisionName(currentUser, divisions) || divisionNames.find(d => d !== '全部署') || divisionNames[0] || '';
+        if (targetDivision) {
+          setSelectedDivision(targetDivision);
+          nextDivision = targetDivision;
+        }
+      }
+      
+      if (view !== 'week' && view !== 'day') {
+        setView('week');
+      }
+    } else if (mode === 'personal' && selectedGroupId === 'org' && activePersonalUser) {
+      const offName = getUserOfficeName(activePersonalUser, offices);
+      if (offName) setSelectedOffice(offName);
+      const divName = getUserDivisionName(activePersonalUser, divisions);
+      if (divName) setSelectedDivision(divName);
+    }
+  };
+
+  const changeDate = (offset: number) => {
+    const newDate = new Date(currentDate);
+    if (view === 'month' || view === 'list') {
+      newDate.setMonth(currentDate.getMonth() + offset);
+    } else if (view === 'week') {
+      newDate.setDate(currentDate.getDate() + offset * 7);
+    } else if (view === 'day') {
+      newDate.setDate(currentDate.getDate() + offset);
+    }
+    setCurrentDate(newDate);
+  };
+
+  const openAddModalWithDate = (
+    dateStr?: string,
+    initialAttendees?: User[],
+    endDateStr?: string,
+    isAllDay?: boolean
+  ) => {
+    setEditingEvent(null);
+    setEditingEventMember(null);
+    setSelectedInitialDate(dateStr);
+    let calculatedEnd = endDateStr;
+    if (!calculatedEnd && dateStr && dateStr.includes('T')) {
+      calculatedEnd = addMinutesToLocalDatetime(dateStr, 60);
+    }
+    setSelectedEndDate(calculatedEnd || dateStr);
+    const isMultiDay = (dateStr && calculatedEnd && dateStr.split('T')[0] !== calculatedEnd.split('T')[0]);
+    setSelectedIsAllDay(isAllDay !== undefined ? isAllDay : (isMultiDay ? true : false));
+    const effectiveAttendees =
+      initialAttendees && initialAttendees.length > 0
+        ? initialAttendees
+        : calendarMode === 'personal' && activePersonalUser
+        ? [activePersonalUser]
+        : undefined;
+    setPreselectedAttendees(effectiveAttendees);
+    setIsModalOpen(true);
+  };
+
+  const getSelectionRange = useCallback(() => {
+    if (!selectionStart || !selectionEnd) return null;
+    if (selectionStart <= selectionEnd) {
+      return { start: selectionStart, end: selectionEnd };
+    } else {
+      return { start: selectionEnd, end: selectionStart };
+    }
+  }, [selectionStart, selectionEnd]);
+
+  const isDateInSelectionRange = (dateStr: string, memberId?: string) => {
+    const range = getSelectionRange();
+    if (!range) return false;
+    if (selectionMemberId) {
+      if (memberId !== selectionMemberId) return false;
+    }
+    return dateStr >= range.start && dateStr <= range.end;
+  };
+
+  // ★ 高速化のためのイベント辞書作成（全画面での O(N) 検索を防止する）
+  // 表示ウィンドウ範囲 [viewRangeStartStr, viewRangeEndStr] にクランプし、JST明示パースで不要な全期間走査を排除
+  const eventDictionary = React.useMemo(() => {
+    const map = new Map<string, CalendarEvent[]>();
+    
+    filteredEvents.forEach(e => {
+      const rawStartStr = getLocalDateStr(e.start);
+      const rawEndStr = e.end ? getLocalDateStr(e.end) : rawStartStr;
+
+      // 表示ウィンドウ外に完全に外れている予定は辞書展開をスキップ
+      if (rawEndStr < viewRangeStartStr || rawStartStr > viewRangeEndStr) {
+        return;
+      }
+
+      const clampedStartStr = rawStartStr < viewRangeStartStr ? viewRangeStartStr : rawStartStr;
+      const clampedEndStr = rawEndStr > viewRangeEndStr ? viewRangeEndStr : rawEndStr;
+      
+      // 対象日付範囲を計算 (JST基準で開始日から終了日まで)
+      const dateKeys: string[] = [];
+      if (clampedStartStr === clampedEndStr) {
+        dateKeys.push(clampedStartStr);
+      } else {
+        let current = new Date(`${clampedStartStr}T00:00:00+09:00`);
+        const end = new Date(`${clampedEndStr}T00:00:00+09:00`);
+        let guard = 0;
+        while (current <= end && guard < 370) {
+          dateKeys.push(getLocalDateStr(current));
+          current = new Date(current.getTime() + 24 * 60 * 60 * 1000);
+          guard++;
+        }
+      }
+      
+      dateKeys.forEach(dateStr => {
+        // 全員用（日付キーのみ）
+        const generalKey = `date_${dateStr}`;
+        let genArr = map.get(generalKey);
+        if (!genArr) {
+          genArr = [];
+          map.set(generalKey, genArr);
+        }
+        genArr.push(e);
+
+        // 参加者ごと（チーム表示用） O(1) ハッシュ検索キー
+        if (e.attendees && e.attendees.length > 0) {
+          e.attendees.forEach(a => {
+            if (a) {
+              const key1 = `date_${dateStr}_user_${a.id}`;
+              const key2 = `date_${dateStr}_user_${String(a.id)}`;
+              let arr1 = map.get(key1);
+              if (!arr1) {
+                arr1 = [];
+                map.set(key1, arr1);
+              }
+              arr1.push(e);
+              if (key1 !== key2) {
+                let arr2 = map.get(key2);
+                if (!arr2) {
+                  arr2 = [];
+                  map.set(key2, arr2);
+                }
+                arr2.push(e);
+              }
+            }
+          });
+        }
+      });
+    });
+
+    return map;
+  }, [filteredEvents, viewRangeStartStr, viewRangeEndStr]);
+
+  const isEventOccurringOnDate = (e: CalendarEvent, dateStr: string) => {
+    const startStr = getLocalDateStr(e.start);
+    const endStr = e.end ? getLocalDateStr(e.end) : startStr;
+    return dateStr >= startStr && dateStr <= endStr;
+  };
+
+  const sortEvents = (eventsList: CalendarEvent[]) => {
+    return [...eventsList].sort((a, b) => {
+      const aStart = getLocalDateStr(a.start);
+      const bStart = getLocalDateStr(b.start);
+      const aEnd = a.end ? getLocalDateStr(a.end) : aStart;
+      const bEnd = b.end ? getLocalDateStr(b.end) : bStart;
+
+      const aIsMultiDay = aStart !== aEnd;
+      const bIsMultiDay = bStart !== bEnd;
+
+      if (aIsMultiDay && !bIsMultiDay) return -1;
+      if (!aIsMultiDay && bIsMultiDay) return 1;
+
+      if (aStart !== bStart) return aStart.localeCompare(bStart);
+
+      const aDuration = new Date(aEnd).getTime() - new Date(aStart).getTime();
+      const bDuration = new Date(bEnd).getTime() - new Date(bStart).getTime();
+      if (aDuration !== bDuration) return bDuration - aDuration;
+
+      if (a.isAllDay && !b.isAllDay) return -1;
+      if (!a.isAllDay && b.isAllDay) return 1;
+
+      return new Date(a.start).getTime() - new Date(b.start).getTime();
+    });
+  };
+
+  const multiDayTypeStyles: Record<EventType, string> = {
+    personal: 'bg-emerald-600 text-white border-emerald-700 hover:bg-emerald-700 shadow-2xs',
+    construction: 'bg-amber-600 text-white border-amber-700 hover:bg-amber-700 shadow-2xs',
+    inspection: 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700 shadow-2xs',
+    replacement: 'bg-cyan-600 text-white border-cyan-700 hover:bg-cyan-700 shadow-2xs',
+    repair: 'bg-rose-600 text-white border-rose-700 hover:bg-rose-700 shadow-2xs',
+    visitor: 'bg-orange-600 text-white border-orange-700 hover:bg-orange-700 shadow-2xs',
+    business_trip: 'bg-sky-600 text-white border-sky-700 hover:bg-sky-700 shadow-2xs',
+    meeting: 'bg-violet-600 text-white border-violet-700 hover:bg-violet-700 shadow-2xs'
+  };
+
+  const getEventStyle = (e: CalendarEvent, forceSolid = false) => {
+    if (e.isSchedulePoll) {
+      if (e.isPollOrganizer && e.isPollAllAnswered) {
+        return 'bg-gradient-to-r from-emerald-100 to-teal-100 text-emerald-950 border-emerald-400 border-dashed animate-pulse font-bold hover:bg-emerald-200';
+      }
+      if (!e.isPollOrganizer && !e.hasMyPollAnswer) {
+        return 'bg-gradient-to-r from-amber-100 to-orange-100 text-amber-950 border-amber-400 border-dashed animate-pulse font-bold hover:bg-amber-200';
+      }
+      return 'bg-amber-50 text-amber-900 border-amber-300 border-dashed hover:bg-amber-100';
+    }
+    if (e.isAssetInspection) {
+      if (e.assetDueConfirmation) {
+        return 'bg-rose-50 text-rose-900 border-rose-400 border-dashed font-bold hover:bg-rose-100';
+      }
+      return 'bg-indigo-50 text-indigo-900 border-indigo-300 border-dashed font-bold hover:bg-indigo-100';
+    }
+    const startStr = getLocalDateStr(e.start);
+    const endStr = e.end ? getLocalDateStr(e.end) : startStr;
+    const isMultiDay = startStr !== endStr;
+    if (forceSolid || e.isAllDay || isMultiDay) {
+      return multiDayTypeStyles[e.type] || 'bg-indigo-600 text-white border-indigo-700 hover:bg-indigo-700';
+    }
+    return typeStyles[e.type];
+  };
+
+  const getMultiDayStyle = (e: CalendarEvent, cellDateStr: string, isMonth = false) => {
+    const startStr = getLocalDateStr(e.start);
+    const endStr = e.end ? getLocalDateStr(e.end) : startStr;
+
+    if (startStr === endStr) {
+      return {
+        isMultiDay: false,
+        containerClass: isMonth ? 'rounded-md shadow-2xs mx-1 px-1.5' : 'rounded-md shadow-2xs',
+        showTitle: true,
+      };
+    }
+
+    const isStartDay = cellDateStr === startStr;
+    const isEndDay = cellDateStr === endStr;
+    const cellDate = new Date(cellDateStr);
+    const isWeekFirstDay = cellDate.getDay() === 0;
+
+    if (isMonth) {
+      if (isStartDay) {
+        return {
+          isMultiDay: true,
+          containerClass: 'rounded-l-full rounded-r-none border-r-0 relative z-20 font-bold text-white shadow-xs ml-1 mr-0 pr-2 pl-2',
+          showTitle: true,
+        };
+      } else if (isEndDay) {
+        return {
+          isMultiDay: true,
+          containerClass: 'rounded-r-full rounded-l-none border-l-0 relative z-20 font-bold text-white shadow-xs mr-1 ml-0 pl-2 pr-2',
+          showTitle: isWeekFirstDay,
+        };
+      } else {
+        return {
+          isMultiDay: true,
+          containerClass: 'rounded-none border-x-0 relative z-20 font-bold text-white shadow-2xs mx-0 px-2',
+          showTitle: isWeekFirstDay,
+        };
+      }
+    }
+
+    if (isStartDay) {
+      return {
+        isMultiDay: true,
+        containerClass: 'rounded-l-full rounded-r-none border-r-0 relative z-20 font-bold text-white shadow-xs -mr-2.5 pr-3 ml-0.5',
+        showTitle: true,
+      };
+    } else if (isEndDay) {
+      return {
+        isMultiDay: true,
+        containerClass: 'rounded-r-full rounded-l-none border-l-0 relative z-20 font-bold text-white shadow-xs -ml-2.5 pl-3 mr-0.5',
+        showTitle: isWeekFirstDay,
+      };
+    } else {
+      return {
+        isMultiDay: true,
+        containerClass: 'rounded-none border-x-0 relative z-20 font-bold text-white shadow-2xs -mx-2.5 px-2.5',
+        showTitle: isWeekFirstDay,
+      };
+    }
+  };
+
+  const handleCellMouseDown = (e: React.MouseEvent, dateStr: string, attendees?: User[]) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest('[data-event-card="true"]')) return;
+    setIsSelectingRange(true);
+    setSelectionStart(dateStr);
+    setSelectionEnd(dateStr);
+    setSelectionAttendees(attendees);
+    setSelectionMemberId(attendees && attendees.length > 0 ? attendees[0].id : null);
+  };
+
+  const handleCellMouseEnter = (dateStr: string) => {
+    if (isSelectingRange) {
+      setSelectionEnd(dateStr);
+    }
+  };
+
+  useEffect(() => {
+    const handleGlobalMouseUp = () => {
+      if (isSelectingRange) {
+        setIsSelectingRange(false);
+        const range = getSelectionRange();
+        if (range) {
+          const isMultiDay = range.start !== range.end;
+          openAddModalWithDate(range.start, selectionAttendees, range.end, isMultiDay);
+        }
+        setSelectionStart(null);
+        setSelectionEnd(null);
+        setSelectionAttendees(undefined);
+        setSelectionMemberId(null);
+      }
+    };
+
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+    return () => {
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [isSelectingRange, getSelectionRange, selectionAttendees]);
+
+  const handleEventClick = (e: React.MouseEvent, event: CalendarEvent, member?: User) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (event.isSchedulePoll && event.pollId) {
+      if (onOpenSchedulePollModal) {
+        onOpenSchedulePollModal(event.pollId);
+      }
+      return;
+    }
+    if (event.isAssetInspection && event.assetId) {
+      if (onNavigateToAsset) {
+        onNavigateToAsset(event.assetId, 'inspections');
+      }
+      return;
+    }
+    if (wasResizedRef.current) return; // リサイズ操作直後のクリックを無効化
+    setSelectedDetailMember(calendarMode === 'team' && member ? member : null);
+    setSelectedDetailEvent(event);
+  };
+
+  const handleSaveEvent = (
+    eventData: Omit<CalendarEvent, 'id'> | CalendarEvent,
+    scope?: RecurrenceActionScope,
+    originalInstanceDate?: string
+  ) => {
+    if ('id' in eventData && eventData.id) {
+      recentOptimisticEventsRef.current.set(String(eventData.id), {
+        event: eventData as CalendarEvent,
+        timestamp: Date.now(),
+      });
+      setLocalEvents(prev => {
+        const plan = planRecurrenceSave(prev, eventData as CalendarEvent, scope, originalInstanceDate);
+        return plan.updatedEvents;
+      });
+      onUpdateEvent?.(eventData as CalendarEvent, scope, originalInstanceDate);
+    } else {
+      onAddEvent(eventData as Omit<CalendarEvent, 'id'>);
+    }
+  };
+
+  // チーム表示で複数メンバーの予定から「この1名のみを削除」を選んだ際、削除ではなく参加者調整として保存する
+  const executeSingleMemberRemoval = (
+    ev: CalendarEvent,
+    targetMember: User,
+    recurrenceScope: RecurrenceActionScope,
+    instanceDate?: string
+  ) => {
+    const remainingAttendees = (ev.attendees || []).filter(
+      a => String(a.id) !== String(targetMember.id)
+    );
+    if (remainingAttendees.length === 0) {
+      onDeleteEvent?.(ev.id, recurrenceScope, instanceDate || ev.instanceDate);
+      return;
+    }
+
+    const isExpanded = isExpandedRecurrenceId(ev.id);
+    const parentId = ev.recurrenceParentId || (isExpanded ? extractParentIdFromInstanceId(ev.id) : ev.id);
+    const parentEvent = localEvents.find(item => String(item.id) === String(parentId));
+
+    let payloadToSave: CalendarEvent;
+    if (recurrenceScope === 'all' && parentEvent) {
+      // シリーズ全体から1名を外す場合は、親イベント本来の開始日時・繰り返し設定を維持して参加者のみ更新する
+      payloadToSave = {
+        ...parentEvent,
+        attendees: remainingAttendees,
+      };
+    } else {
+      payloadToSave = {
+        ...ev,
+        attendees: remainingAttendees,
+        ...(recurrenceScope === 'this_and_following' && !ev.recurrence && parentEvent?.recurrence
+          ? { recurrence: parentEvent.recurrence }
+          : {}),
+      };
+    }
+
+    handleSaveEvent(payloadToSave, recurrenceScope, instanceDate || ev.instanceDate);
+  };
+
+  const closeAllEventActionModals = () => {
+    setTeamDeleteState(null);
+    setSelectedDetailEvent(null);
+    setSelectedDetailMember(null);
+    setIsModalOpen(false);
+    setEditingEvent(null);
+    setEditingEventMember(null);
+    setIsCopyMode(false);
+    if (onClearInitialEventId) onClearInitialEventId();
+  };
+
+  const handleRequestTeamDelete = (event: CalendarEvent, targetMember: User) => {
+    const isRecurring = Boolean(
+      isRecurringEvent(event) ||
+      isExpandedRecurrenceId(event.id) ||
+      event.recurrenceParentId ||
+      event.instanceDate ||
+      event.recurrenceOriginalDate
+    );
+    const instanceDate =
+      event.instanceDate ||
+      event.recurrenceOriginalDate ||
+      (isExpandedRecurrenceId(event.id)
+        ? extractDateFromInstanceId(event.id)
+        : (event.start ? getLocalDateStr(event.start) : undefined));
+
+    setTeamDeleteState({
+      step: 'member_scope',
+      event,
+      targetMember,
+      isRecurring,
+      instanceDate,
+    });
+  };
+
+  const handleConfirmTeamMemberScope = (memberScope: TeamDeleteMemberScope) => {
+    if (!teamDeleteState) return;
+    if (teamDeleteState.isRecurring) {
+      setTeamDeleteState({
+        ...teamDeleteState,
+        step: 'recurrence_scope',
+        memberScope,
+      });
+      return;
+    }
+
+    const { event, targetMember, instanceDate } = teamDeleteState;
+    if (memberScope === 'all_members') {
+      onDeleteEvent?.(event.id, 'all', instanceDate);
+    } else {
+      executeSingleMemberRemoval(event, targetMember, 'all', instanceDate);
+    }
+    closeAllEventActionModals();
+  };
+
+  const handleConfirmTeamRecurrenceScope = (recurrenceScope: RecurrenceActionScope) => {
+    if (!teamDeleteState) return;
+    const { event, targetMember, memberScope, instanceDate } = teamDeleteState;
+    if (memberScope === 'all_members') {
+      onDeleteEvent?.(event.id, recurrenceScope, instanceDate);
+    } else {
+      executeSingleMemberRemoval(event, targetMember, recurrenceScope, instanceDate);
+    }
+    closeAllEventActionModals();
+  };
+
+  const handleCreateMemo = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!memoTargetUser) return;
+    if (!fromName.trim()) {
+      setConfirmModal({
+        isOpen: true,
+        title: '入力エラー',
+        message: '依頼者のお名前を入力してください。',
+        type: 'warning',
+        confirmText: '確認',
+      });
+      return;
+    }
+    if (!content.trim()) {
+      setConfirmModal({
+        isOpen: true,
+        title: '入力エラー',
+        message: '伝言の本文内容を入力してください。',
+        type: 'warning',
+        confirmText: '確認',
+      });
+      return;
+    }
+
+    const recipientStatus: MemoUserRecipientStatus = {
+      userId: memoTargetUser.id,
+      userName: memoTargetUser.name,
+      avatarUrl: memoTargetUser.avatarUrl,
+      department: memoTargetUser.department,
+      office: memoTargetUser.office,
+      division: memoTargetUser.division,
+      isViewed: false,
+      isHandled: false,
+    };
+
+    let reqText = '';
+    if (requirementType === 'phone_called') reqText = '電話がありました';
+    else if (requirementType === 'has_message') reqText = '伝言があります';
+    else if (requirementType === 'call_again') reqText = '再度電話します（折り返し不要）';
+    else if (requirementType === 'please_call_back') reqText = '折り返し連絡下さい';
+    else reqText = customRequirementText || '伝言';
+
+    const newMemo: Memo = {
+      id: `memo-${Date.now()}`,
+      fromName: fromName.trim(),
+      fromCompany: fromCompany.trim() || undefined,
+      fromPhone: fromPhone.trim() || undefined,
+      toUsers: [memoTargetUser],
+      toUser: memoTargetUser,
+      requirementType,
+      requirementText: reqText,
+      content: content.trim(),
+      status: 'unread',
+      createdAt: new Date().toISOString(),
+      createdByUser: currentUser,
+      recipientStatuses: [recipientStatus],
+    };
+
+    if (onUpdateMemos) {
+      onUpdateMemos([...memos, newMemo]);
+    }
+
+    if (memoTargetUser && memoTargetUser.id !== currentUser?.id) {
+      triggerPushNotification({
+        targetUserId: memoTargetUser.id,
+        excludeUserId: currentUser?.id,
+        title: `📞 伝言メモ: ${fromCompany ? `${fromCompany} ` : ''}${fromName}様`,
+        body: `【${reqText}】${content ? ` ${content.slice(0, 40)}` : ''}`,
+        url: `/?tab=memo&memoId=${newMemo.id}`,
+        tag: `memo-${newMemo.id}`
+      });
+    }
+
+    // Reset and close
+    setFromName('');
+    setFromCompany('');
+    setFromPhone('');
+    setRequirementType('phone_called');
+    setCustomRequirementText('');
+    setContent('');
+    setIsMemoModalOpen(false);
+    setMemoTargetUser(null);
+  };
+
+  // チーム表示用の週の日付算出
+  const getWeekDates = (date: Date) => {
+    const current = new Date(date);
+    const day = current.getDay();
+    const sunday = new Date(current);
+    sunday.setDate(current.getDate() - day);
+    
+    const dates: Date[] = [];
+    for (let i = 0; i < 7; i++) {
+      const next = new Date(sunday);
+      next.setDate(sunday.getDate() + i);
+      dates.push(next);
+    }
+    return dates;
+  };
+
+  // チーム週表示のレンダリング
+  const renderTeamWeekView = () => {
+    const rawDates = getWeekDates(currentDate);
+    const dates = calendarSettings.hideWeekends
+      ? rawDates.filter(d => d.getDay() !== 0 && d.getDay() !== 6)
+      : rawDates;
+    const dayNames = ['日', '月', '火', '水', '木', '金', '土'];
+    const isCompact = calendarSettings.density === 'compact';
+
+    // 各曜日にチームメンバーの予定があるか確認
+    const dayHasEvents = dates.map(date => {
+      const dateStr = getLocalDateStr(date);
+      // teamMembersの誰かがその日に予定を持っているか判定
+      return teamMembers.some(member => {
+        const memberEvents = eventDictionary.get(`date_${dateStr}_user_${member.id}`);
+        return memberEvents && memberEvents.length > 0;
+      });
+    });
+
+    // 縦軸を全行で完全一致させるグリッドスタイル
+    // - メンバー列: 140px〜180px (コンパクト時は 130px〜160px)
+    // - 平日 (月〜金) または 予定のある土日: minmax(110px, 1fr) (均等幅を維持)
+    // - 予定のない土日のみ: minmax(46px, 0.45fr) (縮める)
+    const memberCol = isSignageMode ? '160px' : isCompact ? 'minmax(125px, 155px)' : 'minmax(140px, 180px)';
+    const teamWeekGridStyle = {
+      display: 'grid',
+      gridTemplateColumns: `${memberCol} ${dates.map((date, idx) => {
+        const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+        const hasEv = dayHasEvents[idx];
+        if (isWeekend && !hasEv) {
+          return 'minmax(46px, 0.45fr)';
+        }
+        return 'minmax(110px, 1fr)';
+      }).join(' ')}`,
+    };
+    
+    return (
+      <div className="min-w-full h-full overflow-auto divide-y divide-slate-200 bg-white flex flex-col">
+        {/* Table Header */}
+        <div
+          style={teamWeekGridStyle}
+          className="bg-slate-50 text-slate-700 text-xs font-bold shrink-0 sticky top-0 z-20 border-b border-slate-200 shadow-2xs"
+        >
+          <div className="p-2 sm:p-3 border-r border-slate-200 flex items-center justify-center sticky left-0 z-30 bg-slate-50 text-[11px] sm:text-xs">
+            メンバー
+          </div>
+          {dates.map((date, idx) => {
+            const isTodayDate = isSameDay(date, new Date());
+            const isWeekend = date.getDay() === 0 || date.getDay() === 6;
+            const hasEv = dayHasEvents[idx];
+            const isShrunk = isWeekend && !hasEv;
+            const weekendColor = date.getDay() === 0 ? 'text-rose-600' : date.getDay() === 6 ? 'text-blue-600' : 'text-slate-700';
+            
+            return (
+              <div 
+                key={idx} 
+                className={`p-2 sm:p-3 text-center border-r border-slate-200 last:border-r-0 flex flex-col items-center justify-center gap-0.5 transition-colors ${
+                  isTodayDate
+                    ? 'bg-indigo-50/70 border-b-2 border-b-indigo-500'
+                    : isShrunk
+                    ? 'bg-slate-100/60 text-slate-400'
+                    : ''
+                }`}
+                title={isShrunk ? `${date.getMonth() + 1}/${date.getDate()} (${dayNames[date.getDay()]}) - 予定なし` : undefined}
+              >
+                <span className={`${isShrunk ? 'text-slate-400 font-medium' : weekendColor} font-extrabold text-[11px] sm:text-xs truncate`}>
+                  {date.getMonth() + 1}/{date.getDate()} ({dayNames[date.getDay()]})
+                </span>
+                {isTodayDate && <span className="text-[9px] sm:text-[10px] bg-indigo-600 text-white font-semibold px-1 sm:px-1.5 py-0.5 rounded-full scale-90">今日</span>}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Table Body */}
+        <div className="flex-1 divide-y divide-slate-200 bg-white">
+          {teamMembers.map((member) => (
+            <TeamWeekMemberRow
+              key={member.id}
+              member={member}
+              dates={dates}
+              dayHasEvents={dayHasEvents}
+              eventDictionary={eventDictionary}
+              teamWeekGridStyle={teamWeekGridStyle}
+              draggedEventId={draggedEventId}
+              isSignageMode={isSignageMode}
+              onCellMouseDown={handleCellMouseDown}
+              onCellMouseEnter={handleCellMouseEnter}
+              onEventClick={handleEventClick}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
+              onDrop={handleDrop}
+              onOpenMemoModal={(m) => {
+                setMemoTargetUser(m);
+                setIsMemoModalOpen(true);
+              }}
+              getEventStyle={getEventStyle}
+              getMultiDayStyle={getMultiDayStyle}
+              formatEventTime={formatEventTime}
+              sortEvents={sortEvents}
+              isDateInSelectionRange={isDateInSelectionRange}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  // チーム日表示のレンダリング
+  const renderTeamDayView = () => {
+    const dateStr = getLocalDateStr(currentDate);
+
+    // 終了時間のないスケジュールも必ず開始+60分として扱うヘルパー
+    const getEventSpan = (e: CalendarEvent) => {
+      const sDate = new Date(e.start);
+      let eDate = e.end ? new Date(e.end) : new Date(sDate.getTime() + 60 * 60 * 1000);
+      if (isNaN(eDate.getTime()) || eDate.getTime() <= sDate.getTime()) {
+        eDate = new Date(sDate.getTime() + 60 * 60 * 1000);
+      }
+      return { sDate, eDate };
+    };
+
+    // 当日のチームメンバー関連イベント
+    const dayRelevantEvents = eventDictionary.get(`date_${dateStr}`)?.filter(e => {
+      return e.attendees?.some(a => a && teamMembers.some(m => m.id === a.id || String(m.id) === String(a.id) || m.name === a.name));
+    }) || [];
+
+    // 1. 時間範囲のフレキシブル算出 (基本は 8:00〜20:00、時間外の予定があれば自動拡張)
+    // ★ 終了時間の変更中は、ユーザーがマウスを離して確定するまで時間のメモリ（幅・目盛り範囲）を完全固定する
+    let hours: number[];
+    let activeHoursSet: Set<number>;
+
+    if (resizingEvent && lockedTimelineHoursRef.current && lockedActiveHoursSetRef.current) {
+      hours = lockedTimelineHoursRef.current;
+      activeHoursSet = lockedActiveHoursSetRef.current;
+    } else {
+      let minH = 8;
+      let maxH = 20;
+
+      if (calendarSettings.isTimeFilterActive) {
+        minH = calendarSettings.workStartHour ?? 8;
+        maxH = calendarSettings.workEndHour ?? 19;
+      } else {
+        dayRelevantEvents.forEach(e => {
+          if (e.isAllDay) return;
+          const { sDate, eDate } = getEventSpan(e);
+          const { hour: sHour } = getJstHourAndMinutes(sDate);
+          if (sHour < minH) {
+            minH = Math.max(0, sHour);
+          }
+          const { hour: eHour, minute: eMin } = getJstHourAndMinutes(eDate);
+          let endH = eHour;
+          if (eMin > 0) endH = Math.min(23, endH);
+          if (endH > maxH) maxH = Math.min(23, endH);
+        });
+      }
+
+      hours = Array.from({ length: Math.max(1, maxH - minH + 1) }, (_, i) => i + minH);
+
+      // 2. チームの誰かが予定を持っている時間帯（Active Hours）を特定
+      activeHoursSet = new Set<number>();
+      dayRelevantEvents.forEach(e => {
+        if (e.isAllDay) return;
+        const { sDate, eDate } = getEventSpan(e);
+        const { hour: sH } = getJstHourAndMinutes(sDate);
+        const { hour: eHour, minute: eMin } = getJstHourAndMinutes(eDate);
+        let eH = eHour;
+        if (eMin === 0 && eH > sH) {
+          eH = eH - 1;
+        }
+        for (let h = sH; h <= eH; h++) {
+          if (h >= minH && h <= maxH) {
+            activeHoursSet.add(h);
+          }
+        }
+      });
+
+      // リサイズ中の場合は開始時の目盛りをロック保持
+      if (resizingEvent && !lockedTimelineHoursRef.current) {
+        lockedTimelineHoursRef.current = hours;
+        lockedActiveHoursSetRef.current = activeHoursSet;
+      }
+    }
+
+    const minHour = hours.length > 0 ? hours[0] : 8;
+    const maxHour = hours.length > 0 ? hours[hours.length - 1] : 20;
+
+    // 3. グリッド列のテンプレート設定（予定あり時間は見やすく広く、予定なし時間はスリムに伸縮）
+    const memberColWidth = isSignageMode ? '160px' : '170px';
+    const hoursGridStyle: React.CSSProperties = {
+      display: 'grid',
+      gridTemplateColumns: hours
+        .map(h => (activeHoursSet.has(h) ? 'minmax(110px, 1.8fr)' : 'minmax(46px, 0.45fr)'))
+        .join(' '),
+    };
+
+    // 4. 描画前の数学的一括事前計算（DOM実測前のFrame 1から完璧な位置と幅を決定・レイアウトシフト完全排除）
+    const measuredHeaderWidth = hoursHeaderRef.current?.clientWidth || hoursHeaderRef.current?.offsetWidth;
+    const estimatedWidth = typeof window !== 'undefined' ? Math.max(800, window.innerWidth - 260) : 1200;
+    const totalW = timelineTotalWidth > 0 ? timelineTotalWidth : (measuredHeaderWidth || estimatedWidth);
+    const computedHourLayouts: Record<number, { left: number; width: number }> = {};
+    let sumMin = 0;
+    let sumFr = 0;
+    hours.forEach(h => {
+      const isActive = activeHoursSet.has(h);
+      sumMin += isActive ? 110 : 46;
+      sumFr += isActive ? 1.8 : 0.45;
+    });
+
+    const remainingSpace = Math.max(0, totalW - sumMin);
+    let currentLeft = 0;
+
+    hours.forEach(h => {
+      const isActive = activeHoursSet.has(h);
+      const minW = isActive ? 110 : 46;
+      const frW = isActive ? 1.8 : 0.45;
+      const extraW = sumFr > 0 ? (frW / sumFr) * remainingSpace : 0;
+      const finalW = Math.round((minW + extraW) * 10) / 10;
+      computedHourLayouts[h] = { left: Math.round(currentLeft * 10) / 10, width: finalW };
+      currentLeft += finalW;
+    });
+
+    // 実測値があれば優先、初期描画時（未測定時）は事前計算値を100%活用
+    const effectiveHourLayouts = Object.keys(hourLayouts).length > 0 ? hourLayouts : computedHourLayouts;
+
+    // 5. 各時間列のX軸座標（px）から正確なピクセル位置を取得（JST準拠）
+    const getXPositionFromDate = (date: Date): number => {
+      const { hour: h, minute: m } = getJstHourAndMinutes(date);
+
+      if (h < minHour) return 0;
+      if (h > maxHour) {
+        const lastLayout = effectiveHourLayouts[maxHour];
+        return lastLayout ? lastLayout.left + lastLayout.width : (totalW || 1000);
+      }
+
+      const layout = effectiveHourLayouts[h];
+      if (layout && layout.width > 0) {
+        const frac = m / 60;
+        return layout.left + frac * layout.width;
+      }
+
+      // フォールバック計算
+      const totalSlots = hours.length;
+      const slotWidth = totalW / totalSlots;
+      return (h - minHour + m / 60) * slotWidth;
+    };
+
+    // 「工事」表示モード時は2行目の不要なサブツールバーを丸ごと排除し、直接「現場ガントタイムライン」を展開
+    if (teamDaySubView === 'construction') {
+      return (
+        <div className="w-full h-full flex flex-col bg-white overflow-hidden">
+          <CalendarConstructionTimeline
+            currentDate={currentDate}
+            onChangeDate={setCurrentDate}
+            teamMembers={teamMembers}
+            allUsers={allUsers || []}
+            events={filteredEvents}
+            sites={internalSites}
+            onEventClick={handleEventClick}
+            onOpenAddEvent={(dateStr) => openAddModalWithDate(dateStr || `${getLocalDateStr(currentDate)}T09:00:00`)}
+            onNavigateToSite={onNavigateToSite}
+            calendarSettings={calendarSettings}
+          />
+        </div>
+      );
+    }
+
+    return (
+      <div className="w-full h-full flex flex-col bg-white overflow-hidden">
+        {/* 日表示時のサブ表示切り替えツールバー (タイムライン / 現在地マップ / 簡易エリア別カード) */}
+        <div className="p-2 bg-slate-100 border-b border-slate-200 flex items-center justify-between shrink-0 z-20 flex-wrap gap-2">
+          <div className="flex items-center gap-1 bg-white p-0.5 rounded-lg border border-slate-200 shadow-2xs text-xs font-bold">
+            <button
+              onClick={() => setTeamDaySubView('timeline')}
+              className={`px-3 py-1 rounded-md transition-all flex items-center gap-1.5 cursor-pointer ${
+                teamDaySubView === 'timeline'
+                  ? 'bg-indigo-600 text-white shadow-2xs font-extrabold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <CalendarIcon className="w-3.5 h-3.5" />
+              <span>📅 タイムライン表示</span>
+            </button>
+            <button
+              onClick={() => setTeamDaySubView('map')}
+              className={`px-3 py-1 rounded-md transition-all flex items-center gap-1.5 cursor-pointer ${
+                teamDaySubView === 'map'
+                  ? 'bg-indigo-600 text-white shadow-2xs font-extrabold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <Navigation className="w-3.5 h-3.5" />
+              <span>🗺️ 現在地マップ (東海4県)</span>
+            </button>
+            <button
+              onClick={() => setTeamDaySubView('cards')}
+              className={`px-3 py-1 rounded-md transition-all flex items-center gap-1.5 cursor-pointer ${
+                teamDaySubView === 'cards'
+                  ? 'bg-indigo-600 text-white shadow-2xs font-extrabold'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <span>📊 簡易エリア別カード</span>
+            </button>
+          </div>
+
+          <div className="text-[11px] text-slate-500 hidden md:block font-medium">
+            {teamDaySubView === 'map' && '※ メンバーの予定と「前の所在地＋移動中」を東海4県マップ上に自動判定表示します'}
+            {teamDaySubView === 'cards' && '※ 東海4県の主要エリア別にメンバーの現在地・移動状況を一覧カード表示します'}
+            {teamDaySubView === 'timeline' && '※ チームメンバーの空き枠と時間軸スケジュール一覧'}
+          </div>
+        </div>
+
+        {teamDaySubView === 'map' ? (
+          <div className="flex-1 overflow-hidden p-2">
+            <TeamLocationMap
+              currentDate={currentDate}
+              teamMembers={teamMembers}
+              events={filteredEvents}
+              offices={offices}
+              displayMode="map"
+              onOpenMemoModal={(m) => {
+                setMemoTargetUser(m);
+                setIsMemoModalOpen(true);
+              }}
+              onOpenEventModal={(event) => handleEventClick({} as any, event)}
+            />
+          </div>
+        ) : teamDaySubView === 'cards' ? (
+          <div className="flex-1 overflow-hidden p-2">
+            <TeamLocationMap
+              currentDate={currentDate}
+              teamMembers={teamMembers}
+              events={filteredEvents}
+              offices={offices}
+              displayMode="cards"
+              onOpenMemoModal={(m) => {
+                setMemoTargetUser(m);
+                setIsMemoModalOpen(true);
+              }}
+              onOpenEventModal={(event) => handleEventClick({} as any, event)}
+            />
+          </div>
+        ) : (
+          <div className="min-w-full flex-1 overflow-auto divide-y divide-slate-200 bg-white flex flex-col">
+            {/* Table Header */}
+            <div className="flex bg-slate-50 text-slate-700 text-xs font-bold shrink-0 sticky top-0 z-30 border-b border-slate-200 shadow-2xs">
+              <div
+                style={{ width: memberColWidth, minWidth: memberColWidth }}
+                className="p-2 sm:p-2.5 border-r border-slate-200 flex items-center justify-center sticky left-0 z-40 bg-slate-50 text-[11px] sm:text-xs shrink-0"
+              >
+                メンバー
+              </div>
+              <div ref={hoursHeaderRef} style={hoursGridStyle} className="flex-1">
+                {hours.map((hour) => {
+                  const isActive = activeHoursSet.has(hour);
+                  return (
+                    <div
+                      key={hour}
+                      data-hour={hour}
+                      className={`p-2 sm:p-2.5 text-center border-r border-slate-200 last:border-r-0 font-extrabold flex flex-col items-center justify-center transition-colors ${
+                        isActive
+                          ? 'bg-slate-50 text-slate-800 text-[11px] sm:text-xs'
+                          : 'bg-slate-100/60 text-slate-400 text-[10px]'
+                      }`}
+                      title={isActive ? `${hour}:00 (予定あり)` : `${hour}:00 (チーム予定なし)`}
+                    >
+                      <span>{String(hour).padStart(2, '0')}:00</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Table Body */}
+            <div className="flex-1 divide-y divide-slate-200 bg-white">
+              {teamMembers.map((member) => {
+                // 当該メンバーの当日イベント一覧（O(1) 辞書引きで爆速取得）
+                const userKey = `date_${dateStr}_user_${member.id}`;
+                const memberDayEvents = eventDictionary.get(userKey) || [];
+
+                return (
+                  <TeamDayMemberRow
+                    key={member.id}
+                    member={member}
+                    memberEvents={memberDayEvents}
+                    hours={hours}
+                    activeHoursSet={activeHoursSet}
+                    hoursGridStyle={hoursGridStyle}
+                    hourLayouts={effectiveHourLayouts}
+                    timelineTotalWidth={timelineTotalWidth}
+                    minHour={minHour}
+                    maxHour={maxHour}
+                    dateStr={dateStr}
+                    memberColWidth={memberColWidth}
+                    isSignageMode={isSignageMode}
+                    draggedEventId={draggedEventId}
+                    resizingEvent={resizingEvent}
+                    onEventClick={handleEventClick}
+                    onDragStart={handleDragStart}
+                    onDragEnd={handleDragEnd}
+                    onDrop={handleDrop}
+                    onOpenAddModal={(datetimeStr, m) => openAddModalWithDate(datetimeStr, [m])}
+                    onOpenMemoModal={(m) => {
+                      setMemoTargetUser(m);
+                      setIsMemoModalOpen(true);
+                    }}
+                    startResize={startResize}
+                    getEventStyle={getEventStyle}
+                    formatEventTime={formatEventTime}
+                    getXPositionFromDate={getXPositionFromDate}
+                    getEventSpan={getEventSpan}
+                    lockTimelineForResize={() => {
+                      lockedTimelineHoursRef.current = hours;
+                      lockedActiveHoursSetRef.current = activeHoursSet;
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderTeamView = () => {
+    if (teamMembers.length === 0) {
+      return (
+        <div className="flex flex-col items-center justify-center py-20 px-4 text-center bg-white h-full">
+          <Users className="w-12 h-12 text-slate-300 mb-4" />
+          <h3 className="text-sm font-bold text-slate-700">表示対象のメンバーが見つかりません</h3>
+          <div className="text-xs text-slate-500 mt-1 max-w-sm">
+            {activeSelectedGroup ? (
+              <>
+                <p>マイグループ「{activeSelectedGroup.name}」にメンバーが登録されていません。</p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSettingsModalTab('groups');
+                    setIsSettingsModalOpen(true);
+                  }}
+                  className="mt-3 px-3 py-1.5 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 rounded-lg text-xs font-bold inline-flex items-center gap-1 transition-colors cursor-pointer"
+                >
+                  <Users className="w-3.5 h-3.5" />
+                  <span>グループのメンバーを設定する</span>
+                </button>
+              </>
+            ) : (
+              <p>
+                上部のフィルターから、対象となる拠点と部署、またはマイグループを選択してください。
+                <br />
+                （チームモードでは、特定の拠点と部署に所属するメンバー、または登録したマイグループのメンバーを一覧表示します）
+              </p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    if (view === 'week') {
+      return renderTeamWeekView();
+    } else {
+      return renderTeamDayView();
+    }
+  };
+
+  // Drag & Drop handlers
+  const handleDragStart = (e: React.DragEvent, eventId: string, memberId?: string) => {
+    if (resizingEventRef.current || eventId.startsWith('asset_insp_') || eventId.startsWith('poll_')) {
+      e.preventDefault();
+      return;
+    }
+    draggedEventIdRef.current = eventId;
+    dragOverKeyRef.current = null;
+    if (memberId) {
+      setDraggedFromMemberId(memberId);
+    } else {
+      setDraggedFromMemberId(null);
+    }
+    e.dataTransfer.setData('text/plain', eventId);
+    e.dataTransfer.effectAllowed = 'move';
+
+    // ブラウザのドラッグ画像生成を阻害しないよう、次のフレームで半透明ステートを反映
+    requestAnimationFrame(() => {
+      if (draggedEventIdRef.current === eventId) {
+        setDraggedEventId(eventId);
+      }
+    });
+  };
+
+  const handleDragEnd = useCallback(() => {
+    draggedEventIdRef.current = null;
+    setDraggedEventId(null);
+    setDraggedFromMemberId(null);
+    dragOverKeyRef.current = null;
+    setDragOverKey(null);
+    if (rafDragOverRef.current !== null) {
+      cancelAnimationFrame(rafDragOverRef.current);
+      rafDragOverRef.current = null;
+    }
+  }, []);
+
+  const handleDragOver = (e: React.DragEvent, key: string) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setDragOverKeyThrottled(key);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    const related = e.relatedTarget as HTMLElement | null;
+    if (!related || !e.currentTarget.contains(related)) {
+      setDragOverKeyThrottled(null);
+    }
+  };
+
+  const handleDrop = (
+    e: React.DragEvent,
+    targetDateStr: string,
+    targetHour?: number,
+    targetMemberId?: string,
+    targetMinute: number = 0
+  ) => {
+    e.preventDefault();
+    const eventId = draggedEventIdRef.current || draggedEventId || e.dataTransfer.getData('text/plain');
+    handleDragEnd();
+    
+    if (!eventId) return;
+
+    const ev = expandedEvents.find(item => item.id === eventId) || localEvents.find(item => item.id === eventId);
+    if (!ev) return;
+
+    let newStartIso: string;
+    let newEndIso: string | undefined = undefined;
+
+    if (ev.isAllDay) {
+      newStartIso = new Date(`${targetDateStr}T00:00:00+09:00`).toISOString();
+      if (ev.end) {
+        const origStart = new Date(ev.start).getTime();
+        const origEnd = new Date(ev.end).getTime();
+        const duration = Math.max(0, origEnd - origStart);
+        newEndIso = new Date(new Date(newStartIso).getTime() + duration).toISOString();
+      } else {
+        newEndIso = new Date(`${targetDateStr}T23:59:59+09:00`).toISOString();
+      }
+    } else {
+      if (targetHour !== undefined) {
+        const minStr = String(targetMinute || 0).padStart(2, '0');
+        const hStr = String(targetHour).padStart(2, '0');
+        const newStart = new Date(`${targetDateStr}T${hStr}:${minStr}:00+09:00`);
+        newStartIso = newStart.toISOString();
+        if (ev.end) {
+          const duration = new Date(ev.end).getTime() - new Date(ev.start).getTime();
+          newEndIso = new Date(newStart.getTime() + duration).toISOString();
+        } else {
+          newEndIso = new Date(newStart.getTime() + 60 * 60 * 1000).toISOString();
+        }
+      } else {
+        const { hour: hNum, minute: mNum } = getJstHourAndMinutes(ev.start);
+        const hours = String(hNum).padStart(2, '0');
+        const minutes = String(mNum).padStart(2, '0');
+        const newStart = new Date(`${targetDateStr}T${hours}:${minutes}:00+09:00`);
+        newStartIso = newStart.toISOString();
+        if (ev.end) {
+          const oldStartMs = new Date(ev.start).getTime();
+          const duration = new Date(ev.end).getTime() - oldStartMs;
+          newEndIso = new Date(newStart.getTime() + duration).toISOString();
+        } else {
+          newEndIso = new Date(newStart.getTime() + 60 * 60 * 1000).toISOString();
+        }
+      }
+    }
+
+    let updatedAttendees = [...(ev.attendees || [])];
+    if (targetMemberId) {
+      const targetMember = (allUsers || []).find(u => u.id === targetMemberId || String(u.id) === String(targetMemberId));
+      if (targetMember) {
+        const fromId = draggedFromMemberId || (updatedAttendees.length > 0 ? updatedAttendees[0]?.id : undefined);
+        if (fromId) {
+          const idx = updatedAttendees.findIndex(a => a.id === fromId || String(a.id) === String(fromId));
+          if (idx !== -1) {
+            if (String(fromId) !== String(targetMemberId)) {
+              const targetExistsIdx = updatedAttendees.findIndex(a => a.id === targetMemberId || String(a.id) === String(targetMemberId));
+              if (targetExistsIdx !== -1) {
+                updatedAttendees.splice(idx, 1);
+              } else {
+                updatedAttendees[idx] = targetMember;
+              }
+            }
+          } else {
+            if (!updatedAttendees.some(a => a.id === targetMemberId || String(a.id) === String(targetMemberId))) {
+              updatedAttendees.push(targetMember);
+            }
+          }
+        } else {
+          updatedAttendees = updatedAttendees.filter(a => !teamMembers.some(tm => tm.id === a.id || String(tm.id) === String(a.id)));
+          updatedAttendees.push(targetMember);
+        }
+      }
+    }
+
+    const isRecurring = !!(ev.recurrence && ev.recurrence.frequency && ev.recurrence.frequency !== 'none') ||
+      !!ev.recurrenceParentId ||
+      isExpandedRecurrenceId(ev.id) ||
+      !!ev.instanceDate ||
+      !!ev.recurrenceOriginalDate;
+
+    const origDate = ev.instanceDate || ev.recurrenceOriginalDate || (isExpandedRecurrenceId(ev.id) ? extractDateFromInstanceId(ev.id) : (ev.start ? getLocalDateStr(ev.start) : undefined));
+
+    const updatedEvObj: CalendarEvent = {
+      ...ev,
+      start: newStartIso,
+      end: newEndIso,
+      attendees: updatedAttendees,
+    };
+
+    if (isRecurring) {
+      setPendingRecurrenceUpdate({
+        updatedEvent: updatedEvObj,
+        originalInstanceDate: origDate,
+      });
+    } else {
+      // ★ 即座にローカルステートを楽観的更新し、一瞬たりとも元の時間に戻る現象（ちらつき）を完全に防止
+      recentOptimisticEventsRef.current.set(String(updatedEvObj.id), {
+        event: updatedEvObj,
+        timestamp: Date.now(),
+      });
+      setLocalEvents(prev => {
+        const plan = planRecurrenceSave(prev, updatedEvObj, 'all');
+        return plan.updatedEvents;
+      });
+      onUpdateEvent?.(updatedEvObj, 'all');
+    }
+
+    setDraggedEventId(null);
+    setDraggedFromMemberId(null);
+  };
+
+  // Helper date calculations
+  const year = currentDate.getFullYear();
+  const month = currentDate.getMonth();
+
+  const getDaysInMonth = (y: number, m: number) => new Date(y, m + 1, 0).getDate();
+  const getFirstDayOfMonth = (y: number, m: number) => new Date(y, m, 1).getDay();
+
+  const daysInMonth = getDaysInMonth(year, month);
+  const firstDay = getFirstDayOfMonth(year, month);
+  const totalWeeks = Math.ceil((firstDay + daysInMonth) / 7);
+
+  // 月表示用スロット（7日表示または平日5日表示）
+  const days = useMemo(() => {
+    if (!calendarSettings.hideWeekends) {
+      const slots = Math.max(35, totalWeeks * 7);
+      return Array.from({ length: slots }, (_, i) => {
+        const day = i - firstDay + 1;
+        if (day > 0 && day <= daysInMonth) return day;
+        return null;
+      });
+    }
+
+    // 平日のみ (月〜金) の5列グリッド
+    // 1日の曜日を月曜起算インデックス (月=0, 火=1, 水=2, 木=3, 金=4, 土=5, 日=6)
+    const firstWeekdayOffset = (firstDay + 6) % 7;
+    const startPadding = firstWeekdayOffset < 5 ? firstWeekdayOffset : 0;
+
+    const weekdaySlots: (number | null)[] = [];
+    for (let p = 0; p < startPadding; p++) {
+      weekdaySlots.push(null);
+    }
+
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dObj = new Date(year, month, d);
+      const dayOfWeek = dObj.getDay(); // 0=日, 6=土
+      if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+        weekdaySlots.push(d);
+      }
+    }
+
+    while (weekdaySlots.length % 5 !== 0 || weekdaySlots.length < 25) {
+      weekdaySlots.push(null);
+    }
+
+    return weekdaySlots;
+  }, [calendarSettings.hideWeekends, totalWeeks, firstDay, daysInMonth, year, month]);
+
+  // Week view dates (Sunday to Saturday or Monday to Friday)
+  const getWeekDays = (date: Date) => {
+    const startOfWeek = new Date(date);
+    const dayOfWeek = startOfWeek.getDay(); // 0 = Sun
+    startOfWeek.setDate(date.getDate() - dayOfWeek);
+
+    const fullWeek = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(startOfWeek);
+      d.setDate(startOfWeek.getDate() + i);
+      return d;
+    });
+
+    if (calendarSettings.hideWeekends) {
+      return fullWeek.filter(d => d.getDay() !== 0 && d.getDay() !== 6);
+    }
+    return fullWeek;
+  };
+
+  const weekDays = useMemo(() => getWeekDays(currentDate), [currentDate, calendarSettings.hideWeekends]);
+
+  // Formatting date range for header
+  const getHeaderTitle = (isCompact = false) => {
+    if (view === 'month' || view === 'list') {
+      return `${year}年${month + 1}月`;
+    }
+    if (view === 'week') {
+      const startD = weekDays[0] || currentDate;
+      const endD = weekDays[weekDays.length - 1] || currentDate;
+      const startM = startD.getMonth() + 1;
+      const endM = endD.getMonth() + 1;
+      if (isCompact) {
+        if (startM === endM) {
+          return `${startM}/${startD.getDate()} - ${endD.getDate()}`;
+        }
+        return `${startM}/${startD.getDate()} - ${endM}/${endD.getDate()}`;
+      }
+      if (startM === endM) {
+        return `${startD.getFullYear()}年${startM}月${startD.getDate()}日 - ${endD.getDate()}日`;
+      }
+      return `${startD.getFullYear()}年${startM}月${startD.getDate()}日 - ${endM}月${endD.getDate()}日`;
+    }
+    if (view === 'day') {
+      const dayNames = ['日', '月', '火', '水', '木', '金', '土'];
+      if (isCompact) {
+        return `${month + 1}/${currentDate.getDate()} (${dayNames[currentDate.getDay()]})`;
+      }
+      return `${year}年${month + 1}月${currentDate.getDate()}日 (${dayNames[currentDate.getDay()]})`;
+    }
+    return `${year}年${month + 1}月`;
+  };
+
+  const formatEventTime = (e: CalendarEvent) => {
+    if (e.isAllDay) return '終日';
+    const startDate = new Date(e.start);
+    const startTimeStr = startDate.toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit' });
+    let endDate = e.end ? new Date(e.end) : new Date(startDate.getTime() + 60 * 60 * 1000);
+    if (isNaN(endDate.getTime()) || (isSameDay(startDate, endDate) && startTimeStr === endDate.toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit' }))) {
+      endDate = new Date(startDate.getTime() + 60 * 60 * 1000);
+    }
+    const endTimeStr = endDate.toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit' });
+    return `${startTimeStr}〜${endTimeStr}`;
+  };
+
+  const isSameDay = (d1: Date, d2: Date) => {
+    return getLocalDateStr(d1) === getLocalDateStr(d2);
+  };
+
+  const hoursList = useMemo(() => {
+    let minH = 8;
+    let maxH = 20;
+
+    if (calendarSettings.isTimeFilterActive) {
+      minH = calendarSettings.workStartHour ?? 8;
+      maxH = calendarSettings.workEndHour ?? 19;
+      return Array.from({ length: Math.max(1, maxH - minH + 1) }, (_, i) => i + minH);
+    }
+
+    filteredEvents.forEach(e => {
+      if (e.isAllDay) return;
+      const { hour: sH } = getJstHourAndMinutes(e.start);
+      if (sH < minH) {
+        minH = Math.max(0, sH);
+      }
+      const endVal = e.end || e.start;
+      const { hour: eH, minute: eMin } = getJstHourAndMinutes(endVal);
+      let endHourVal = eH;
+      if (eMin > 0) endHourVal = Math.min(23, endHourVal);
+      if (endHourVal > maxH) maxH = Math.min(23, endHourVal);
+    });
+    return Array.from({ length: maxH - minH + 1 }, (_, i) => i + minH);
+  }, [filteredEvents, calendarSettings.isTimeFilterActive, calendarSettings.workStartHour, calendarSettings.workEndHour]);
+
+  const dayTimelineRef = useRef<HTMLDivElement | null>(null);
+
+  const handleDayTimelineDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    if (!dayTimelineRef.current || hoursList.length === 0) return;
+    const rect = dayTimelineRef.current.getBoundingClientRect();
+    const relativeY = Math.max(0, e.clientY - rect.top + dayTimelineRef.current.scrollTop);
+    const slotIndex = Math.floor(relativeY / 50);
+    const startH = hoursList[0];
+    const targetH = startH + Math.floor(slotIndex / 2);
+    const is30 = slotIndex % 2 === 1;
+    const boundedH = Math.max(hoursList[0], Math.min(hoursList[hoursList.length - 1], targetH));
+    const targetKey = `day-slot-${boundedH}-${is30 ? '30' : '00'}`;
+    setDragOverKeyThrottled(targetKey);
+  }, [hoursList, setDragOverKeyThrottled]);
+
+  const handleDayTimelineDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    if (!dayTimelineRef.current || hoursList.length === 0) return;
+    const rect = dayTimelineRef.current.getBoundingClientRect();
+    const relativeY = Math.max(0, e.clientY - rect.top + dayTimelineRef.current.scrollTop);
+    const slotIndex = Math.floor(relativeY / 50);
+    const startH = hoursList[0];
+    const targetH = startH + Math.floor(slotIndex / 2);
+    const is30 = slotIndex % 2 === 1;
+    const boundedH = Math.max(hoursList[0], Math.min(hoursList[hoursList.length - 1], targetH));
+    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`;
+    handleDrop(e, dateStr, boundedH, undefined, is30 ? 30 : 0);
+  }, [hoursList, year, month, currentDate, handleDrop]);
+
+  return (
+    <div className={`flex-1 bg-white rounded-xl border border-slate-200 shadow-sm ring-1 ring-slate-900/5 overflow-hidden flex flex-col min-h-[550px] h-[calc(100vh-6.5rem)] sm:h-[calc(100vh-7.5rem)] lg:h-[calc(100vh-8rem)] ${draggedEventId ? 'calendar-dragging select-none' : ''}`}>
+      <style>{`
+        ${draggedEventId ? `
+          .calendar-dragging * {
+            transition: none !important;
+            animation: none !important;
+          }
+        ` : ''}
+      `}</style>
+      {/* Header Toolbar (Google Calendar style simplified responsive header) */}
+      <div className="border-b border-slate-200 bg-slate-50/90 shrink-0">
+        {/* --- DESKTOP TOOLBAR (md:flex hidden) --- */}
+        <div className="hidden md:flex items-center justify-between gap-3 px-4 py-2.5">
+          {/* Zone 1: Navigation & Title */}
+          <div className="flex items-center gap-3 min-w-0 shrink-0">
+            <h2 className="text-lg font-bold text-slate-800 tracking-tight min-w-0 truncate">
+              {getHeaderTitle()}
+            </h2>
+            <div className="flex items-center gap-0.5 bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs shrink-0">
+              <button onClick={() => changeDate(-1)} className="p-1 hover:bg-slate-100 rounded text-slate-600 transition-colors" title="前へ"><ChevronLeft className="w-4 h-4"/></button>
+              <button onClick={() => setCurrentDate(new Date())} className="px-2.5 py-0.5 text-xs font-semibold hover:bg-slate-100 rounded text-slate-700 transition-colors">今日</button>
+              <button onClick={() => changeDate(1)} className="p-1 hover:bg-slate-100 rounded text-slate-600 transition-colors" title="次へ"><ChevronRight className="w-4 h-4"/></button>
+            </div>
+          </div>
+
+          {/* Zone 2: Mode & View Switchers */}
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Mode Switcher */}
+            <div className="flex items-center bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs text-xs font-semibold">
+              <button
+                onClick={() => handleToggleMode('personal')}
+                className={`px-2.5 py-1 rounded transition-all ${calendarMode === 'personal' ? 'bg-amber-500 text-white font-bold shadow-xs' : 'text-slate-600 hover:bg-slate-50'}`}
+              >
+                個人
+              </button>
+              <button
+                onClick={() => handleToggleMode('team')}
+                className={`px-2.5 py-1 rounded transition-all ${calendarMode === 'team' ? 'bg-indigo-600 text-white font-bold shadow-xs' : 'text-slate-600 hover:bg-slate-50'}`}
+              >
+                チーム
+              </button>
+            </div>
+
+            {/* お気に入り表示設定 (個人・チームの右に配置) */}
+            <div className="relative" ref={favoritesRef}>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsFavoritesOpen(prev => {
+                    const next = !prev;
+                    if (next && !customPresetName) {
+                      setCustomPresetName(getDefaultPresetName());
+                    }
+                    return next;
+                  });
+                }}
+                className={`flex items-center gap-1 px-2 py-1 rounded-lg border text-xs font-semibold transition-all shadow-2xs cursor-pointer ${
+                  isFavoritesOpen
+                    ? 'bg-amber-50 text-amber-900 border-amber-300 ring-2 ring-amber-200'
+                    : presets.length > 0
+                    ? 'bg-amber-50/50 text-amber-800 border-amber-200 hover:bg-amber-100/60'
+                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                }`}
+                title="表示設定のお気に入り"
+              >
+                <Star className={`w-3.5 h-3.5 ${presets.length > 0 ? 'text-amber-500 fill-amber-400' : 'text-slate-400'}`} />
+                {presets.length > 0 && (
+                  <span className="text-[10px] font-bold text-amber-900">{presets.length}</span>
+                )}
+              </button>
+
+              {isFavoritesOpen && (
+                <div className="absolute left-0 top-full mt-2 w-80 bg-white rounded-xl shadow-2xl border border-slate-200 p-3.5 z-50 text-slate-800">
+                  <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-100">
+                    <span className="font-bold text-xs text-slate-800">表示設定のお気に入り</span>
+                    <button type="button" onClick={() => setIsFavoritesOpen(false)} className="text-slate-400 hover:text-slate-600 p-0.5">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                  <div className="bg-amber-50/70 border border-amber-200/80 rounded-lg p-2 mb-2.5">
+                    <div className="text-[10px] font-bold text-amber-900 mb-1 flex items-center gap-1">
+                      <BookmarkCheck className="w-3 h-3 text-amber-600" />
+                      <span>現在の条件を登録: {getCurrentSummary()}</span>
+                    </div>
+                    <form onSubmit={handleSavePreset} className="flex gap-1 items-center">
+                      <input
+                        type="text"
+                        value={customPresetName}
+                        onChange={(e) => setCustomPresetName(e.target.value)}
+                        placeholder="お気に入り名"
+                        className="flex-1 bg-white border border-slate-200 rounded px-2 py-0.5 text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-amber-500 min-w-0"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!onUpdateUser}
+                        className="px-2.5 py-0.5 bg-amber-500 hover:bg-amber-600 text-white rounded text-xs font-bold transition-colors cursor-pointer shrink-0 disabled:opacity-50"
+                      >
+                        追加
+                      </button>
+                    </form>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto space-y-1">
+                    {presets.length === 0 ? (
+                      <div className="py-4 text-center text-slate-400 text-xs">お気に入りはまだありません</div>
+                    ) : (
+                      presets.map((preset) => {
+                        const isDefault = defaultPresetId === preset.id;
+                        return (
+                          <div
+                            key={preset.id}
+                            onClick={() => handleApplyPreset(preset)}
+                            className="flex items-center justify-between p-1.5 rounded border border-slate-100 hover:bg-indigo-50/50 cursor-pointer text-xs"
+                          >
+                            <div className="min-w-0 flex-1 mr-1 truncate">
+                              <span className="font-bold text-slate-800 truncate">{preset.name}</span>
+                              {isDefault && <span className="ml-1 text-[9px] px-1 bg-emerald-100 text-emerald-800 rounded font-bold">初期</span>}
+                            </div>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => handleToggleDefaultPreset(preset.id, e)}
+                                className={`p-1 rounded ${isDefault ? 'text-emerald-700 bg-emerald-100' : 'text-slate-400 hover:text-slate-700'}`}
+                                title={isDefault ? '初期表示解除' : '初期表示に設定'}
+                              >
+                                <Pin className="w-3 h-3" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => handleDeletePreset(preset.id, preset.name, e)}
+                                className="p-1 rounded text-slate-400 hover:text-rose-600"
+                                title="削除"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* View Switcher (Google Calendar Segmented) */}
+            <div className="flex items-center bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs text-xs font-semibold">
+              {calendarMode !== 'team' && (
+                <button
+                  onClick={() => setView('month')}
+                  className={`px-2.5 py-1 rounded transition-colors ${view === 'month' ? 'bg-indigo-50 text-indigo-700 font-bold' : 'text-slate-600 hover:bg-slate-50'}`}
+                >
+                  月
+                </button>
+              )}
+              <button
+                onClick={() => setView('week')}
+                className={`px-2.5 py-1 rounded transition-colors ${view === 'week' ? 'bg-indigo-50 text-indigo-700 font-bold' : 'text-slate-600 hover:bg-slate-50'}`}
+              >
+                週
+              </button>
+              <button
+                onClick={() => {
+                  setView('day');
+                  if (teamDaySubView === 'construction') setTeamDaySubView('timeline');
+                }}
+                className={`px-2.5 py-1 rounded transition-colors ${view === 'day' && teamDaySubView !== 'construction' ? 'bg-indigo-50 text-indigo-700 font-bold' : 'text-slate-600 hover:bg-slate-50'}`}
+              >
+                日
+              </button>
+              {calendarMode === 'team' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setView('day');
+                    setTeamDaySubView('construction');
+                  }}
+                  className={`px-2 py-1 rounded transition-all flex items-center gap-1 cursor-pointer ${
+                    view === 'day' && teamDaySubView === 'construction'
+                      ? 'bg-amber-100 text-amber-900 font-bold shadow-2xs'
+                      : 'text-amber-800 hover:bg-amber-50'
+                  }`}
+                  title="工事タイムライン（現場乗り込み・出庫・残工事の可視化）"
+                >
+                  <HardHat className="w-3.5 h-3.5 text-amber-600" />
+                  <span className="hidden sm:inline">工事</span>
+                </button>
+              )}
+              {calendarMode !== 'team' && (
+                <button
+                  onClick={() => setView('list')}
+                  className={`p-1 rounded transition-colors ${view === 'list' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-500 hover:bg-slate-50'}`}
+                  title="リスト表示"
+                >
+                  <ListIcon className="w-4 h-4"/>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Zone 3: Filters, Presets, Actions & Primary CTA */}
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex items-center gap-1.5">
+              {/* 表示対象セレクター (所属 or マイグループ) */}
+              <select
+                value={selectedGroupId === 'org' ? 'org' : 'mygroup'}
+                onChange={e => {
+                  const mode = e.target.value;
+                  if (mode === 'org') {
+                    handleChangeGroupWithSync('org');
+                  } else {
+                    if (memberGroups.length > 0) {
+                      if (selectedGroupId === 'org') {
+                        handleChangeGroupWithSync(memberGroups[0].id);
+                      }
+                    } else {
+                      setSettingsModalTab('groups');
+                      setIsSettingsModalOpen(true);
+                    }
+                  }
+                }}
+                className={`border rounded px-2 py-1 text-xs font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-2xs transition-colors ${
+                  selectedGroupId !== 'org'
+                    ? 'bg-indigo-50/80 border-indigo-300 text-indigo-900 ring-1 ring-indigo-200'
+                    : 'bg-white border-slate-200 text-slate-800'
+                }`}
+                title="表示対象の切り替え（所属 / マイグループ）"
+              >
+                <option value="org">🏢 所属</option>
+                <option value="mygroup">👥 マイグループ</option>
+              </select>
+
+              {selectedGroupId === 'org' ? (
+                <>
+                  <select
+                    value={selectedOffice}
+                    onChange={e => handleChangeOfficeWithSync(e.target.value)}
+                    className="bg-white border border-slate-200 rounded px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-2xs"
+                    title="拠点フィルター"
+                  >
+                    {officeNames.filter(o => o !== '全社' && o !== '全拠点').map(o => (
+                      <option key={o} value={o}>{o}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={selectedDivision}
+                    onChange={e => handleChangeDivisionWithSync(e.target.value)}
+                    className="bg-white border border-slate-200 rounded px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-2xs"
+                    title="部署フィルター"
+                  >
+                    {divisionNames.filter(d => d !== '全部署').map(d => (
+                      <option key={d} value={d}>{d}</option>
+                    ))}
+                  </select>
+                </>
+              ) : (
+                <select
+                  value={selectedGroupId}
+                  onChange={e => {
+                    const val = e.target.value;
+                    if (val === '__manage__') {
+                      setSettingsModalTab('groups');
+                      setIsSettingsModalOpen(true);
+                    } else {
+                      handleChangeGroupWithSync(val);
+                    }
+                  }}
+                  className="bg-indigo-50/80 border border-indigo-300 text-indigo-900 ring-1 ring-indigo-200 rounded px-2 py-1 text-xs font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-2xs"
+                  title="マイグループ一覧・管理"
+                >
+                  {memberGroups.length > 0 ? (
+                    memberGroups.map(g => (
+                      <option key={g.id} value={g.id}>👥 {g.name} ({g.memberIds.length}名)</option>
+                    ))
+                  ) : (
+                    <option value="" disabled>登録されているマイグループはありません</option>
+                  )}
+                  <option value="__manage__">⚙️ マイグループの管理・作成...</option>
+                </select>
+              )}
+
+              {/* 個人モード時：個人名選択プルダウン＋モーダル起動ボタン */}
+              {calendarMode === 'personal' && (
+                <>
+                  <select
+                    value={activePersonalUser?.id || ''}
+                    onChange={e => handleSelectPersonalUserId(e.target.value)}
+                    className="bg-amber-50/80 border border-amber-300 text-slate-900 rounded px-2 py-1 text-xs font-bold focus:outline-none focus:ring-2 focus:ring-amber-500 cursor-pointer shadow-2xs max-w-[150px] truncate"
+                    title="個人カレンダーの表示対象メンバー"
+                  >
+                    {personalCandidateUsers.map(u => (
+                      <option key={u.id} value={u.id}>
+                        👤 {u.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => setIsPersonalModalOpen(true)}
+                    className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-lg transition-colors shadow-2xs cursor-pointer"
+                    title="所属・拠点・部署・個人名を選択（モーダルを開く）"
+                  >
+                    <UserIcon className="w-3.5 h-3.5 text-amber-600" />
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* 区分フィルター */}
+            <select
+              value={selectedTypeFilter}
+              onChange={e => setSelectedTypeFilter(e.target.value)}
+              className="bg-white border border-slate-200 rounded px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer shadow-2xs"
+            >
+              <option value="all">全区分</option>
+              {Object.keys(typeLabels).map(key => (
+                <option key={key} value={key}>{typeLabels[key as EventType]}</option>
+              ))}
+            </select>
+
+            {/* 共有リンクコピー＆お気に入りストック */}
+            <button
+              type="button"
+              onClick={handleShareCalendarView}
+              className={`p-1.5 rounded-lg border text-xs font-semibold transition-all shadow-2xs cursor-pointer ${
+                copiedLink
+                  ? 'bg-emerald-50 text-emerald-700 border-emerald-300 ring-2 ring-emerald-200'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+              title="日付なしのURL共有リンクをコピー（お気に入りにも自動ストック）"
+            >
+              {copiedLink ? <Check className="w-4 h-4 text-emerald-600" /> : <Share2 className="w-4 h-4 text-slate-500" />}
+            </button>
+
+            {/* カレンダー表示設定 (平日のみ / 時間帯 / 表示密度) - アイコンのみ */}
+            <button
+              type="button"
+              onClick={() => {
+                setSettingsModalTab('display');
+                setIsSettingsModalOpen(true);
+              }}
+              className={`p-1.5 rounded-lg border text-xs font-semibold transition-all shadow-2xs cursor-pointer flex items-center justify-center relative ${
+                calendarSettings.hideWeekends || calendarSettings.isTimeFilterActive || calendarSettings.density === 'compact'
+                  ? 'bg-indigo-50 text-indigo-700 border-indigo-300 ring-2 ring-indigo-200'
+                  : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              }`}
+              title="カレンダー表示設定 (平日のみ / 時間帯 / 表示密度)"
+              aria-label="カレンダー表示設定"
+            >
+              <SlidersHorizontal className="w-4 h-4 text-slate-600" />
+              {(calendarSettings.hideWeekends || calendarSettings.isTimeFilterActive || calendarSettings.density === 'compact') && (
+                <span className="absolute top-1 right-1 w-1.5 h-1.5 rounded-full bg-indigo-600"></span>
+              )}
+            </button>
+
+            {/* デジタルサイネージモード */}
+            {calendarMode === 'team' && view === 'day' && (
+              <button
+                type="button"
+                onClick={() => handleToggleSignageMode(!isSignageMode)}
+                className={`p-1.5 rounded-lg border text-xs font-bold transition-all shadow-2xs cursor-pointer ${
+                  isSignageMode ? 'bg-rose-600 text-white border-rose-700' : 'bg-slate-800 text-white border-slate-700'
+                }`}
+                title="デジタルサイネージ"
+              >
+                <Monitor className="w-4 h-4 text-amber-300" />
+              </button>
+            )}
+
+            {/* 日程調整 */}
+            {onOpenSchedulePollModal && (
+              <button
+                type="button"
+                onClick={() => onOpenSchedulePollModal()}
+                className="relative p-1.5 bg-gradient-to-r from-amber-50 to-orange-50 hover:from-amber-100 hover:to-orange-100 text-amber-800 border border-amber-200 rounded-lg transition-all shadow-2xs cursor-pointer"
+                title={pendingPollCount > 0 ? `日程調整（未回答の調整依頼: ${pendingPollCount}件）` : '日程調整'}
+              >
+                <CalendarDays className="w-4 h-4 text-amber-600" />
+                {pendingPollCount > 0 && (
+                  <span className="absolute -top-1.5 -right-1.5 flex h-4 min-w-4 px-1 items-center justify-center rounded-full bg-rose-500 text-[10px] font-bold text-white shadow-xs animate-pulse">
+                    {pendingPollCount}
+                  </span>
+                )}
+              </button>
+            )}
+
+            {/* Primary Action Button */}
+            <button
+              onClick={() => openAddModalWithDate()}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg transition-colors shadow-xs cursor-pointer shrink-0"
+            >
+              <Plus className="w-4 h-4"/>
+              <span>予定追加</span>
+            </button>
+          </div>
+        </div>
+
+        {/* --- MOBILE TOOLBAR (<md: 2 clean compact rows) --- */}
+        <div className="flex md:hidden flex-col px-3 py-2 gap-1.5 relative">
+          {/* Mobile Row 1: Nav & Title + Quick Mode + Plus Icon Button + Favorites Button */}
+          <div className="flex items-center justify-between gap-1.5">
+            {/* Left: Nav & Title (Plenty of space secured) */}
+            <div className="flex items-center gap-1.5 min-w-0 flex-1 mr-1">
+              <div className="flex items-center bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs shrink-0">
+                <button onClick={() => changeDate(-1)} className="p-1 hover:bg-slate-100 rounded text-slate-600 transition-colors" title="前へ"><ChevronLeft className="w-3.5 h-3.5"/></button>
+                <button onClick={() => setCurrentDate(new Date())} className="px-1.5 py-0.5 text-[11px] font-bold hover:bg-slate-100 rounded text-slate-700 transition-colors">今</button>
+                <button onClick={() => changeDate(1)} className="p-1 hover:bg-slate-100 rounded text-slate-600 transition-colors" title="次へ"><ChevronRight className="w-3.5 h-3.5"/></button>
+              </div>
+              <h2 className="text-xs sm:text-sm font-bold text-slate-800 tracking-tight truncate min-w-0">
+                <span className="hidden sm:inline">{getHeaderTitle(false)}</span>
+                <span className="inline sm:hidden">{getHeaderTitle(true)}</span>
+              </h2>
+            </div>
+
+            {/* Right: Mode + Plus Icon Only + Favorites Button (Ultra-compact & efficient) */}
+            <div className="flex items-center gap-1 shrink-0">
+              {/* Mode Toggle */}
+              <div className="flex items-center bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs text-[11px] font-bold">
+                <button
+                  onClick={() => handleToggleMode('personal')}
+                  className={`px-1.5 py-0.5 rounded transition-all ${calendarMode === 'personal' ? 'bg-amber-500 text-white font-bold' : 'text-slate-600'}`}
+                >
+                  個人
+                </button>
+                <button
+                  onClick={() => handleToggleMode('team')}
+                  className={`px-1.5 py-0.5 rounded transition-all ${calendarMode === 'team' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-600'}`}
+                >
+                  チーム
+                </button>
+              </div>
+
+              {/* Add Event Button (+ Icon Only) */}
+              <button
+                type="button"
+                onClick={() => openAddModalWithDate()}
+                className="w-7 h-7 bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-lg flex items-center justify-center shadow-xs cursor-pointer shrink-0 transition-colors"
+                title="予定を追加"
+              >
+                <Plus className="w-4 h-4 stroke-[2.5]" />
+              </button>
+
+              {/* Mobile Team / Personal Settings Button */}
+              {calendarMode === 'team' ? (
+                <button
+                  type="button"
+                  onClick={() => setIsMobileTeamModalOpen(true)}
+                  className="h-7 px-1.5 bg-indigo-50 hover:bg-indigo-100 border border-indigo-300 text-indigo-900 rounded-lg flex items-center gap-1 text-[11px] font-bold shadow-2xs transition-colors shrink-0 cursor-pointer"
+                  title="チーム表示・マイグループ設定"
+                >
+                  <Users className="w-3.5 h-3.5 text-indigo-700" />
+                  <span className="hidden xs:inline">チーム設定</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setIsPersonalModalOpen(true)}
+                  className="h-7 px-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 rounded-lg flex items-center gap-1 text-[11px] font-bold shadow-2xs transition-colors shrink-0 cursor-pointer"
+                  title="個人表示対象の設定（所属・拠点・部署・個人名）"
+                >
+                  <UserIcon className="w-3.5 h-3.5 text-amber-700" />
+                  <span className="hidden xs:inline">個人設定</span>
+                </button>
+              )}
+
+              {/* Calendar View Settings Button on Mobile */}
+              <button
+                type="button"
+                onClick={() => {
+                  setSettingsModalTab('display');
+                  setIsSettingsModalOpen(true);
+                }}
+                className={`w-7 h-7 rounded-lg border flex items-center justify-center transition-all shadow-2xs cursor-pointer shrink-0 ${
+                  calendarSettings.hideWeekends || calendarSettings.isTimeFilterActive || calendarSettings.density === 'compact'
+                    ? 'bg-indigo-50 text-indigo-700 border-indigo-300 ring-2 ring-indigo-200'
+                    : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                }`}
+                title="カレンダー表示設定 (平日のみ / 時間帯 / 表示密度)"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5" />
+              </button>
+
+              {/* Favorites Button on Mobile */}
+              <div className="relative" ref={favoritesMobileRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsFavoritesMobileOpen(prev => {
+                      const next = !prev;
+                      if (next && !customPresetName) {
+                        setCustomPresetName(getDefaultPresetName());
+                      }
+                      return next;
+                    });
+                  }}
+                  className={`w-7 h-7 rounded-lg border flex items-center justify-center transition-all shadow-2xs cursor-pointer ${
+                    isFavoritesMobileOpen
+                      ? 'bg-amber-100 text-amber-900 border-amber-400 ring-2 ring-amber-200'
+                      : presets.length > 0
+                      ? 'bg-amber-50 text-amber-800 border-amber-300'
+                      : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                  }`}
+                  title="表示設定のお気に入り"
+                >
+                  <Star className={`w-3.5 h-3.5 ${presets.length > 0 ? 'text-amber-500 fill-amber-400' : 'text-slate-400'}`} />
+                </button>
+
+                {/* Mobile Favorites Popover */}
+                {isFavoritesMobileOpen && (
+                  <div className="absolute right-0 top-full mt-1.5 w-76 sm:w-80 max-w-[calc(100vw-24px)] bg-white rounded-xl shadow-2xl border border-slate-200 p-3 z-50 text-slate-800 space-y-2.5 max-h-[80vh] overflow-y-auto">
+                    <div className="flex items-center justify-between pb-1.5 border-b border-slate-100">
+                      <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                        <Star className="w-3.5 h-3.5 text-amber-500 fill-amber-400" />
+                        表示設定のお気に入り
+                      </span>
+                      <button type="button" onClick={() => setIsFavoritesMobileOpen(false)} className="text-slate-400 p-0.5 hover:text-slate-600">
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    {/* ★ お気に入り登録（現在の画面をお気に入りに追加） */}
+                    <div className="bg-amber-50/90 border border-amber-200/90 rounded-xl p-2.5 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-bold text-amber-950 flex items-center gap-1">
+                          <BookmarkCheck className="w-3.5 h-3.5 text-amber-600" />
+                          現在の画面をお気に入りに追加
+                        </span>
+                        <span className="text-[10px] text-amber-800 font-semibold bg-amber-100/70 px-1.5 py-0.5 rounded truncate max-w-[120px]">
+                          {getCurrentSummary()}
+                        </span>
+                      </div>
+
+                      {/* 登録フォーム */}
+                      <form onSubmit={handleSavePreset} className="flex gap-1.5 items-center">
+                        <input
+                          type="text"
+                          value={customPresetName}
+                          onChange={(e) => setCustomPresetName(e.target.value)}
+                          placeholder={getDefaultPresetName()}
+                          className="flex-1 bg-white border border-amber-200 rounded-lg px-2 py-1 text-xs text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-amber-500 min-w-0"
+                        />
+                        <button
+                          type="submit"
+                          className="px-2.5 py-1 bg-amber-500 hover:bg-amber-600 active:bg-amber-700 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer shrink-0 shadow-2xs"
+                        >
+                          追加
+                        </button>
+                      </form>
+
+                      {favoritesFeedback && (
+                        <div className="text-[10px] font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded px-2 py-1 flex items-center gap-1">
+                          <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                          <span>{favoritesFeedback}</span>
+                        </div>
+                      )}
+
+                      {/* 登録済みお気に入り一覧 */}
+                      {presets.length > 0 && (
+                        <div className="pt-2 border-t border-amber-200/80 space-y-1">
+                          <div className="flex items-center justify-between text-[10px] font-bold text-amber-900 mb-1">
+                            <span>登録済みのお気に入り ({presets.length})</span>
+                            {defaultPresetId && (
+                              <span className="text-emerald-700 font-semibold flex items-center gap-0.5">
+                                <Check className="w-2.5 h-2.5" />
+                                初期表示あり
+                              </span>
+                            )}
+                          </div>
+                          <div className="space-y-1 max-h-36 overflow-y-auto pr-0.5">
+                            {presets.map((preset) => {
+                              const isDefault = defaultPresetId === preset.id;
+                              return (
+                                <div
+                                  key={preset.id}
+                                  onClick={() => { handleApplyPreset(preset); setIsFavoritesMobileOpen(false); }}
+                                  className="flex items-center justify-between p-1.5 rounded-lg bg-white border border-amber-200/60 hover:border-amber-300 hover:bg-amber-50/50 cursor-pointer text-xs transition-colors"
+                                >
+                                  <div className="min-w-0 flex-1 mr-1 truncate">
+                                    <div className="flex items-center gap-1">
+                                      <span className="font-bold text-slate-800 truncate">{preset.name}</span>
+                                      {isDefault && <span className="text-[9px] px-1 bg-emerald-100 text-emerald-800 rounded font-bold shrink-0">初期</span>}
+                                    </div>
+                                    <div className="text-[10px] text-slate-500 truncate">{getPresetSummary(preset)}</div>
+                                  </div>
+                                  <div className="flex items-center gap-0.5 shrink-0" onClick={e => e.stopPropagation()}>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleToggleDefaultPreset(preset.id, e)}
+                                      className={`p-1 rounded ${isDefault ? 'text-emerald-700 bg-emerald-100' : 'text-slate-400 hover:text-slate-700'}`}
+                                      title={isDefault ? '初期表示解除' : 'カレンダー起動時の初期表示に設定'}
+                                    >
+                                      <Pin className={`w-3 h-3 ${isDefault ? 'fill-emerald-600 text-emerald-600' : ''}`} />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleDeletePreset(preset.id, preset.name, e)}
+                                      className="p-1 rounded text-slate-400 hover:text-rose-600"
+                                      title="削除"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* 区分フィルター */}
+                    <div>
+                      <label className="text-[11px] font-bold text-slate-600 mb-1 block">予定区分フィルター</label>
+                      <select
+                        value={selectedTypeFilter}
+                        onChange={e => setSelectedTypeFilter(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                      >
+                        <option value="all">全区分</option>
+                        {Object.keys(typeLabels).map(key => (
+                          <option key={key} value={key}>{typeLabels[key as EventType]}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    {/* 表示対象フィルター（チーム・個人共通） */}
+                    <div className="space-y-2 pt-1 border-t border-slate-100">
+                      <div>
+                        <label className="text-[11px] font-bold text-slate-600 mb-1 block">
+                          {calendarMode === 'team' ? 'チーム表示基準' : '個人表示基準'}
+                        </label>
+                        <select
+                          value={selectedGroupId === 'org' ? 'org' : 'mygroup'}
+                          onChange={e => {
+                            const mode = e.target.value;
+                            if (mode === 'org') {
+                              handleChangeGroupWithSync('org');
+                            } else {
+                              if (memberGroups.length > 0) {
+                                if (selectedGroupId === 'org') {
+                                  handleChangeGroupWithSync(memberGroups[0].id);
+                                }
+                              } else {
+                                setSettingsModalTab('groups');
+                                setIsSettingsModalOpen(true);
+                                setIsFavoritesMobileOpen(false);
+                              }
+                            }
+                          }}
+                          className={`w-full border rounded px-2 py-1 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500 ${
+                            selectedGroupId !== 'org'
+                              ? 'bg-indigo-50/80 border-indigo-300 text-indigo-900'
+                              : 'bg-slate-50 border-slate-200 text-slate-800'
+                          }`}
+                        >
+                          <option value="org">🏢 所属</option>
+                          <option value="mygroup">👥 マイグループ</option>
+                        </select>
+                      </div>
+
+                      {selectedGroupId === 'org' ? (
+                        <>
+                          <div>
+                            <label className="text-[11px] font-bold text-slate-600 mb-1 block">拠点</label>
+                            <select
+                              value={selectedOffice}
+                              onChange={e => handleChangeOfficeWithSync(e.target.value)}
+                              className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-semibold text-slate-800"
+                            >
+                              {officeNames.filter(o => o !== '全社' && o !== '全拠点').map(o => (
+                                <option key={o} value={o}>{o}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="text-[11px] font-bold text-slate-600 mb-1 block">部署</label>
+                            <select
+                              value={selectedDivision}
+                              onChange={e => handleChangeDivisionWithSync(e.target.value)}
+                              className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-semibold text-slate-800"
+                            >
+                              {divisionNames.filter(d => d !== '全部署').map(d => (
+                                <option key={d} value={d}>{d}</option>
+                              ))}
+                            </select>
+                          </div>
+                        </>
+                      ) : (
+                        <div>
+                          <label className="text-[11px] font-bold text-slate-600 mb-1 block">マイグループ選択</label>
+                          <select
+                            value={selectedGroupId}
+                            onChange={e => {
+                              const val = e.target.value;
+                              if (val === '__manage__') {
+                                setSettingsModalTab('groups');
+                                setIsSettingsModalOpen(true);
+                                setIsFavoritesMobileOpen(false);
+                              } else {
+                                handleChangeGroupWithSync(val);
+                              }
+                            }}
+                            className="w-full bg-indigo-50/80 border border-indigo-300 text-indigo-900 rounded px-2 py-1 text-xs font-bold focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                          >
+                            {memberGroups.length > 0 ? (
+                              memberGroups.map(g => (
+                                <option key={g.id} value={g.id}>👥 {g.name} ({g.memberIds.length}名)</option>
+                              ))
+                            ) : (
+                              <option value="" disabled>登録されているマイグループはありません</option>
+                            )}
+                            <option value="__manage__">⚙️ マイグループの管理・作成...</option>
+                          </select>
+                        </div>
+                      )}
+
+                      {calendarMode === 'personal' && (
+                        <div>
+                          <label className="text-[11px] font-bold text-slate-600 mb-1 block">個人名</label>
+                          <select
+                            value={activePersonalUser?.id || ''}
+                            onChange={e => handleSelectPersonalUserId(e.target.value)}
+                            className="w-full bg-amber-50/80 border border-amber-300 rounded px-2 py-1 text-xs font-bold text-slate-900"
+                          >
+                            {personalCandidateUsers.map(u => (
+                              <option key={u.id} value={u.id}>👤 {u.name}</option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* クイックツールボタン一覧（スマホでは一括登録Excelは非表示） */}
+                    <div className="pt-2 border-t border-slate-100 flex flex-col gap-1.5">
+                      {/* URL共有 */}
+                      <button
+                        type="button"
+                        onClick={handleShareCalendarView}
+                        className="w-full flex items-center justify-center gap-1.5 py-1.5 px-2 bg-slate-50 hover:bg-slate-100 rounded-lg text-xs font-semibold text-slate-700 border border-slate-200"
+                      >
+                        {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Share2 className="w-3.5 h-3.5 text-slate-500" />}
+                        <span>{copiedLink ? 'URLコピー＆ストック完了!' : '現在の表示URLをコピー'}</span>
+                      </button>
+
+                      {/* 日程調整アンケート */}
+                      {onOpenSchedulePollModal && (
+                        <button
+                          type="button"
+                          onClick={() => { setIsFavoritesMobileOpen(false); onOpenSchedulePollModal(); }}
+                          className="w-full flex items-center justify-center gap-1.5 py-1.5 px-2 bg-amber-50 hover:bg-amber-100 rounded-lg text-xs font-semibold text-amber-800 border border-amber-200 cursor-pointer relative"
+                        >
+                          <CalendarDays className="w-3.5 h-3.5 text-amber-600" />
+                          <span>日程調整アンケート</span>
+                          {pendingPollCount > 0 && (
+                            <span className="px-1.5 py-0.2 bg-rose-500 text-white text-[10px] font-bold rounded-full animate-pulse shadow-xs ml-1">
+                              未回答 {pendingPollCount}
+                            </span>
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Mobile Team / Personal Target Bar: 現在の対象（所属・マイグループ・個人名）を表示＆タップで設定ポップアップ */}
+          {calendarMode === 'team' ? (
+            <div className="flex items-center justify-between gap-1.5 bg-gradient-to-r from-indigo-50/95 via-indigo-50/80 to-blue-50/80 border border-indigo-200/90 rounded-xl px-2.5 py-1.5 text-xs shadow-2xs">
+              <button
+                type="button"
+                onClick={() => setIsMobileTeamModalOpen(true)}
+                className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer group"
+              >
+                <span className="p-1.5 bg-indigo-600 text-white rounded-lg shrink-0 shadow-2xs group-hover:bg-indigo-700 transition-colors">
+                  <Users className="w-3.5 h-3.5" />
+                </span>
+                <div className="min-w-0 flex-1 truncate">
+                  <div className="text-[10px] text-indigo-700 font-bold leading-tight flex items-center gap-1">
+                    <span>チーム表示対象</span>
+                    <span className="text-[9px] px-1 py-0.1 bg-indigo-100 text-indigo-800 rounded font-bold">
+                      {teamMembers.length}名
+                    </span>
+                  </div>
+                  <div className="text-xs font-bold text-slate-900 truncate">
+                    {selectedGroupId === 'org' ? (
+                      `🏢 ${selectedOffice || '全社'} / ${selectedDivision || '全部署'}`
+                    ) : (
+                      `👥 ${activeSelectedGroup?.name || 'マイグループ'}`
+                    )}
+                  </div>
+                </div>
+                <ChevronDown className="w-4 h-4 text-indigo-400 shrink-0 group-hover:text-indigo-600 transition-colors" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsMobileTeamModalOpen(true)}
+                className="px-2.5 py-1 bg-white hover:bg-indigo-50 active:bg-indigo-100 border border-indigo-300 text-indigo-800 rounded-lg text-xs font-bold shrink-0 shadow-2xs transition-colors flex items-center gap-1 cursor-pointer"
+              >
+                <SlidersHorizontal className="w-3 h-3 text-indigo-600" />
+                <span>設定</span>
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between gap-1.5 bg-gradient-to-r from-amber-50/95 via-amber-50/80 to-orange-50/80 border border-amber-200/90 rounded-xl px-2.5 py-1.5 text-xs shadow-2xs">
+              <button
+                type="button"
+                onClick={() => setIsPersonalModalOpen(true)}
+                className="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer group"
+              >
+                {activePersonalUser ? (
+                  <img
+                    src={getAvatarUrl(
+                      currentUser && String(activePersonalUser.id) === String(currentUser.id)
+                        ? (currentUser.avatarUrl || activePersonalUser.avatarUrl)
+                        : activePersonalUser.avatarUrl
+                    )}
+                    alt={activePersonalUser.name}
+                    onError={handleAvatarError}
+                    className="w-7 h-7 rounded-full object-cover border border-amber-300 shrink-0 shadow-2xs"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <span className="p-1.5 bg-amber-500 text-white rounded-lg shrink-0 shadow-2xs group-hover:bg-amber-600 transition-colors">
+                    <UserIcon className="w-3.5 h-3.5" />
+                  </span>
+                )}
+                <div className="min-w-0 flex-1 truncate">
+                  <div className="text-[10px] text-amber-800 font-bold leading-tight flex items-center gap-1 truncate">
+                    <span>個人表示対象</span>
+                    <span className="text-[9px] px-1 py-0.1 bg-amber-100 text-amber-900 rounded font-bold truncate">
+                      {selectedGroupId === 'org'
+                        ? `🏢 ${selectedOffice || '全社'} / ${selectedDivision || '全部署'}`
+                        : `👥 ${activeSelectedGroup?.name || 'マイグループ'}`}
+                    </span>
+                  </div>
+                  <div className="text-xs font-bold text-slate-900 truncate">
+                    👤 {activePersonalUser?.name || '未選択'}
+                  </div>
+                </div>
+                <ChevronDown className="w-4 h-4 text-amber-500 shrink-0 group-hover:text-amber-700 transition-colors" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setIsPersonalModalOpen(true)}
+                className="px-2.5 py-1 bg-white hover:bg-amber-50 active:bg-amber-100 border border-amber-300 text-amber-900 rounded-lg text-xs font-bold shrink-0 shadow-2xs transition-colors flex items-center gap-1 cursor-pointer"
+              >
+                <SlidersHorizontal className="w-3 h-3 text-amber-600" />
+                <span>設定</span>
+              </button>
+            </div>
+          )}
+
+          {/* Mobile Row 2: View Switcher (Google Calendar segmented) + Quick Sub-Controls */}
+          <div className="flex items-center justify-between gap-1.5">
+            {/* View Switcher Segmented */}
+            <div className="flex-1 flex items-center bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs text-xs font-bold">
+              {calendarMode !== 'team' && (
+                <button
+                  onClick={() => setView('month')}
+                  className={`flex-1 py-1 rounded text-center transition-colors ${view === 'month' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-600'}`}
+                >
+                  月
+                </button>
+              )}
+              <button
+                onClick={() => setView('week')}
+                className={`flex-1 py-1 rounded text-center transition-colors ${view === 'week' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-600'}`}
+              >
+                週
+              </button>
+              <button
+                onClick={() => {
+                  setView('day');
+                  if (teamDaySubView === 'construction') setTeamDaySubView('timeline');
+                }}
+                className={`flex-1 py-1 rounded text-center transition-colors ${view === 'day' && teamDaySubView !== 'construction' ? 'bg-indigo-600 text-white font-bold' : 'text-slate-600'}`}
+              >
+                日
+              </button>
+              {calendarMode === 'team' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setView('day');
+                    setTeamDaySubView('construction');
+                  }}
+                  className={`flex-1 py-1 rounded text-center transition-colors flex items-center justify-center gap-1 ${view === 'day' && teamDaySubView === 'construction' ? 'bg-amber-600 text-white font-bold' : 'text-amber-700'}`}
+                  title="工事タイムライン"
+                >
+                  <HardHat className="w-3.5 h-3.5" />
+                  <span>工事</span>
+                </button>
+              )}
+              {calendarMode !== 'team' && (
+                <button
+                  onClick={() => setView('list')}
+                  className={`px-2.5 py-1 rounded transition-colors flex items-center justify-center ${view === 'list' ? 'bg-indigo-600 text-white' : 'text-slate-500'}`}
+                  title="リスト表示"
+                >
+                  <ListIcon className="w-3.5 h-3.5"/>
+                </button>
+              )}
+            </div>
+
+            {/* Mobile Week View Mode Switcher (3日 vs 7日) - 個人カレンダーの週表示でのみ表示 */}
+            {calendarMode === 'personal' && view === 'week' && (
+              <div className="flex items-center bg-white rounded-lg border border-slate-200 p-0.5 shadow-2xs text-[11px] font-bold shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setMobileWeekMode('3day')}
+                  className={`px-2 py-0.5 rounded transition-all ${mobileWeekMode === '3day' ? 'bg-indigo-50 text-indigo-700 font-bold' : 'text-slate-500'}`}
+                >
+                  3日
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMobileWeekMode('7day')}
+                  className={`px-2 py-0.5 rounded transition-all ${mobileWeekMode === '7day' ? 'bg-indigo-50 text-indigo-700 font-bold' : 'text-slate-500'}`}
+                >
+                  全7日
+                </button>
+              </div>
+            )}
+
+            {/* Active Type Filter Chip */}
+            {selectedTypeFilter !== 'all' && (
+              <button
+                type="button"
+                onClick={() => setSelectedTypeFilter('all')}
+                className="px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-[10px] font-bold flex items-center gap-1 shrink-0"
+                title="区分フィルター解除"
+              >
+                <span>{typeLabels[selectedTypeFilter as EventType] || selectedTypeFilter}</span>
+                <X className="w-2.5 h-2.5" />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Main View Area */}
+      <div className="flex-1 overflow-auto bg-white">
+        {/* 進行中の日程調整案内バー */}
+        {openSchedulePolls && openSchedulePolls.length > 0 && (
+          <div className="mx-2 sm:mx-4 mt-2.5 mb-1.5 p-2 sm:p-2.5 bg-gradient-to-r from-amber-500/10 via-orange-500/5 to-amber-500/10 border border-amber-200/90 rounded-xl flex items-center justify-between gap-3 shadow-2xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="p-1.5 bg-amber-500 text-white rounded-lg shrink-0 shadow-2xs">
+                <CalendarDays className="w-3.5 h-3.5" />
+              </span>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs font-bold text-amber-950 shrink-0">
+                    進行中の日程調整 ({openSchedulePolls.length}件):
+                  </span>
+                  {openSchedulePolls.slice(0, 3).map((p) => {
+                    const targetCount = p.targetUserIds?.length || 0;
+                    const ansCount = p.answeredCount !== undefined
+                      ? p.answeredCount
+                      : (p.answeredUserIds || []).filter(uid => (p.targetUserIds || []).includes(uid)).length;
+                    const isAllDone = targetCount > 0 && ansCount >= targetCount;
+                    const isOrganizer = String(p.organizerId) === String(currentUser?.id);
+                    const hasMyAnswer = (p.answeredUserIds || []).includes(String(currentUser?.id));
+
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => onOpenSchedulePollModal && onOpenSchedulePollModal(p.id)}
+                        className={`text-xs px-2 py-0.5 rounded-md border truncate max-w-[260px] flex items-center gap-1.5 cursor-pointer transition-colors ${
+                          isOrganizer && isAllDone
+                            ? 'bg-emerald-50 text-emerald-900 border-emerald-300 hover:bg-emerald-100 font-bold'
+                            : !isOrganizer && !hasMyAnswer
+                            ? 'bg-rose-50 text-rose-900 border-rose-300 hover:bg-rose-100 font-bold'
+                            : 'bg-white/80 text-slate-700 border-amber-200 hover:bg-white'
+                        }`}
+                        title={`「${p.title}」をクリックして回答・確認`}
+                      >
+                        {isOrganizer && isAllDone ? (
+                          <span className="text-[9px] px-1 bg-emerald-600 text-white rounded-sm font-black shrink-0 animate-pulse">要確定</span>
+                        ) : !isOrganizer && !hasMyAnswer ? (
+                          <span className="text-[9px] px-1 bg-rose-600 text-white rounded-sm font-black shrink-0 animate-pulse">要回答</span>
+                        ) : null}
+                        <span className="truncate">「{p.title}」</span>
+                        <strong className="text-amber-900 font-bold shrink-0">({ansCount}/{targetCount}人回答済)</strong>
+                      </button>
+                    );
+                  })}
+                  {openSchedulePolls.length > 3 && (
+                    <span className="text-[11px] text-slate-500">他{openSchedulePolls.length - 3}件</span>
+                  )}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onOpenSchedulePollModal && onOpenSchedulePollModal()}
+              className="px-2.5 py-1 bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold rounded-lg shadow-2xs shrink-0 flex items-center gap-1 cursor-pointer transition-colors"
+            >
+              <span>一覧・新規</span>
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {calendarMode === 'team' ? (
+          renderTeamView()
+        ) : (
+          <>
+            {/* 1. MONTH VIEW */}
+            {view === 'month' && (() => {
+              const isCompact = calendarSettings.density === 'compact';
+              const monthHeaders = calendarSettings.hideWeekends
+                ? [
+                    { name: '月', color: 'text-slate-500' },
+                    { name: '火', color: 'text-slate-500' },
+                    { name: '水', color: 'text-slate-500' },
+                    { name: '木', color: 'text-slate-500' },
+                    { name: '金', color: 'text-slate-500' },
+                  ]
+                : [
+                    { name: '日', color: 'text-red-500' },
+                    { name: '月', color: 'text-slate-500' },
+                    { name: '火', color: 'text-slate-500' },
+                    { name: '水', color: 'text-slate-500' },
+                    { name: '木', color: 'text-slate-500' },
+                    { name: '金', color: 'text-slate-500' },
+                    { name: '土', color: 'text-blue-500' },
+                  ];
+              const monthGridColsClass = calendarSettings.hideWeekends ? 'grid-cols-5' : 'grid-cols-7';
+              const numCols = calendarSettings.hideWeekends ? 5 : 7;
+              const totalMonthRows = Math.ceil(days.length / numCols);
+
+              return (
+              <div className="w-full h-full flex flex-col">
+                {/* --- DESKTOP MONTH VIEW (hidden on mobile, sm:flex) --- */}
+                <div className="hidden sm:flex min-w-full h-full flex-col">
+                  <div className={`grid ${monthGridColsClass} border-b border-slate-200 bg-slate-50 shrink-0 sticky top-0 z-10`}>
+                    {monthHeaders.map((d, idx) => (
+                      <div key={d.name} className={`py-2 text-center text-xs font-bold tracking-wider ${d.color}`}>{d.name}</div>
+                    ))}
+                  </div>
+                  <div className={`flex-1 grid ${monthGridColsClass} ${totalMonthRows >= 6 ? 'grid-rows-6' : 'grid-rows-5'}`}>
+                    {days.map((day, i) => {
+                      const isToday = day === new Date().getDate() && month === new Date().getMonth() && year === new Date().getFullYear();
+                      const cellDateStr = day ? `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}` : null;
+                      const cellEvents = cellDateStr ? (eventDictionary.get(`date_${cellDateStr}`) || []) : [];
+                      const cellKey = `month-cell-${i}`;
+                      const isDragOver = dragOverKey === cellKey;
+                      const isSelectedRange = cellDateStr ? isDateInSelectionRange(cellDateStr) : false;
+                      
+                      return (
+                        <div
+                          key={i}
+                          onMouseDown={(e) => cellDateStr && handleCellMouseDown(e, cellDateStr)}
+                          onMouseEnter={() => cellDateStr && handleCellMouseEnter(cellDateStr)}
+                          onDragOver={(e) => cellDateStr && handleDragOver(e, cellKey)}
+                          onDragLeave={handleDragLeave}
+                          onDrop={(e) => cellDateStr && handleDrop(e, cellDateStr)}
+                          className={`border-b border-r border-slate-100 ${isCompact ? 'py-0.5 min-h-[72px]' : 'py-1 sm:py-1.5 min-h-[90px] sm:min-h-[100px]'} px-0 group relative transition-colors select-none ${
+                            !day ? 'bg-slate-50/50' : isSelectedRange ? 'bg-indigo-100/90 ring-2 ring-indigo-500/70 z-10' : isDragOver ? 'bg-indigo-100/70 ring-2 ring-indigo-400' : 'hover:bg-indigo-50/20 cursor-pointer'
+                          }`}
+                        >
+                          {day && (
+                            <div className="h-full flex flex-col">
+                              <div className="flex items-center justify-between mb-1 px-1 sm:px-1.5">
+                                <div className={`text-[11px] sm:text-xs font-semibold w-5 h-5 sm:w-6 sm:h-6 flex items-center justify-center rounded-full ${isToday ? 'bg-indigo-600 text-white shadow-sm' : 'text-slate-700'}`}>
+                                  {day}
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={(e) => { e.stopPropagation(); openAddModalWithDate(cellDateStr!, undefined, cellDateStr!, false); }}
+                                  className="opacity-0 group-hover:opacity-100 p-0.5 text-indigo-600 hover:bg-indigo-100 rounded transition-all"
+                                  title="この日に予定を追加"
+                                >
+                                  <Plus className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+                                </button>
+                              </div>
+                              <div className="flex-1 space-y-0.5 sm:space-y-1 overflow-y-auto px-0">
+                                {sortEvents(cellEvents).map(e => {
+                                  const multiProps = getMultiDayStyle(e, cellDateStr!, true);
+                                  return (
+                                    <div
+                                      key={e.id}
+                                      data-event-card="true"
+                                      draggable={!e.isIcal && !e.isAssetInspection}
+                                      onDragStart={(eDrag) => handleDragStart(eDrag, e.id)}
+                                      onDragEnd={handleDragEnd}
+                                      onMouseDown={(eClick) => eClick.stopPropagation()}
+                                      onClick={(eClick) => handleEventClick(eClick, e)}
+                                      className={`${isCompact ? 'text-[8px] sm:text-[9px] py-0 px-1 h-4 sm:h-4.5' : 'text-[9px] sm:text-[10px] py-0.5 px-1 sm:px-1.5 h-5 sm:h-5.5'} border font-bold cursor-pointer transition-all flex items-center select-none truncate ${getEventStyle(e)} ${multiProps.containerClass} ${
+                                        draggedEventId === e.id ? 'opacity-40 select-none' : (draggedEventId ? 'pointer-events-none' : '')
+                                      }`}
+                                      title={`${e.isIcal ? '[iCal連携] ' : ''}${e.title} (${formatEventTime(e)})`}
+                                    >
+                                      <span className="truncate font-bold tracking-tight flex items-center gap-1">
+                                        {renderConstructionBadge(e, true)}
+                                        <span className="truncate">{multiProps.showTitle ? (e.isIcal ? `[iCal] ${e.title}` : e.title) : '\u00A0'}</span>
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* --- MOBILE MONTH VIEW (Google Calendar Style: dot grid + selected day agenda list) --- */}
+                <div className="flex sm:hidden flex-col h-full overflow-hidden bg-white">
+                  {/* Day of Week Header */}
+                  <div className={`grid ${monthGridColsClass} border-b border-slate-200 bg-slate-50/90 shrink-0`}>
+                    {monthHeaders.map((d, idx) => (
+                      <div key={d.name} className={`py-1.5 text-center text-[11px] font-bold ${d.color}`}>{d.name}</div>
+                    ))}
+                  </div>
+
+                  {/* Month Grid */}
+                  <div className={`grid ${monthGridColsClass} border-b border-slate-200 bg-white shrink-0`}>
+                    {days.map((day, i) => {
+                      const isToday = day === new Date().getDate() && month === new Date().getMonth() && year === new Date().getFullYear();
+                      const cellDateStr = day ? `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}` : null;
+                      const cellEvents = cellDateStr ? (eventDictionary.get(`date_${cellDateStr}`) || []) : [];
+                      const isSelected = cellDateStr === selectedMobileDate;
+
+                      return (
+                        <div
+                          key={i}
+                          onClick={() => {
+                            if (cellDateStr) setSelectedMobileDate(cellDateStr);
+                          }}
+                          className={`min-h-[46px] p-0.5 border-b border-r border-slate-100 flex flex-col items-center justify-start transition-colors cursor-pointer select-none ${
+                            !day ? 'bg-slate-50/30' : isSelected ? 'bg-indigo-50/90' : 'hover:bg-slate-50'
+                          }`}
+                        >
+                          {day && (
+                            <>
+                              <div
+                                className={`w-6 h-6 flex items-center justify-center text-xs font-semibold rounded-full mt-0.5 transition-all ${
+                                  isToday
+                                    ? 'bg-indigo-600 text-white font-bold shadow-xs'
+                                    : isSelected
+                                    ? 'bg-indigo-100 text-indigo-700 font-bold ring-2 ring-indigo-500'
+                                    : 'text-slate-700'
+                                }`}
+                              >
+                                {day}
+                              </div>
+                              {/* Event indicator dots */}
+                              {cellEvents.length > 0 && (
+                                <div className="flex items-center justify-center gap-0.5 mt-1 max-w-full px-0.5">
+                                  {cellEvents.slice(0, 3).map((ev, dotIdx) => (
+                                    <span
+                                      key={dotIdx}
+                                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${getEventDotColor(ev.type)}`}
+                                    />
+                                  ))}
+                                  {cellEvents.length > 3 && (
+                                    <span className="text-[8px] font-bold text-slate-400 leading-none">+</span>
+                                  )}
+                                </div>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Selected Day Agenda / Schedule List */}
+                  <div className="flex-1 overflow-y-auto bg-slate-50/50 flex flex-col">
+                    {(() => {
+                      const selectedEvents = eventDictionary.get(`date_${selectedMobileDate}`) || [];
+                      const selDateObj = new Date(selectedMobileDate + 'T00:00:00');
+                      const dayNames = ['日', '月', '火', '水', '木', '金', '土'];
+                      const isSelectedToday = isSameDay(selDateObj, new Date());
+                      const dateTitle = `${selDateObj.getMonth() + 1}月${selDateObj.getDate()}日 (${dayNames[selDateObj.getDay()]})`;
+
+                      return (
+                        <div className="p-3 space-y-2 flex-1 flex flex-col">
+                          {/* Agenda Header */}
+                          <div className="flex items-center justify-between pb-2 border-b border-slate-200">
+                            <div className="flex items-center gap-2">
+                              <span className="text-xs font-bold text-slate-800">
+                                {dateTitle} の予定
+                              </span>
+                              {isSelectedToday && (
+                                <span className="px-1.5 py-0.5 bg-indigo-100 text-indigo-700 text-[10px] font-bold rounded">
+                                  今日
+                                </span>
+                              )}
+                              <span className="text-[11px] text-slate-500">
+                                ({selectedEvents.length}件)
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => openAddModalWithDate(selectedMobileDate)}
+                              className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg flex items-center gap-1 shadow-2xs cursor-pointer"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                              <span>追加</span>
+                            </button>
+                          </div>
+
+                          {/* Event Cards List */}
+                          {selectedEvents.length === 0 ? (
+                            <div className="py-8 text-center flex-1 flex flex-col items-center justify-center">
+                              <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center text-slate-400 mb-2">
+                                <CalendarIcon className="w-5 h-5" />
+                              </div>
+                              <p className="text-xs text-slate-500 font-medium">この日の予定はありません</p>
+                              <button
+                                type="button"
+                                onClick={() => openAddModalWithDate(selectedMobileDate)}
+                                className="mt-2.5 text-xs text-indigo-600 hover:text-indigo-800 font-bold hover:underline"
+                              >
+                                + 予定を登録する
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="space-y-1.5 flex-1 overflow-y-auto">
+                              {sortEvents(selectedEvents).map(e => {
+                                return (
+                                  <div
+                                    key={e.id}
+                                    onClick={(eClick) => handleEventClick(eClick, e)}
+                                    className="p-2.5 bg-white rounded-lg border border-slate-200 hover:border-indigo-300 shadow-2xs hover:shadow-xs transition-all cursor-pointer flex items-start gap-2 relative overflow-hidden group"
+                                  >
+                                    <div className={`w-1 self-stretch rounded-full shrink-0 ${getEventDotColor(e.type)}`} />
+                                    <div className="flex-1 min-w-0">
+                                      <div className="flex items-center gap-1.5 mb-0.5">
+                                        <span className="text-[11px] font-bold text-slate-600 font-mono">
+                                          {formatEventTime(e)}
+                                        </span>
+                                        <span className="text-[10px] px-1.5 py-0.2 bg-slate-100 text-slate-600 rounded font-semibold shrink-0">
+                                          {typeLabels[e.type] || e.type}
+                                        </span>
+                                        {e.isIcal && (
+                                          <span className="text-[9px] px-1 py-0.2 bg-amber-100 text-amber-800 rounded font-bold shrink-0">
+                                            iCal
+                                          </span>
+                                        )}
+                                      </div>
+                                      <div className="text-xs font-bold text-slate-900 group-hover:text-indigo-600 leading-snug break-words flex items-center gap-1.5 flex-wrap">
+                                        {renderConstructionBadge(e)}
+                                        <span>{e.title}</span>
+                                      </div>
+                                      {e.location && (
+                                        <div className="text-[11px] text-slate-500 flex items-center gap-1 mt-1 truncate">
+                                          <MapPin className="w-3 h-3 shrink-0 text-slate-400" />
+                                          <span className="truncate">{e.location}</span>
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              </div>
+              );
+            })()}
+
+            {/* 2. WEEK VIEW */}
+            {view === 'week' && (() => {
+              const renderWeekGrid = (daysToRender: Date[], isMobile3Day = false) => {
+                const daysHasEvents = daysToRender.map(d => {
+                  const dateStr = getLocalDateStr(d);
+                  const dayEvs = eventDictionary.get(`date_${dateStr}`);
+                  return dayEvs ? dayEvs.length > 0 : false;
+                });
+
+                const gridStyle = isMobile3Day
+                  ? {
+                      display: 'grid',
+                      gridTemplateColumns: '38px repeat(3, minmax(0, 1fr))',
+                    }
+                  : {
+                      display: 'grid',
+                      gridTemplateColumns: `60px ${daysToRender.map((d, idx) => {
+                        const isWeekend = d.getDay() === 0 || d.getDay() === 6;
+                        const hasEv = daysHasEvents[idx];
+                        if (isWeekend && !hasEv) {
+                          return 'minmax(46px, 0.45fr)';
+                        }
+                        return 'minmax(110px, 1fr)';
+                      }).join(' ')}`,
+                    };
+
+                return (
+                  <div className={`${isMobile3Day ? 'w-full' : 'min-w-full'} h-full overflow-auto flex flex-col bg-white`}>
+                    {/* Week Header */}
+                    <div
+                      style={gridStyle}
+                      className="border-b border-slate-200 bg-slate-50 shrink-0 sticky top-0 z-20 shadow-2xs"
+                    >
+                      <div className={`py-2 px-1 text-center font-bold text-slate-400 border-r border-slate-200 sticky left-0 z-30 bg-slate-50 flex items-center justify-center ${isMobile3Day ? 'text-[10px]' : 'text-[11px] sm:text-xs'}`}>
+                        時間
+                      </div>
+                      {daysToRender.map((d, idx) => {
+                        const isToday = isSameDay(d, new Date());
+                        const dayName = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+                        const dateStr = getLocalDateStr(d);
+                        const isSelectedRange = isDateInSelectionRange(dateStr);
+                        const isWeekend = d.getDay() === 0 || d.getDay() === 6;
+                        const hasEv = daysHasEvents[idx];
+                        const isShrunk = !isMobile3Day && isWeekend && !hasEv;
+
+                        return (
+                          <div
+                            key={idx}
+                            onMouseDown={(e) => handleCellMouseDown(e, dateStr)}
+                            onMouseEnter={() => handleCellMouseEnter(dateStr)}
+                            className={`py-1.5 px-0.5 sm:px-1 text-center border-r border-slate-200 cursor-pointer select-none transition-colors ${
+                              isSelectedRange
+                                ? 'bg-indigo-100/90 ring-2 ring-indigo-500/70 z-10'
+                                : isToday
+                                ? 'bg-indigo-50/60'
+                                : isShrunk
+                                ? 'bg-slate-100/60'
+                                : 'hover:bg-indigo-50/40'
+                            }`}
+                          >
+                            <div className={`text-[10px] sm:text-xs font-semibold ${isShrunk ? 'text-slate-400' : d.getDay() === 0 ? 'text-red-500' : d.getDay() === 6 ? 'text-blue-500' : 'text-slate-500'}`}>
+                              {dayName}
+                            </div>
+                            <div className={`text-xs sm:text-sm font-bold mt-0.5 inline-flex items-center justify-center w-5 h-5 sm:w-7 sm:h-7 rounded-full ${isToday ? 'bg-indigo-600 text-white font-bold' : isShrunk ? 'text-slate-400' : 'text-slate-800'}`}>
+                              {d.getDate()}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* All-Day Events row */}
+                    <div
+                      style={gridStyle}
+                      className="border-b border-slate-200 bg-slate-50/50 shrink-0"
+                    >
+                      <div className={`py-1.5 px-0.5 text-center font-bold text-slate-500 border-r border-slate-200 flex items-center justify-center sticky left-0 z-10 bg-slate-50/95 ${isMobile3Day ? 'text-[9px]' : 'text-[10px] sm:text-[11px]'}`}>
+                        終日
+                      </div>
+                      {daysToRender.map((d, idx) => {
+                        const dateStr = getLocalDateStr(d);
+                        const isWeekend = d.getDay() === 0 || d.getDay() === 6;
+                        const hasEv = daysHasEvents[idx];
+                        const isShrunk = !isMobile3Day && isWeekend && !hasEv;
+
+                        const dayEvs = eventDictionary.get(`date_${dateStr}`) || [];
+                        const allDayEvs = dayEvs.filter(e => (e.isAllDay || getLocalDateStr(e.start) !== getLocalDateStr(e.end)));
+                        const slotKey = `week-allday-${idx}-${isMobile3Day ? 'm' : 'd'}`;
+                        const isDragOver = dragOverKey === slotKey;
+                        const isSelectedRange = isDateInSelectionRange(dateStr);
+
+                        return (
+                          <div
+                            key={idx}
+                            onMouseDown={(e) => handleCellMouseDown(e, dateStr)}
+                            onMouseEnter={() => handleCellMouseEnter(dateStr)}
+                            onDragOver={(e) => handleDragOver(e, slotKey)}
+                            onDragLeave={handleDragLeave}
+                            onDrop={(e) => handleDrop(e, dateStr)}
+                            className={`p-0.5 sm:p-1 border-r border-slate-200 min-h-[32px] sm:min-h-[40px] cursor-pointer space-y-0.5 sm:space-y-1 transition-colors select-none ${
+                              isSelectedRange
+                                ? 'bg-indigo-100/90 ring-2 ring-indigo-500/70 z-10'
+                                : isDragOver
+                                ? 'bg-indigo-100/70 ring-2 ring-indigo-400'
+                                : isShrunk
+                                ? 'bg-slate-50/40 hover:bg-indigo-50/20'
+                                : 'hover:bg-indigo-50/30'
+                            }`}
+                          >
+                            {sortEvents(allDayEvs).map(e => {
+                              const multiProps = getMultiDayStyle(e, dateStr);
+                              return (
+                                <div
+                                  key={e.id}
+                                  data-event-card="true"
+                                  draggable={!e.isIcal && !e.isAssetInspection && !isMobile3Day}
+                                  onDragStart={(eDrag) => handleDragStart(eDrag, e.id)}
+                                  onDragEnd={handleDragEnd}
+                                  onMouseDown={(eClick) => eClick.stopPropagation()}
+                                  onClick={eClick => handleEventClick(eClick, e)}
+                                  className={`text-[9px] sm:text-[10px] py-0.5 px-1 sm:px-1.5 border font-semibold cursor-pointer transition-all flex items-center h-4.5 sm:h-5.5 select-none truncate ${getEventStyle(e, true)} ${multiProps.containerClass} ${
+                                    draggedEventId === e.id ? 'opacity-40 select-none' : (draggedEventId ? 'pointer-events-none' : '')
+                                  }`}
+                                  title={e.title}
+                                >
+                                  <span className="truncate font-bold tracking-tight flex items-center gap-1">
+                                    {renderConstructionBadge(e, true)}
+                                    <span className="truncate">{multiProps.showTitle ? (e.isIcal ? `[iCal] ${e.title}` : e.title) : '\u00A0'}</span>
+                                  </span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Hourly Grid */}
+                    <div className="flex-1">
+                      {hoursList.map(h => {
+                        const hourFormatted = `${String(h).padStart(2, '0')}:00`;
+                        const isCompact = calendarSettings.density === 'compact';
+                        const slotHeight = isCompact ? 36 : 50;
+
+                        return (
+                          <div
+                            key={h}
+                            style={gridStyle}
+                            className={`border-b border-slate-100 ${isCompact ? 'h-[36px]' : 'h-[50px]'}`}
+                          >
+                            <div className={`py-1 px-0.5 text-center font-medium text-slate-400 border-r border-slate-200 bg-slate-50/95 sticky left-0 z-10 flex items-center justify-center ${isMobile3Day || isCompact ? 'text-[9px]' : 'text-[10px] sm:text-xs'}`}>
+                              {hourFormatted}
+                            </div>
+                            {daysToRender.map((d, idx) => {
+                              const dateStr = getLocalDateStr(d);
+                              const isWeekend = d.getDay() === 0 || d.getDay() === 6;
+                              const hasEv = daysHasEvents[idx];
+                              const isShrunk = !isMobile3Day && isWeekend && !hasEv;
+
+                              const slotDateTimeStr = `${dateStr}T${String(h).padStart(2, '0')}:00`;
+                              const slotKey = `week-slot-${idx}-${h}-${isMobile3Day ? 'm' : 'd'}`;
+                              const isDragOver = dragOverKey === slotKey;
+                              
+                              const dayEvs = eventDictionary.get(`date_${dateStr}`) || [];
+                              const slotEvents = dayEvs.filter(e => {
+                                if (e.isAllDay) return false;
+                                const eventHour = getJstHourAndMinutes(e.start).hour;
+                                return eventHour === h;
+                              });
+
+                              return (
+                                <div
+                                  key={idx}
+                                  onClick={() => openAddModalWithDate(slotDateTimeStr)}
+                                  onDragOver={(e) => handleDragOver(e, slotKey)}
+                                  onDragLeave={handleDragLeave}
+                                  onDrop={(e) => handleDrop(e, dateStr, h)}
+                                  className={`border-r border-slate-100 p-0.5 cursor-pointer transition-colors relative group ${
+                                    isDragOver
+                                      ? 'bg-indigo-100/70 ring-2 ring-indigo-400'
+                                      : isShrunk
+                                      ? 'bg-slate-50/30 hover:bg-indigo-50/20'
+                                      : 'hover:bg-indigo-50/30'
+                                  }`}
+                                >
+                                  {slotEvents.map((e, evIdx) => {
+                                    const isBeingResized = resizingEvent?.event.id === e.id && resizingEvent?.direction === 'vertical';
+                                    let displayTimeString = formatEventTime(e);
+                                    const sDateMs = new Date(e.start).getTime();
+                                    let eDateMs = e.end ? new Date(e.end).getTime() : sDateMs + 60 * 60 * 1000;
+
+                                    if (isBeingResized && resizingEvent) {
+                                      eDateMs = resizingEvent.currentEndMs;
+                                      const { hour: sHNum, minute: sMNum } = getJstHourAndMinutes(e.start);
+                                      const { hour: eHNum, minute: eMNum } = getJstHourAndMinutes(eDateMs);
+                                      const sH = String(sHNum).padStart(2, '0');
+                                      const sM = String(sMNum).padStart(2, '0');
+                                      const eH = String(eHNum).padStart(2, '0');
+                                      const eM = String(eMNum).padStart(2, '0');
+                                      displayTimeString = `${sH}:${sM} ～ ${eH}:${eM}`;
+                                    }
+
+                                    const durationMinutes = Math.max(15, (eDateMs - sDateMs) / 60000);
+                                    const cardHeightPx = Math.max(isCompact ? 18 : 26, durationMinutes * (slotHeight / 60));
+                                    const { minute: startMinutes } = getJstHourAndMinutes(e.start);
+                                    const topOffsetPx = (startMinutes / 60) * slotHeight;
+                                    const isShortEvent = durationMinutes <= 35 || cardHeightPx < (isCompact ? 32 : 42);
+
+                                    return (
+                                      <div
+                                        key={e.id}
+                                        data-event-card="true"
+                                        draggable={!e.isIcal && !e.isAssetInspection && !isBeingResized && !isMobile3Day}
+                                        onDragStart={(eDrag) => handleDragStart(eDrag, e.id)}
+                                        onDragEnd={handleDragEnd}
+                                        onDragOver={(eDragOver) => {
+                                          eDragOver.stopPropagation();
+                                          const parent = eDragOver.currentTarget.parentElement;
+                                          if (!parent) return;
+                                          const parentRect = parent.getBoundingClientRect();
+                                          const offsetY = Math.max(0, eDragOver.clientY - parentRect.top);
+                                          const hourDiff = Math.floor(offsetY / slotHeight);
+                                          const targetH = Math.max(hoursList[0], Math.min(hoursList[hoursList.length - 1], h + hourDiff));
+                                          handleDragOver(eDragOver, `week-slot-${idx}-${targetH}-${isMobile3Day ? 'm' : 'd'}`);
+                                        }}
+                                        onDrop={(eDrop) => {
+                                          eDrop.stopPropagation();
+                                          const parent = eDrop.currentTarget.parentElement;
+                                          if (!parent) return;
+                                          const parentRect = parent.getBoundingClientRect();
+                                          const offsetY = Math.max(0, eDrop.clientY - parentRect.top);
+                                          const hourDiff = Math.floor(offsetY / slotHeight);
+                                          const targetH = Math.max(hoursList[0], Math.min(hoursList[hoursList.length - 1], h + hourDiff));
+                                          handleDrop(eDrop, dateStr, targetH);
+                                        }}
+                                        onMouseDown={(eClick) => eClick.stopPropagation()}
+                                        onClick={eClick => handleEventClick(eClick, e)}
+                                        style={{ 
+                                          height: `${cardHeightPx}px`,
+                                          top: `${topOffsetPx}px`,
+                                          left: `${2 + (evIdx * 4)}px`,
+                                          right: '2px',
+                                          zIndex: 10 + evIdx
+                                        }}
+                                        className={`absolute group/wkcard ${isCompact ? 'text-[8.5px] sm:text-[9.5px]' : 'text-[9px] sm:text-[11px]'} ${isShortEvent ? 'px-1 py-0.5 justify-center' : 'p-1 flex-col items-start'} rounded border font-medium shadow-2xs flex cursor-pointer transition-[box-shadow,filter,opacity] duration-150 overflow-hidden ${getEventStyle(e)} ${
+                                          draggedEventId === e.id ? 'opacity-40 select-none' : (draggedEventId ? 'pointer-events-none' : '')
+                                        } ${
+                                          isBeingResized ? 'ring-2 ring-indigo-500 shadow-md brightness-95' : ''
+                                        }`}
+                                        title={`${e.isIcal ? '[iCal] ' : ''}${e.title} (${displayTimeString})`}
+                                      >
+                                        {isShortEvent ? (
+                                          <div className={`font-bold w-full truncate leading-tight pointer-events-none ${isCompact ? 'text-[8px] sm:text-[9px]' : 'text-[9px] sm:text-[10px]'} flex items-center gap-1`}>
+                                            {renderConstructionBadge(e, true)}
+                                            <span className="truncate">{e.isIcal ? `[iCal] ${e.title}` : e.title}</span>
+                                          </div>
+                                        ) : (
+                                          <>
+                                            <div className="font-bold w-full break-words leading-tight pointer-events-none line-clamp-2 flex items-center gap-1 flex-wrap">
+                                              {renderConstructionBadge(e, true)}
+                                              <span>{e.isIcal ? `[iCal] ${e.title}` : e.title}</span>
+                                            </div>
+                                            <div className="text-[8px] sm:text-[9px] opacity-85 pointer-events-none mt-0.5">
+                                              {displayTimeString}
+                                            </div>
+                                          </>
+                                        )}
+
+                                        {!e.isIcal && !e.isAssetInspection && !isMobile3Day && (
+                                          <div
+                                            onMouseDown={(evt) => {
+                                              evt.stopPropagation();
+                                              evt.preventDefault();
+                                              const currentEnd = e.end ? new Date(e.end).getTime() : new Date(e.start).getTime() + 60 * 60 * 1000;
+                                              startResize({
+                                                event: e,
+                                                direction: 'vertical',
+                                                initialStartX: evt.clientX,
+                                                initialStartY: evt.clientY,
+                                                initialEndMs: currentEnd,
+                                                currentEndMs: currentEnd,
+                                                slotHeightPx: slotHeight,
+                                                dateStr,
+                                              });
+                                            }}
+                                            className="absolute bottom-0 left-0 right-0 h-5 hover:h-6 cursor-ns-resize flex items-center justify-center opacity-0 group-hover/wkcard:opacity-100 transition-opacity z-20 group/handle"
+                                            title="下端をドラッグして終了時刻を変更"
+                                          >
+                                            <div className="w-8 h-1 bg-slate-500/80 group-hover/handle:bg-indigo-600 rounded-full shadow-xs transition-colors" />
+                                          </div>
+                                        )}
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              };
+
+              // Mobile 3-day window centered around mobileWeekActiveDay
+              const startIdx = Math.min(4, Math.max(0, mobileWeekActiveDay - 1));
+              const active3Days = weekDays.slice(startIdx, startIdx + 3);
+
+              return (
+                <div className="w-full h-full flex flex-col">
+                  {/* --- DESKTOP WEEK VIEW (hidden on mobile, sm:flex) --- */}
+                  <div className="hidden sm:flex min-w-full h-full flex-col">
+                    {renderWeekGrid(weekDays, false)}
+                  </div>
+
+                  {/* --- MOBILE WEEK VIEW (Google Calendar Style: Top week bar + 3-day/7-day grid) --- */}
+                  <div className="flex sm:hidden flex-col h-full overflow-hidden bg-white">
+                    {/* Top Week Bar (日〜土 7日間タップバー) */}
+                    <div className="grid grid-cols-7 border-b border-slate-200 bg-slate-50/90 shrink-0 p-1 gap-1">
+                      {weekDays.map((d, idx) => {
+                        const isToday = isSameDay(d, new Date());
+                        const isActive = idx === mobileWeekActiveDay;
+                        const dateStr = getLocalDateStr(d);
+                        const dayEvs = eventDictionary.get(`date_${dateStr}`) || [];
+                        const dayName = ['日', '月', '火', '水', '木', '金', '土'][d.getDay()];
+
+                        return (
+                          <button
+                            key={idx}
+                            type="button"
+                            onClick={() => setMobileWeekActiveDay(idx)}
+                            className={`flex flex-col items-center py-1 rounded-lg transition-all ${
+                              isActive
+                                ? 'bg-indigo-100/90 text-indigo-900 font-bold ring-2 ring-indigo-500'
+                                : 'hover:bg-slate-200/50 text-slate-700'
+                            }`}
+                          >
+                            <span className={`text-[10px] ${idx === 0 ? 'text-red-500' : idx === 6 ? 'text-blue-500' : 'text-slate-500'}`}>{dayName}</span>
+                            <span className={`text-xs font-bold w-5 h-5 flex items-center justify-center rounded-full mt-0.5 ${isToday ? 'bg-indigo-600 text-white' : ''}`}>
+                              {d.getDate()}
+                            </span>
+                            {dayEvs.length > 0 ? (
+                              <span className="w-1 h-1 rounded-full bg-indigo-500 mt-0.5" />
+                            ) : (
+                              <span className="w-1 h-1 mt-0.5" />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {/* Timeline Content */}
+                    <div className="flex-1 overflow-hidden flex flex-col">
+                      {mobileWeekMode === '3day' ? (
+                        renderWeekGrid(active3Days, true)
+                      ) : (
+                        <div className="w-full h-full overflow-x-auto">
+                          <div className="min-w-[650px] h-full flex flex-col">
+                            {renderWeekGrid(weekDays, false)}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* 3. DAY VIEW */}
+            {view === 'day' && (
+              <div className="w-full h-full flex flex-col p-3 sm:p-6">
+                <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 pb-3 sm:pb-4 border-b border-slate-200 mb-3 sm:mb-4">
+                  <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+                    <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-xl sm:rounded-2xl bg-indigo-600 text-white flex flex-col items-center justify-center font-bold shadow-md shrink-0">
+                      <span className="text-[10px] sm:text-xs uppercase leading-none">{['日', '月', '火', '水', '木', '金', '土'][currentDate.getDay()]}</span>
+                      <span className="text-base sm:text-lg leading-none mt-0.5">{currentDate.getDate()}</span>
+                    </div>
+                    <div className="min-w-0">
+                      <h3 className="text-base sm:text-lg font-bold text-slate-800 truncate">{getHeaderTitle()}の予定</h3>
+                      <p className="text-[11px] sm:text-xs text-slate-500 truncate hidden sm:block">予定のクリックで詳細確認・編集を行えます</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => {
+                      const dStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`;
+                      openAddModalWithDate(dStr);
+                    }}
+                    className="flex items-center gap-1 px-3 py-1.5 sm:px-3.5 sm:py-2 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 font-semibold text-xs rounded-lg transition-colors shrink-0"
+                  >
+                    <Plus className="w-4 h-4"/>
+                    <span>この日に追加</span>
+                  </button>
+                </div>
+
+                {/* All-Day & Multi-Day Events */}
+                {(() => {
+                  const dStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`;
+                  const dayAllDayEvents = eventDictionary.get(`date_${dStr}`)?.filter(e => e.isAllDay || getLocalDateStr(e.start) !== getLocalDateStr(e.end)) || [];
+                  if (dayAllDayEvents.length === 0) return null;
+                  return (
+                    <div className="mb-4 sm:mb-6 p-3 sm:p-4 bg-slate-50 rounded-xl border border-slate-200">
+                      <div className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-slate-400" />
+                        終日・複数日予定
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        {dayAllDayEvents.map(e => {
+                          const sStr = getLocalDateStr(e.start);
+                          const eStr = e.end ? getLocalDateStr(e.end) : sStr;
+                          const isMulti = sStr !== eStr;
+                          return (
+                            <div
+                              key={e.id}
+                              data-event-card="true"
+                              draggable={!e.isIcal && !e.isAssetInspection}
+                              onDragStart={(eDrag) => handleDragStart(eDrag, e.id)}
+                              onDragEnd={handleDragEnd}
+                              onMouseDown={(eClick) => eClick.stopPropagation()}
+                              onClick={eClick => handleEventClick(eClick, e)}
+                              className={`p-2.5 sm:p-3 rounded-lg border font-semibold cursor-pointer transition-all ${getEventStyle(e, true)} ${
+                                draggedEventId === e.id ? 'opacity-40 select-none' : (draggedEventId ? 'pointer-events-none' : '')
+                              }`}
+                              title="クリックで詳細"
+                            >
+                              <div className="flex items-center justify-between">
+                                <div>
+                                  <div className="font-bold text-xs sm:text-sm">{e.isIcal ? `[iCal] ${e.title}` : e.title}</div>
+                                  {isMulti && <div className="text-[10px] sm:text-[11px] font-medium opacity-90">{sStr} ～ {eStr}</div>}
+                                </div>
+                                <span className="text-[9px] sm:text-[10px] px-2 py-0.5 bg-white/20 rounded-full font-bold">{e.isIcal ? 'iCal' : e.isAssetInspection ? '資産点検' : typeLabels[e.type]}</span>
+                              </div>
+                              {e.memo && <div className="text-[11px] sm:text-xs font-normal mt-1 opacity-90">{renderContentWithLinks(e.memo)}</div>}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
+
+                {/* Timeline slots */}
+                <div 
+                  ref={dayTimelineRef}
+                  onDragOver={handleDayTimelineDragOver}
+                  onDrop={handleDayTimelineDrop}
+                  className="overflow-y-auto flex-1 pr-0.5 sm:pr-1"
+                >
+                  {hoursList.map(h => {
+                    const hourFormatted = `${String(h).padStart(2, '0')}:00`;
+                    const hour30Formatted = `${String(h).padStart(2, '0')}:30`;
+                    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(currentDate.getDate()).padStart(2, '0')}`;
+                    const slotKey00 = `day-slot-${h}-00`;
+                    const slotKey30 = `day-slot-${h}-30`;
+                    const isDragOver00 = dragOverKey === slotKey00;
+                    const isDragOver30 = dragOverKey === slotKey30;
+                    
+                    const dayEvs = eventDictionary.get(`date_${dateStr}`) || [];
+
+                    const dayEvents00 = dayEvs.filter(e => {
+                      if (e.isAllDay) return false;
+                      const { hour: evH, minute: evM } = getJstHourAndMinutes(e.start);
+                      return evH === h && evM < 30;
+                    });
+
+                    const dayEvents30 = dayEvs.filter(e => {
+                      if (e.isAllDay) return false;
+                      const { hour: evH, minute: evM } = getJstHourAndMinutes(e.start);
+                      return evH === h && evM >= 30;
+                    });
+
+                    const renderDayCard = (e: CalendarEvent, evIdx: number) => {
+                      const isBeingResized = resizingEvent?.event.id === e.id && resizingEvent?.direction === 'vertical';
+                      let displayTimeString = formatEventTime(e);
+                      const sDateMs = new Date(e.start).getTime();
+                      let eDateMs = e.end ? new Date(e.end).getTime() : sDateMs + 60 * 60 * 1000;
+
+                      if (isBeingResized && resizingEvent) {
+                        eDateMs = resizingEvent.currentEndMs;
+                        const { hour: sHNum, minute: sMNum } = getJstHourAndMinutes(e.start);
+                        const { hour: eHNum, minute: eMNum } = getJstHourAndMinutes(eDateMs);
+                        const sH = String(sHNum).padStart(2, '0');
+                        const sM = String(sMNum).padStart(2, '0');
+                        const eH = String(eHNum).padStart(2, '0');
+                        const eM = String(eMNum).padStart(2, '0');
+                        displayTimeString = `${sH}:${sM} ～ ${eH}:${eM}`;
+                      }
+
+                      // 1時間あたり100pxとして高さを計算
+                      const durationMinutes = Math.max(15, (eDateMs - sDateMs) / 60000);
+                      const cardHeightPx = Math.max(25, durationMinutes * (100 / 60));
+                      
+                      const startMins = getJstHourAndMinutes(e.start).minute;
+                      const is30Slot = startMins >= 30;
+                      const slotLocalMins = is30Slot ? startMins - 30 : startMins;
+                      const topOffsetPx = slotLocalMins * (100 / 60);
+
+                      return (
+                        <div
+                          key={e.id}
+                          data-event-card="true"
+                          draggable={!e.isIcal && !e.isAssetInspection && !isBeingResized}
+                          onDragStart={(eDrag) => handleDragStart(eDrag, e.id)}
+                          onDragEnd={handleDragEnd}
+                          onDragOver={(eDragOver) => {
+                            eDragOver.stopPropagation();
+                            handleDayTimelineDragOver(eDragOver);
+                          }}
+                          onDrop={(eDrop) => {
+                            eDrop.stopPropagation();
+                            handleDayTimelineDrop(eDrop);
+                          }}
+                          onMouseDown={(eClick) => eClick.stopPropagation()}
+                          onClick={eClick => handleEventClick(eClick, e)}
+                          style={{ 
+                            height: `${cardHeightPx}px`,
+                            top: `${topOffsetPx}px`,
+                            left: `${evIdx * 8}px`,
+                            right: '2px',
+                            zIndex: 10 + evIdx
+                          }}
+                          className={`absolute group/daycard p-2 sm:p-2.5 rounded-lg border flex flex-col items-start gap-1 shadow-xs cursor-pointer transition-[box-shadow,filter,opacity] duration-150 overflow-hidden ${getEventStyle(e)} ${
+                            draggedEventId === e.id ? 'opacity-40 select-none' : (draggedEventId ? 'pointer-events-none' : '')
+                          } ${
+                            isBeingResized ? 'ring-2 ring-indigo-500 shadow-md brightness-95' : ''
+                          }`}
+                          title="クリックで詳細"
+                        >
+                          <div className="w-full flex justify-between items-start pointer-events-none gap-2">
+                            <div className="font-extrabold text-xs sm:text-sm text-slate-900 leading-snug break-words flex items-center gap-1.5 flex-wrap">
+                              {renderConstructionBadge(e)}
+                              <span>{e.title}</span>
+                            </div>
+                            <span className="text-[9px] sm:text-[10px] px-2 py-0.5 rounded-md font-bold border bg-white/80 shrink-0">
+                              {e.isSchedulePoll ? '日程調整' : e.isAssetInspection ? '資産点検' : typeLabels[e.type]}
+                            </span>
+                          </div>
+                          <div className="text-[10px] sm:text-xs font-semibold text-slate-600 mt-0.5 pointer-events-none">{displayTimeString}</div>
+                          {e.memo && (
+                            <div className="text-[10px] sm:text-xs text-slate-700 mt-1 bg-white/50 p-1.5 rounded border border-slate-200/50 line-clamp-2 w-full pointer-events-none">
+                              {renderContentWithLinks(e.memo)}
+                            </div>
+                          )}
+
+                          {/* 縦方向リサイズハンドル */}
+                          {!e.isIcal && !e.isAssetInspection && (
+                            <div
+                              onMouseDown={(evt) => {
+                                evt.stopPropagation();
+                                evt.preventDefault();
+                                const currentEnd = e.end ? new Date(e.end).getTime() : new Date(e.start).getTime() + 60 * 60 * 1000;
+                                startResize({
+                                  event: e,
+                                  direction: 'vertical',
+                                  initialStartX: evt.clientX,
+                                  initialStartY: evt.clientY,
+                                  initialEndMs: currentEnd,
+                                  currentEndMs: currentEnd,
+                                  slotHeightPx: 100, // 1時間 = 100px (50px + 50px)
+                                  dateStr,
+                                });
+                              }}
+                              className="absolute bottom-0 left-0 right-0 h-5 hover:h-6 cursor-ns-resize flex items-center justify-center opacity-0 group-hover/daycard:opacity-100 transition-opacity z-20 group/handle"
+                              title="下端をドラッグして終了時刻を15分単位で変更"
+                            >
+                              <div className="w-10 h-1.5 bg-slate-500/80 group-hover/handle:bg-indigo-600 rounded-full shadow-xs transition-colors" />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    };
+
+                    return (
+                      <div
+                        key={h}
+                        className={`border-b border-slate-200/80 transition-colors relative ${
+                          isDragOver00 || isDragOver30
+                            ? 'border-indigo-400 ring-2 ring-indigo-400 bg-indigo-50/30'
+                            : 'hover:border-indigo-200'
+                        }`}
+                      >
+                        {/* 00分スロット */}
+                        <div
+                          onClick={() => openAddModalWithDate(`${dateStr}T${String(h).padStart(2, '0')}:00`)}
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            e.dataTransfer.dropEffect = 'move';
+                            setDragOverKeyThrottled(slotKey00);
+                          }}
+                          onDragLeave={handleDragLeave}
+                          onDrop={(e) => handleDrop(e, dateStr, h, undefined, 0)}
+                          className={`h-[50px] flex gap-2 sm:gap-4 px-2 sm:px-2.5 py-1 transition-colors cursor-pointer group/slot00 ${
+                            isDragOver00 ? 'bg-indigo-100/90 ring-1 ring-indigo-500' : 'hover:bg-indigo-50/20'
+                          }`}
+                        >
+                          <div className="w-12 sm:w-16 shrink-0 text-[11px] sm:text-xs font-semibold text-slate-500 flex items-center justify-between pt-0.5 pointer-events-none">
+                            <span>{hourFormatted}</span>
+                            {isDragOver00 && (
+                              <span className="bg-indigo-600 text-white text-[9px] font-bold px-1 rounded shadow-xs whitespace-nowrap">
+                                :00
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex-1 h-full relative">
+                            {dayEvents00.length > 0 ? (
+                              dayEvents00.map((e, idx) => renderDayCard(e, idx))
+                            ) : (
+                              <div className="text-[11px] text-slate-300 opacity-0 group-hover/slot00:opacity-100 transition-opacity flex items-center gap-1 h-full pointer-events-none">
+                                <Plus className="w-3 h-3"/> <span className="hidden sm:inline">クリックして{hourFormatted}に予定を追加</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* 30分スロット（点線ボーダーで区切り） */}
+                        <div
+                          onClick={() => openAddModalWithDate(`${dateStr}T${String(h).padStart(2, '0')}:30`)}
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            e.dataTransfer.dropEffect = 'move';
+                            setDragOverKeyThrottled(slotKey30);
+                          }}
+                          onDragLeave={handleDragLeave}
+                          onDrop={(e) => handleDrop(e, dateStr, h, undefined, 30)}
+                          className={`h-[50px] flex gap-2 sm:gap-4 px-2 sm:px-2.5 py-1 transition-colors cursor-pointer border-t border-dashed border-slate-200/80 group/slot30 ${
+                            isDragOver30 ? 'bg-indigo-100/90 ring-1 ring-indigo-500' : 'hover:bg-indigo-50/20'
+                          }`}
+                        >
+                          <div className="w-12 sm:w-16 shrink-0 text-[10px] sm:text-[11px] font-medium text-slate-400 flex items-center justify-between pt-0.5 pointer-events-none">
+                            <span>{hour30Formatted}</span>
+                            {isDragOver30 && (
+                              <span className="bg-indigo-600 text-white text-[9px] font-bold px-1 rounded shadow-xs whitespace-nowrap">
+                                :30
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex-1 h-full relative">
+                            {dayEvents30.length > 0 ? (
+                              dayEvents30.map((e, idx) => renderDayCard(e, idx))
+                            ) : (
+                              <div className="text-[11px] text-slate-300 opacity-0 group-hover/slot30:opacity-100 transition-opacity flex items-center gap-1 h-full pointer-events-none">
+                                <Plus className="w-3 h-3"/> <span className="hidden sm:inline">クリックして{hour30Formatted}に予定を追加</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 4. LIST VIEW */}
+            {view === 'list' && (() => {
+              const sortedListEvents = [...filteredEvents].sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+              const visibleListEvents = sortedListEvents.slice(0, visibleListCount);
+              return (
+              <div className="p-3 sm:p-6 w-full space-y-3 sm:space-y-4">
+                {sortedListEvents.length > 0 ? (
+                  <>
+                    {visibleListEvents.map(e => (
+                      <div
+                        key={e.id}
+                        data-event-card="true"
+                        onMouseDown={(eClick) => eClick.stopPropagation()}
+                        onClick={(eClick) => handleEventClick(eClick, e)}
+                        className="flex flex-col sm:flex-row gap-3 sm:gap-5 p-3.5 sm:p-5 rounded-xl border border-slate-200 hover:border-indigo-300 transition-all bg-white shadow-xs cursor-pointer hover:shadow-md"
+                      >
+                        <div className="sm:w-24 shrink-0 flex sm:flex-col items-center sm:items-center sm:justify-center justify-between pb-2 sm:pb-0 border-b sm:border-b-0 border-slate-100">
+                          <div className="text-xs font-bold text-slate-600 uppercase tracking-wider bg-slate-100 px-2 py-0.5 rounded sm:bg-transparent sm:p-0">
+                            {new Date(e.start).toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo', month: 'short', day: 'numeric' })}
+                          </div>
+                          <div className="text-xs sm:text-sm font-extrabold text-indigo-700 sm:text-slate-800 sm:mt-1">
+                            {formatEventTime(e)}
+                          </div>
+                        </div>
+                        <div className="hidden sm:block w-px bg-slate-100 shrink-0 my-1"></div>
+                        <div className="flex-1 min-w-0 py-0.5">
+                          <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold tracking-wider border ${getEventStyle(e)}`}>
+                              {e.isSchedulePoll ? '日程調整' : e.isAssetInspection ? '資産点検' : typeLabels[e.type]}
+                            </span>
+                            {renderConstructionBadge(e)}
+                            <h3 className="font-bold text-slate-900 truncate text-sm sm:text-base flex-1 min-w-0">{e.title}</h3>
+                          </div>
+                          {e.memo && (
+                            <div className="text-xs text-slate-700 my-2 bg-slate-50 p-2 rounded-lg border border-slate-100">
+                              {renderContentWithLinks(e.memo)}
+                            </div>
+                          )}
+                          <div className="flex flex-wrap gap-2.5 sm:gap-4 text-xs text-slate-500 mt-2 font-medium items-center">
+                            {e.attendees && e.attendees.length > 0 && (
+                              <div className="flex items-center gap-1.5">
+                                <Users className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                <div className="flex -space-x-1.5">
+                                  {e.attendees.map(u => (
+                                    <img
+                                      key={u.id}
+                                      src={getAvatarUrl(u.id === currentUser.id ? (currentUser.avatarUrl || u.avatarUrl) : u.avatarUrl)}
+                                      onError={handleAvatarError}
+                                      onClick={(ev) => {
+                                        ev.stopPropagation();
+                                        triggerOpenUserModal(u);
+                                      }}
+                                      alt={u.name}
+                                      title={`${u.name} (クリックで社員詳細を表示)`}
+                                      className="w-4 h-4 rounded-full border border-white object-cover cursor-pointer hover:scale-125 hover:z-10 transition-transform"
+                                    />
+                                  ))}
+                                </div>
+                                <span>({e.attendees.length}名)</span>
+                              </div>
+                            )}
+                            {e.attachments && e.attachments.length > 0 && (
+                              <div className="flex items-center gap-1 text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full text-[11px] font-semibold border border-indigo-100">
+                                <Paperclip className="w-3 h-3" />
+                                <span>添付 ({e.attachments.length})</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    {sortedListEvents.length > visibleListCount && (
+                      <div className="pt-2 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => setVisibleListCount(prev => prev + 50)}
+                          className="px-5 py-2.5 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 shadow-2xs transition-all flex items-center gap-2"
+                        >
+                          <ChevronDown className="w-4 h-4 text-slate-400" />
+                          <span>さらに表示する（残り {sortedListEvents.length - visibleListCount} 件）</span>
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-center py-12 sm:py-16">
+                    <CalendarIcon className="w-10 h-10 sm:w-12 sm:h-12 text-slate-300 mx-auto mb-3 sm:mb-4" />
+                    <h3 className="text-slate-800 font-semibold mb-1 text-sm sm:text-base">予定がありません</h3>
+                    <p className="text-slate-500 text-xs sm:text-sm">条件に一致する予定は見つかりませんでした。</p>
+                  </div>
+                )}
+              </div>
+              );
+            })()}
+          </>
+        )}
+      </div>
+
+      {selectedDetailEvent && (
+        <GlobalEventDetailModal
+          isOpen={!!selectedDetailEvent}
+          event={selectedDetailEvent}
+          onNavigateToSite={onNavigateToSite}
+          onClose={() => {
+            setSelectedDetailEvent(null);
+            setSelectedDetailMember(null);
+            if (onClearInitialEventId) onClearInitialEventId();
+          }}
+          onEdit={(event) => {
+            setEditingEventMember(calendarMode === 'team' ? selectedDetailMember : null);
+            setSelectedDetailEvent(null);
+            setSelectedDetailMember(null);
+            if (onClearInitialEventId) onClearInitialEventId();
+            setEditingEvent(event);
+            setIsCopyMode(false);
+            setIsModalOpen(true);
+          }}
+          onCopyAndAdd={(event) => {
+            setSelectedDetailEvent(null);
+            setSelectedDetailMember(null);
+            setEditingEventMember(null);
+            if (onClearInitialEventId) onClearInitialEventId();
+            setEditingEvent(event);
+            setIsCopyMode(true);
+            setIsModalOpen(true);
+          }}
+          onDelete={(event, scope, instanceDate) => {
+            if (onDeleteEvent) {
+              onDeleteEvent(event.id, scope || 'all', instanceDate || event.instanceDate);
+            }
+            setSelectedDetailEvent(null);
+            setSelectedDetailMember(null);
+            if (onClearInitialEventId) onClearInitialEventId();
+          }}
+          currentUser={currentUser}
+          teamDeleteMember={calendarMode === 'team' ? selectedDetailMember : null}
+          onRequestTeamDelete={handleRequestTeamDelete}
+        />
+      )}
+
+      <EventModal
+        isOpen={isModalOpen}
+        onClose={() => { setIsModalOpen(false); setEditingEvent(null); setEditingEventMember(null); setIsCopyMode(false); }}
+        onSave={handleSaveEvent}
+        onDelete={onDeleteEvent}
+        editingEvent={editingEvent}
+        isCopyMode={isCopyMode}
+        defaultInitialDate={selectedInitialDate}
+        defaultEndDate={selectedEndDate}
+        defaultIsAllDay={selectedIsAllDay}
+        offices={offices}
+        divisions={divisions}
+        allUsers={allUsers}
+        defaultAttendees={preselectedAttendees}
+        currentUser={currentUser}
+        sites={internalSites}
+        allEvents={localEvents}
+        teamDeleteMember={calendarMode === 'team' ? editingEventMember : null}
+        onRequestTeamDelete={handleRequestTeamDelete}
+      />
+
+      {/* 伝言メモ新規作成モーダル */}
+      {isMemoModalOpen && memoTargetUser && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-2 sm:p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 max-w-lg w-full shadow-xl overflow-hidden flex flex-col max-h-[92vh] animate-in fade-in zoom-in duration-200">
+            <div className="flex items-center justify-between px-4 sm:px-5 py-3 sm:py-4 border-b border-slate-100 shrink-0 bg-slate-50">
+              <div className="flex items-center gap-2 min-w-0">
+                <MessageSquare className="w-4 h-4 sm:w-5 sm:h-5 text-indigo-500 shrink-0" />
+                <h3 className="font-bold text-slate-800 text-xs sm:text-sm truncate">
+                  {memoTargetUser.name} さんへの伝言メモ登録
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsMemoModalOpen(false);
+                  setMemoTargetUser(null);
+                }}
+                className="p-1 rounded-lg text-slate-400 hover:bg-slate-200 transition-colors shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateMemo} className="flex-1 overflow-y-auto p-3.5 sm:p-5 space-y-3.5 sm:space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-500 mb-1">
+                  宛先 (メンバー)
+                </label>
+                <div
+                  onClick={() => triggerOpenUserModal(memoTargetUser)}
+                  title={`${memoTargetUser.name} の社員詳細を表示`}
+                  className="flex items-center gap-2 p-2 sm:p-2.5 bg-indigo-50/50 hover:bg-indigo-50 border border-indigo-100/60 hover:border-indigo-200 rounded-xl cursor-pointer transition-colors group/memotarget"
+                >
+                  <img
+                    src={getAvatarUrl(memoTargetUser.id === currentUser.id ? (currentUser.avatarUrl || memoTargetUser.avatarUrl) : memoTargetUser.avatarUrl)}
+                    alt={memoTargetUser.name}
+                    onError={handleAvatarError}
+                    className="w-7 h-7 sm:w-8 sm:h-8 rounded-full border border-slate-200 shrink-0 object-cover group-hover/memotarget:ring-2 group-hover/memotarget:ring-indigo-300 transition-all"
+                    referrerPolicy="no-referrer"
+                  />
+                  <div className="min-w-0">
+                    <p className="font-extrabold text-xs text-slate-800 group-hover/memotarget:text-indigo-600 group-hover/memotarget:underline truncate transition-colors">{memoTargetUser.name}</p>
+                    <p className="text-[10px] text-slate-500 mt-0.5 truncate">{memoTargetUser.office}・{memoTargetUser.division}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">
+                    相手方の会社・組織名
+                  </label>
+                  <input
+                    type="text"
+                    value={fromCompany}
+                    onChange={(e) => setFromCompany(e.target.value)}
+                    placeholder="例: 株式会社〇〇"
+                    className="w-full text-xs font-semibold px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">
+                    お名前 <span className="text-rose-500">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={fromName}
+                    onChange={(e) => setFromName(e.target.value)}
+                    placeholder="例: 鈴木様"
+                    required
+                    className="w-full text-xs font-semibold px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-500 mb-1">
+                  相手方の連絡先 (電話番号など)
+                </label>
+                <div className="relative">
+                  <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-slate-400">
+                    <Phone className="w-3.5 h-3.5" />
+                  </span>
+                  <input
+                    type="text"
+                    value={fromPhone}
+                    onChange={(e) => setFromPhone(e.target.value)}
+                    placeholder="例: 090-0000-0000"
+                    className="w-full text-xs font-semibold pl-9 pr-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-500 mb-2">
+                  要件の種類
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-semibold">
+                  <button
+                    type="button"
+                    onClick={() => setRequirementType('phone_called')}
+                    className={`p-2 sm:p-2.5 rounded-lg border text-left transition-all ${
+                      requirementType === 'phone_called'
+                        ? 'bg-indigo-50 border-indigo-500 text-indigo-700 font-bold'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
+                    }`}
+                  >
+                    📞 電話がありました
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRequirementType('has_message')}
+                    className={`p-2 sm:p-2.5 rounded-lg border text-left transition-all ${
+                      requirementType === 'has_message'
+                        ? 'bg-indigo-50 border-indigo-500 text-indigo-700 font-bold'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
+                    }`}
+                  >
+                    💬 伝言があります
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRequirementType('call_again')}
+                    className={`p-2 sm:p-2.5 rounded-lg border text-left transition-all ${
+                      requirementType === 'call_again'
+                        ? 'bg-indigo-50 border-indigo-500 text-indigo-700 font-bold'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
+                    }`}
+                  >
+                    🔄 再度お電話します
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRequirementType('please_call_back')}
+                    className={`p-2 sm:p-2.5 rounded-lg border text-left transition-all ${
+                      requirementType === 'please_call_back'
+                        ? 'bg-indigo-50 border-indigo-500 text-indigo-700 font-bold'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
+                    }`}
+                  >
+                    🤙 折り返し連絡下さい
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setRequirementType('custom')}
+                    className={`p-2 sm:p-2.5 rounded-lg border text-left col-span-1 sm:col-span-2 transition-all ${
+                      requirementType === 'custom'
+                        ? 'bg-indigo-50 border-indigo-500 text-indigo-700 font-bold'
+                        : 'border-slate-200 hover:bg-slate-50 text-slate-700'
+                    }`}
+                  >
+                    ✍️ その他 (自由入力)
+                  </button>
+                </div>
+              </div>
+
+              {requirementType === 'custom' && (
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">
+                    カスタム要件名
+                  </label>
+                  <input
+                    type="text"
+                    value={customRequirementText}
+                    onChange={(e) => setCustomRequirementText(e.target.value)}
+                    placeholder="例: 来社予定など"
+                    className="w-full text-xs font-semibold px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-800"
+                  />
+                </div>
+              )}
+
+              <div className="relative">
+                <label className="block text-xs font-bold text-slate-500 mb-1">
+                  伝言内容本文 <span className="text-rose-500">*</span>
+                </label>
+                <UrlPastePopup
+                  prompt={memoContentPasteHandler.pastePrompt}
+                  onInsertCard={memoContentPasteHandler.handleInsertCard}
+                  onKeepPlain={memoContentPasteHandler.handleKeepPlain}
+                  onClose={memoContentPasteHandler.closePrompt}
+                  positionClass="bottom-full mb-2 left-0"
+                />
+                <textarea
+                  value={content}
+                  onChange={(e) => setContent(e.target.value)}
+                  onPaste={memoContentPasteHandler.handlePaste}
+                  placeholder="伝言の具体的な内容を入力してください。"
+                  required
+                  rows={4}
+                  className="w-full text-xs font-semibold px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-800 resize-none"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-2.5 pt-4 border-t border-slate-100 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsMemoModalOpen(false);
+                    setMemoTargetUser(null);
+                  }}
+                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-lg transition-colors"
+                >
+                  キャンセル
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg transition-colors shadow-sm"
+                >
+                  送信する
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* D&D / リサイズ時の繰り返しスコープ決定モーダル */}
+      {pendingRecurrenceUpdate && (
+        <RecurrenceActionModal
+          isOpen={true}
+          mode="edit"
+          title="定期予定の変更範囲を選択"
+          instanceDate={pendingRecurrenceUpdate.originalInstanceDate}
+          onClose={() => setPendingRecurrenceUpdate(null)}
+          onConfirm={(scope) => {
+            if (pendingRecurrenceUpdate) {
+              recentOptimisticEventsRef.current.set(String(pendingRecurrenceUpdate.updatedEvent.id), {
+                event: pendingRecurrenceUpdate.updatedEvent,
+                timestamp: Date.now(),
+              });
+              setLocalEvents(prev => {
+                const plan = planRecurrenceSave(
+                  prev,
+                  pendingRecurrenceUpdate.updatedEvent,
+                  scope,
+                  pendingRecurrenceUpdate.originalInstanceDate
+                );
+                return plan.updatedEvents;
+              });
+              onUpdateEvent?.(
+                pendingRecurrenceUpdate.updatedEvent,
+                scope,
+                pendingRecurrenceUpdate.originalInstanceDate
+              );
+            }
+            setPendingRecurrenceUpdate(null);
+          }}
+        />
+      )}
+
+      {/* チーム表示時の複数メンバー予定削除対象選択モーダル */}
+      <TeamEventDeleteModal
+        isOpen={!!teamDeleteState && teamDeleteState.step === 'member_scope'}
+        event={teamDeleteState?.event || null}
+        targetMember={teamDeleteState?.targetMember || null}
+        isRecurring={!!teamDeleteState?.isRecurring}
+        instanceDate={teamDeleteState?.instanceDate}
+        onClose={() => setTeamDeleteState(null)}
+        onConfirm={handleConfirmTeamMemberScope}
+      />
+
+      {/* チーム表示時の複数メンバー予定削除 → 繰り返し適用範囲選択モーダル */}
+      <RecurrenceActionModal
+        isOpen={!!teamDeleteState && teamDeleteState.step === 'recurrence_scope'}
+        mode="delete"
+        instanceDate={teamDeleteState?.instanceDate}
+        targetMemberName={
+          teamDeleteState?.memberScope === 'this_member'
+            ? teamDeleteState?.targetMember?.name
+            : undefined
+        }
+        onClose={() => setTeamDeleteState(null)}
+        onConfirm={handleConfirmTeamRecurrenceScope}
+      />
+      {/* デジタルサイネージモード 全画面オーバーレイ */}
+      {isSignageMode && (
+        <div className="fixed inset-0 z-[9999] bg-slate-900 text-slate-100 flex flex-col font-sans overflow-hidden select-none">
+          {/* Top Control Bar */}
+          <div className="bg-slate-800/95 backdrop-blur-md border-b border-slate-700 px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 shrink-0 shadow-xl">
+            {/* Left: Badge & Filters */}
+            <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-indigo-600 to-indigo-800 text-white rounded-lg shadow-inner font-extrabold text-xs sm:text-sm tracking-wide">
+                <Monitor className="w-4 h-4 text-amber-300 animate-pulse shrink-0" />
+                <span>デジタルサイネージ</span>
+              </div>
+
+              <div className="hidden md:flex items-center gap-2.5 text-xs bg-slate-900/80 px-3 py-1.5 rounded-lg border border-slate-700">
+                <div className="flex items-center gap-1">
+                  <Building2 className="w-3.5 h-3.5 text-orange-400 shrink-0" />
+                  <span className="text-slate-400 font-medium">拠点:</span>
+                  <select
+                    value={selectedOffice}
+                    onChange={e => setSelectedOffice(e.target.value)}
+                    className="bg-slate-800 border border-slate-600 text-white rounded px-2 py-0.5 font-bold focus:outline-none cursor-pointer"
+                  >
+                    {officeNames.filter(o => o !== '全社' && o !== '全拠点').map(o => (
+                      <option key={o} value={o}>{o}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="w-px h-3 bg-slate-700" />
+                <div className="flex items-center gap-1">
+                  <Users className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                  <span className="text-slate-400 font-medium">部署:</span>
+                  <select
+                    value={selectedDivision}
+                    onChange={e => setSelectedDivision(e.target.value)}
+                    className="bg-slate-800 border border-slate-600 text-white rounded px-2 py-0.5 font-bold focus:outline-none cursor-pointer"
+                  >
+                    {divisionNames.filter(d => d !== '全部署').map(d => (
+                      <option key={d} value={d}>{d}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            {/* Center: Navigation & Real-time Clock */}
+            <div className="flex items-center gap-3 sm:gap-4">
+              <div className="flex items-center gap-1 bg-slate-800 border border-slate-700 rounded-lg p-0.5">
+                <button
+                  type="button"
+                  onClick={() => changeDate(-1)}
+                  className="p-1 hover:bg-slate-700 rounded text-slate-300 transition-colors cursor-pointer"
+                  title="前日"
+                >
+                  <ChevronLeft className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setCurrentDate(new Date())}
+                  className="px-2 py-0.5 text-xs font-bold bg-indigo-600 text-white rounded hover:bg-indigo-500 transition-colors cursor-pointer"
+                >
+                  今日
+                </button>
+                <button
+                  type="button"
+                  onClick={() => changeDate(1)}
+                  className="p-1 hover:bg-slate-700 rounded text-slate-300 transition-colors cursor-pointer"
+                  title="翌日"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="text-xs sm:text-sm font-extrabold text-slate-200">
+                {currentDate.getFullYear()}年{currentDate.getMonth() + 1}月{currentDate.getDate()}日 (
+                {['日', '月', '火', '水', '木', '金', '土'][currentDate.getDay()]})
+              </div>
+
+              <div className="flex items-center gap-1.5 bg-slate-950 px-3 py-1 rounded-lg border border-indigo-500/40 text-indigo-300 font-mono text-base sm:text-lg font-black tracking-wider shadow-inner">
+                <Clock className="w-4 h-4 text-indigo-400" />
+                <span>{liveClock.toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+              </div>
+            </div>
+
+            {/* Right: Sync Status & Exit */}
+            <div className="flex items-center gap-2.5">
+              <div className="hidden lg:flex items-center gap-2 bg-emerald-950/90 border border-emerald-500/40 text-emerald-300 text-xs px-2.5 py-1 rounded-lg font-bold">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                <span>30秒自動更新</span>
+                <span className="text-[10px] text-emerald-400 font-mono ml-0.5">({countdown}s)</span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  if (onRefetchEvents) {
+                    onRefetchEvents();
+                    setLastRefetchedAt(new Date());
+                    setCountdown(30);
+                  }
+                }}
+                className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg text-xs font-bold text-slate-200 transition-all cursor-pointer shadow-xs"
+                title="即時スケジュール手動更新"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">更新</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleToggleSignageMode(false)}
+                className="flex items-center gap-1 px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-extrabold shadow-sm transition-all cursor-pointer"
+                title="全画面サイネージモードを終了"
+              >
+                <Minimize2 className="w-4 h-4" />
+                <span>解除</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Full Screen Calendar View */}
+          <div className="flex-1 overflow-auto p-2 sm:p-3 bg-slate-950">
+            <div className="h-full bg-white rounded-xl shadow-2xl overflow-auto text-slate-800 border border-slate-800">
+              {renderTeamDayView()}
+            </div>
+          </div>
+        </div>
+      )}
+      <ConfirmModal
+        {...confirmModal}
+        onClose={() => setConfirmModal((prev) => ({ ...prev, isOpen: false }))}
+      />
+
+      {/* カレンダー表示設定モーダル (平日のみ / 時間帯 / 表示密度 / マイグループ管理) */}
+      <CalendarSettingsModal
+        isOpen={isSettingsModalOpen}
+        onClose={() => setIsSettingsModalOpen(false)}
+        currentSettings={calendarSettings}
+        onSaveSettings={handleSaveCalendarSettings}
+        allUsers={allUsers}
+        memberGroups={memberGroups}
+        onSaveMemberGroups={handleSaveMemberGroups}
+        initialTab={settingsModalTab}
+      />
+
+      {/* スマホ用 チーム表示・マイグループ設定ポップアップ */}
+      <MobileTeamSettingsModal
+        isOpen={isMobileTeamModalOpen}
+        onClose={() => setIsMobileTeamModalOpen(false)}
+        selectedGroupId={selectedGroupId}
+        onSelectGroupId={setSelectedGroupId}
+        selectedOffice={selectedOffice}
+        onSelectOffice={setSelectedOffice}
+        officeNames={officeNames}
+        selectedDivision={selectedDivision}
+        onSelectDivision={setSelectedDivision}
+        divisionNames={divisionNames}
+        memberGroups={memberGroups}
+        allUsers={allUsers}
+        offices={offices}
+        divisions={divisions}
+        teamMembersCount={teamMembers.length}
+        selectedTypeFilter={selectedTypeFilter}
+        onSelectTypeFilter={setSelectedTypeFilter}
+        typeLabels={typeLabels}
+        onOpenManageGroups={() => {
+          setSettingsModalTab('groups');
+          setIsSettingsModalOpen(true);
+        }}
+      />
+
+      {/* 個人カレンダー表示対象メンバー設定ポップアップ（所属・拠点・部署・マイグループ・個人名） */}
+      <PersonalMemberSettingsModal
+        isOpen={isPersonalModalOpen}
+        onClose={() => setIsPersonalModalOpen(false)}
+        selectedGroupId={selectedGroupId}
+        onSelectGroupId={handleChangeGroupWithSync}
+        selectedOffice={selectedOffice}
+        onSelectOffice={handleChangeOfficeWithSync}
+        officeNames={officeNames}
+        selectedDivision={selectedDivision}
+        onSelectDivision={handleChangeDivisionWithSync}
+        divisionNames={divisionNames}
+        selectedUserId={activePersonalUser?.id || ''}
+        onSelectUserId={handleSelectPersonalUserId}
+        memberGroups={memberGroups}
+        allUsers={allUsers}
+        currentUser={currentUser}
+        offices={offices}
+        divisions={divisions}
+        selectedTypeFilter={selectedTypeFilter}
+        onSelectTypeFilter={setSelectedTypeFilter}
+        typeLabels={typeLabels}
+        onOpenManageGroups={() => {
+          setSettingsModalTab('groups');
+          setIsSettingsModalOpen(true);
+        }}
+      />
+
+      {/* お気に入り操作トースト通知 */}
+      {favoritesFeedback && (
+        <div className="fixed bottom-6 right-6 z-50 flex flex-wrap items-center gap-2.5 bg-slate-900/95 text-white px-4 py-2.5 rounded-xl shadow-2xl border border-slate-700 text-xs font-semibold backdrop-blur-xs max-w-[calc(100vw-2rem)]">
+          <Star className="w-4 h-4 text-amber-400 fill-amber-400 shrink-0" />
+          <span>{favoritesFeedback}</span>
+          {shareWithDateAction && (
+            <button
+              type="button"
+              onClick={handleIncludeDateInShare}
+              className="ml-1 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer whitespace-nowrap border border-indigo-400/50"
+            >
+              <CalendarIcon className="w-3 h-3" />
+              表示中の日付 ({shareWithDateAction.shortLabel}) を含める
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

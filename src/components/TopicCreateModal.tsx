@@ -1,0 +1,891 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { X, Paperclip, Pin, Calendar as CalendarIcon, Building2, Users, Tag, Plus, Trash2, Loader2, UploadCloud, BarChart2, AlertCircle, CheckSquare, Lock } from 'lucide-react';
+import { BoardTopic, User, OfficeMaster, DivisionMaster, AttachmentFile, BoardPoll } from '../types';
+import { uploadMultipleFiles } from '../utils/fileUpload';
+import { UrlPastePopup, useUrlPasteHandler } from './common/UrlPastePopup';
+import { resolveOffice, resolveDivision, getUserOfficeName, getUserDivisionName } from '../utils/masterResolver';
+import { TopicScopeSelector, TopicScopeMode } from './TopicScopeSelector';
+
+interface TopicCreateModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSubmit: (topicData: Omit<BoardTopic, 'id' | 'createdAt' | 'views' | 'commentsCount'>) => void;
+  currentUser: User;
+  users?: User[];
+  offices?: OfficeMaster[];
+  divisions?: DivisionMaster[];
+  existingTags: string[];
+}
+
+const getDefaultDeadlineDate = () => {
+  const d = new Date();
+  d.setDate(d.getDate() + 7);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+export function TopicCreateModal({
+  isOpen,
+  onClose,
+  onSubmit,
+  currentUser,
+  users = [],
+  offices = [],
+  divisions = [],
+  existingTags = [],
+}: TopicCreateModalProps) {
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+  const pasteHandler = useUrlPasteHandler(content, setContent);
+  const [scopeMode, setScopeMode] = useState<TopicScopeMode>('org');
+  const [selectedOffice, setSelectedOffice] = useState(() => getUserOfficeName(currentUser, offices) || '全社');
+  const [selectedDivision, setSelectedDivision] = useState(() => getUserDivisionName(currentUser, divisions) || '全部署');
+  const [targetUserIds, setTargetUserIds] = useState<string[]>(() => (currentUser?.id ? [String(currentUser.id)] : []));
+  const [targetGroupName, setTargetGroupName] = useState('');
+  const [isStrictScope, setIsStrictScope] = useState(false);
+  
+  // タグ関連
+  const [tags, setTags] = useState<string[]>([]);
+  const [tagInput, setTagInput] = useState('');
+  const [isSuggestOpen, setIsSuggestOpen] = useState(false);
+
+  // 添付ファイル
+  const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
+
+  // 公開期間 (デフォルト: オフ)
+  const [hasPeriod, setHasPeriod] = useState(false);
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+
+  // ピン留め
+  const [isPinned, setIsPinned] = useState(false);
+  const [pinnedPeriod, setPinnedPeriod] = useState<'1week' | '1month' | 'forever'>('1week');
+
+  // アンケート設定
+  const [hasPoll, setHasPoll] = useState(false);
+  const [pollOptions, setPollOptions] = useState<Array<{ id: string; text: string; requireComment: boolean }>>([
+    { id: 'opt-1', text: '賛成', requireComment: false },
+    { id: 'opt-2', text: '条件付き賛成', requireComment: false },
+    { id: 'opt-3', text: 'どれも反対', requireComment: true },
+  ]);
+  const [pollDeadline, setPollDeadline] = useState(getDefaultDeadlineDate());
+  const [pollAutoPin, setPollAutoPin] = useState(true);
+  const [pollAllowMultiple, setPollAllowMultiple] = useState(false);
+  const [pollIsAnonymous, setPollIsAnonymous] = useState(false);
+
+  const [isUploading, setIsUploading] = useState(false);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setTitle('');
+      setContent('');
+      setScopeMode('org');
+      setSelectedOffice(getUserOfficeName(currentUser, offices) || '全社');
+      setSelectedDivision(getUserDivisionName(currentUser, divisions) || '全部署');
+      setTargetUserIds(currentUser?.id ? [String(currentUser.id)] : []);
+      setTargetGroupName('');
+      setIsStrictScope(false);
+      setTags([]);
+      setTagInput('');
+      setAttachments([]);
+      setHasPeriod(false);
+      setStartDate('');
+      setEndDate('');
+      setIsPinned(false);
+      setPinnedPeriod('1week');
+      setHasPoll(false);
+      setPollOptions([
+        { id: 'opt-1', text: '賛成', requireComment: false },
+        { id: 'opt-2', text: '条件付き賛成', requireComment: false },
+        { id: 'opt-3', text: 'どれも反対', requireComment: true },
+      ]);
+      setPollDeadline(getDefaultDeadlineDate());
+      setPollAutoPin(true);
+      setPollAllowMultiple(false);
+      setPollIsAnonymous(false);
+      setIsUploading(false);
+      setIsDraggingOver(false);
+      setError(null);
+    }
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
+  // オートコンプリート用の候補抽出
+  const filteredSuggestions = existingTags.filter(
+    t => t.toLowerCase().includes((tagInput || '').trim().toLowerCase()) && !tags.includes(t)
+  );
+
+  const handleAddTag = (tagToAdd: string) => {
+    const trimmed = (tagToAdd || '').trim().replace(/^#/, '');
+    if (trimmed && !tags.includes(trimmed)) {
+      setTags([...tags, trimmed]);
+    }
+    setTagInput('');
+    setIsSuggestOpen(false);
+  };
+
+  const handleKeyDownTagInput = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' || e.key === ',') {
+      e.preventDefault();
+      if (tagInput && tagInput.trim()) {
+        handleAddTag(tagInput);
+      }
+    }
+  };
+
+  const handleRemoveTag = (tagToRemove: string) => {
+    setTags(tags.filter(t => t !== tagToRemove));
+  };
+
+  // ファイル選択ハンドラー（非同期アップロード）
+  const processUploadedFiles = async (files: FileList | File[]) => {
+    if (files && files.length > 0) {
+      setIsUploading(true);
+      setError(null);
+      try {
+        const uploaded = await uploadMultipleFiles(files);
+        setAttachments(prev => [...prev, ...uploaded]);
+      } catch (err) {
+        console.error(err);
+        setError('ファイルのアップロードに失敗しました。');
+      } finally {
+        setIsUploading(false);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = '';
+        }
+      }
+    }
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files) {
+      await processUploadedFiles(e.target.files);
+    }
+  };
+
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      await processUploadedFiles(e.dataTransfer.files);
+    }
+  };
+
+  const handleRemoveAttachment = (id: string) => {
+    setAttachments(attachments.filter(a => a.id !== id));
+  };
+
+  const handleAddOption = () => {
+    if (pollOptions.length >= 10) return;
+    const existingIds = new Set(pollOptions.map(o => o.id));
+    let nextId = '';
+    for (let i = 1; i <= 20; i++) {
+      const candidate = `opt-${i}`;
+      if (!existingIds.has(candidate)) {
+        nextId = candidate;
+        break;
+      }
+    }
+    if (!nextId) {
+      nextId = `opt-${Date.now()}`;
+    }
+    setPollOptions([
+      ...pollOptions,
+      { id: nextId, text: '', requireComment: false },
+    ]);
+  };
+
+  const handleUpdateOptionText = (id: string, text: string) => {
+    setPollOptions(pollOptions.map(o => o.id === id ? { ...o, text } : o));
+  };
+
+  const handleToggleOptionRequireComment = (id: string) => {
+    setPollOptions(pollOptions.map(o => o.id === id ? { ...o, requireComment: !o.requireComment } : o));
+  };
+
+  const handleRemoveOption = (id: string) => {
+    if (pollOptions.length <= 2) return;
+    setPollOptions(pollOptions.filter(o => o.id !== id));
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!title.trim()) {
+      setError('タイトルを入力してください。');
+      return;
+    }
+    if (!content.trim()) {
+      setError('本文内容を入力してください。');
+      return;
+    }
+
+    if (hasPeriod) {
+      if (!startDate || !endDate) {
+        setError('公開期間の開始日と終了日を指定してください。');
+        return;
+      }
+      if (startDate > endDate) {
+        setError('公開期間の開始日は終了日より前の日付にしてください。');
+        return;
+      }
+    }
+
+    let pollData: BoardPoll | undefined = undefined;
+    if (hasPoll) {
+      const validOptions = pollOptions
+        .map(o => ({ ...o, text: (o.text || '').trim() }))
+        .filter(o => o.text.length > 0);
+      if (validOptions.length < 2) {
+        setError('アンケートの選択肢は最低2つ以上入力してください。');
+        return;
+      }
+      if (!pollDeadline) {
+        setError('アンケートの回答期限日を指定してください。');
+        return;
+      }
+      pollData = {
+        id: `poll-${Date.now()}`,
+        options: validOptions.map(o => ({
+          id: o.id,
+          text: o.text,
+          requireComment: !!o.requireComment,
+        })),
+        allowMultiple: pollAllowMultiple,
+        isAnonymous: pollIsAnonymous,
+        deadline: pollDeadline,
+        autoPinUntilDeadline: pollAutoPin,
+        votes: [],
+      };
+    }
+
+    let finalIsPinned = isPinned;
+    let pinnedUntil: string | null = null;
+    if (hasPoll && pollAutoPin && pollDeadline) {
+      finalIsPinned = true;
+      pinnedUntil = new Date(`${pollDeadline}T23:59:59.999+09:00`).toISOString();
+    } else if (isPinned) {
+      if (pinnedPeriod === '1week') {
+        const d = new Date();
+        d.setDate(d.getDate() + 7);
+        pinnedUntil = d.toISOString();
+      } else if (pinnedPeriod === '1month') {
+        const d = new Date();
+        d.setDate(d.getDate() + 30);
+        pinnedUntil = d.toISOString();
+      } else {
+        pinnedUntil = null;
+      }
+    }
+
+    const isMembersScope = scopeMode === 'members';
+    const finalTargetUserIds = isMembersScope
+      ? Array.from(
+          new Set(
+            [...targetUserIds.map(String), ...(currentUser?.id ? [String(currentUser.id)] : [])].filter(Boolean)
+          )
+        )
+      : [];
+
+    if (isMembersScope && finalTargetUserIds.length === 0) {
+      setError('公開対象メンバーを1名以上選択してください。');
+      return;
+    }
+
+    const matchedOffice = !isMembersScope && selectedOffice !== '全社' ? resolveOffice(selectedOffice, offices) : undefined;
+    const matchedDivision = !isMembersScope && selectedDivision !== '全部署' ? resolveDivision(selectedDivision, divisions) : undefined;
+
+    onSubmit({
+      title: (title || '').trim(),
+      content: (content || '').trim(),
+      author: currentUser,
+      officeId: isMembersScope || selectedOffice === '全社' ? 'all' : matchedOffice?.id,
+      office: isMembersScope || selectedOffice === '全社' ? '全社' : (matchedOffice?.name || selectedOffice),
+      divisionId: isMembersScope || selectedDivision === '全部署' ? 'all' : matchedDivision?.id,
+      division: isMembersScope || selectedDivision === '全部署' ? '全部署' : (matchedDivision?.name || selectedDivision),
+      scope: isMembersScope ? 'members' : '全社',
+      isStrictScope,
+      targetUserIds: finalTargetUserIds,
+      targetGroupName: isMembersScope ? targetGroupName.trim() : '',
+      tags,
+      attachments,
+      hasPeriod,
+      startDate: hasPeriod ? startDate : undefined,
+      endDate: hasPeriod ? endDate : undefined,
+      isPinned: finalIsPinned,
+      pinnedUntil,
+      pinnedDuration: isPinned ? pinnedPeriod : undefined,
+      poll: pollData,
+      comments: [],
+      viewers: [{ user: currentUser, viewedAt: new Date().toISOString() }],
+    });
+
+    onClose();
+  };
+
+  const officeNames = Array.from(new Set(offices.map(o => o.name)));
+  const divisionNames = Array.from(new Set(divisions.map(d => d.name)));
+
+  return (
+    <div
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs overflow-y-auto"
+    >
+      <div
+        onClick={e => e.stopPropagation()}
+        className="bg-white rounded-2xl max-w-2xl w-full shadow-2xl border border-slate-200 overflow-hidden my-8"
+      >
+        {/* Modal Header */}
+        <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="p-2 bg-indigo-100 text-indigo-600 rounded-lg">
+              <Plus className="w-5 h-5" />
+            </div>
+            <h2 className="text-lg font-bold text-slate-800">新規掲示板トピック作成</h2>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-200/60 rounded-lg transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Modal Form Body */}
+        <form onSubmit={handleSubmit} className="p-6 space-y-5 max-h-[75vh] overflow-y-auto">
+          {error && (
+            <div className="p-3 bg-red-50 border border-red-200 text-red-600 text-xs rounded-lg font-medium">
+              {error}
+            </div>
+          )}
+
+          {/* 公開範囲（拠点・部署 / マイグループ・指定メンバー） */}
+          <TopicScopeSelector
+            scopeMode={scopeMode}
+            onScopeModeChange={setScopeMode}
+            selectedOffice={selectedOffice}
+            onOfficeChange={setSelectedOffice}
+            selectedDivision={selectedDivision}
+            onDivisionChange={setSelectedDivision}
+            officeNames={officeNames}
+            divisionNames={divisionNames}
+            targetUserIds={targetUserIds}
+            onTargetUserIdsChange={setTargetUserIds}
+            targetGroupName={targetGroupName}
+            onTargetGroupNameChange={setTargetGroupName}
+            isStrictScope={isStrictScope}
+            onStrictScopeChange={setIsStrictScope}
+            currentUser={currentUser}
+            authorId={currentUser?.id}
+            users={users}
+          />
+
+          {/* タイトル */}
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-1.5">
+              タイトル <span className="text-red-500">*</span>
+            </label>
+            <input
+              type="text"
+              placeholder="例: 【重要】新しい福利厚生制度の導入について"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+              className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+
+          {/* 内容 */}
+          <div className="relative">
+            <label className="block text-xs font-bold text-slate-700 mb-1.5">
+              本文内容 <span className="text-red-500">*</span>
+            </label>
+            <UrlPastePopup
+              prompt={pasteHandler.pastePrompt}
+              onInsertCard={pasteHandler.handleInsertCard}
+              onKeepPlain={pasteHandler.handleKeepPlain}
+              onClose={pasteHandler.closePrompt}
+              positionClass="bottom-full mb-2 left-0"
+            />
+            <textarea
+              rows={5}
+              placeholder="告知内容や詳細を詳しく記載してください..."
+              value={content}
+              onChange={e => setContent(e.target.value)}
+              onPaste={pasteHandler.handlePaste}
+              className="w-full px-3.5 py-2.5 bg-white border border-slate-200 rounded-xl text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none"
+            />
+          </div>
+
+          {/* モダンなタグ設定（オートコンプリート機能付き） */}
+          <div className="relative">
+            <label className="block text-xs font-bold text-slate-700 mb-1.5 flex items-center gap-1.5">
+              <Tag className="w-4 h-4 text-indigo-500" />
+              タグ設定（入力してEnterまたは選択）
+            </label>
+
+            {/* タグ一覧表示 */}
+            <div className="flex flex-wrap items-center gap-1.5 mb-2">
+              {tags.map(tag => (
+                <span
+                  key={tag}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-indigo-50 text-indigo-700 text-xs font-semibold rounded-lg border border-indigo-200"
+                >
+                  #{tag}
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveTag(tag)}
+                    className="hover:text-red-600 transition-colors ml-0.5"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </span>
+              ))}
+            </div>
+
+            <div className="relative">
+              <input
+                type="text"
+                placeholder="タグを入力（例: 全社告知, 総務, システム更新）"
+                value={tagInput}
+                onChange={e => {
+                  setTagInput(e.target.value);
+                  setIsSuggestOpen(true);
+                }}
+                onFocus={() => setIsSuggestOpen(true)}
+                onKeyDown={handleKeyDownTagInput}
+                className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white"
+              />
+
+              {/* 既存タグの補完候補ドロップダウン */}
+              {isSuggestOpen && (tagInput || '').trim() !== '' && filteredSuggestions.length > 0 && (
+                <div className="absolute z-20 top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-lg max-h-40 overflow-y-auto py-1">
+                  <div className="px-3 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                    既存の候補タグから選択
+                  </div>
+                  {filteredSuggestions.map(sugg => (
+                    <button
+                      key={sugg}
+                      type="button"
+                      onClick={() => handleAddTag(sugg)}
+                      className="w-full text-left px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-indigo-50 hover:text-indigo-600 transition-colors flex items-center justify-between"
+                    >
+                      <span>#{sugg}</span>
+                      <span className="text-[10px] text-slate-400">クリックで追加</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* 添付ファイル */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                <Paperclip className="w-4 h-4 text-slate-500" />
+                添付ファイル
+              </label>
+              <button
+                type="button"
+                disabled={isUploading}
+                onClick={() => fileInputRef.current?.click()}
+                className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 disabled:opacity-50"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                ファイルを選択
+              </button>
+            </div>
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileChange}
+              multiple
+              className="hidden"
+            />
+
+            <div
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+              className={`relative rounded-xl transition-all ${
+                isDraggingOver
+                  ? 'border-2 border-dashed border-indigo-500 bg-indigo-50/80 p-4 text-center ring-2 ring-indigo-300'
+                  : ''
+              }`}
+            >
+              {isDraggingOver ? (
+                <div className="flex flex-col items-center justify-center gap-1 text-indigo-700 pointer-events-none py-2">
+                  <UploadCloud className="w-6 h-6 animate-bounce text-indigo-600" />
+                  <p className="text-xs font-bold">ここにファイルをドロップして添付</p>
+                </div>
+              ) : (
+                <>
+                  {isUploading && (
+                    <div className="flex items-center gap-2 p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 mb-1.5">
+                      <Loader2 className="w-4 h-4 text-indigo-500 animate-spin" />
+                      <span>ファイルをアップロード中...</span>
+                    </div>
+                  )}
+
+                  {attachments.length > 0 ? (
+                    <div className="space-y-1.5">
+                      {attachments.map(att => (
+                        <div
+                          key={att.id}
+                          className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <Paperclip className="w-4 h-4 text-slate-400 shrink-0" />
+                            <span className="font-semibold text-slate-700 truncate">{att.name}</span>
+                            <span className="text-[10px] text-slate-400">({att.size})</span>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={isUploading}
+                            onClick={() => handleRemoveAttachment(att.id)}
+                            className="text-slate-400 hover:text-red-600 p-1 rounded transition-colors disabled:opacity-50"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                      {!isUploading && (
+                        <div
+                          onClick={() => !isUploading && fileInputRef.current?.click()}
+                          className="p-2.5 border border-dashed border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/30 rounded-xl text-center cursor-pointer transition-all bg-slate-50/50"
+                        >
+                          <p className="text-xs text-slate-500 font-medium flex items-center justify-center gap-1.5">
+                            <UploadCloud className="w-3.5 h-3.5 text-indigo-500" />
+                            クリックまたはファイルをドラッグ＆ドロップして追加添付
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    !isUploading && (
+                      <div
+                        onClick={() => !isUploading && fileInputRef.current?.click()}
+                        className="p-4 border-2 border-dashed border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/30 rounded-xl text-center cursor-pointer transition-all bg-slate-50/50 flex flex-col items-center justify-center gap-1"
+                      >
+                        <UploadCloud className="w-5 h-5 text-indigo-500 mb-0.5" />
+                        <p className="text-xs text-slate-600 font-bold">
+                          ドラッグ＆ドロップでファイルを添付
+                        </p>
+                        <p className="text-[11px] text-slate-400 font-medium">
+                          またはクリックしてファイルを選択（資料・画像・ドキュメントなど）
+                        </p>
+                      </div>
+                    )
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* 公開期間設定 (デフォルト: オフ) */}
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <CalendarIcon className="w-4 h-4 text-indigo-600" />
+                <span className="text-xs font-bold text-slate-700">公開期間を設定する（デフォルト: 無期限）</span>
+              </label>
+              <input
+                type="checkbox"
+                checked={hasPeriod}
+                onChange={e => setHasPeriod(e.target.checked)}
+                className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500 border-slate-300 cursor-pointer"
+              />
+            </div>
+
+            {hasPeriod && (
+              <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-200">
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">開始日</label>
+                  <input
+                    type="date"
+                    value={startDate}
+                    onChange={e => setStartDate(e.target.value)}
+                    className="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-600 mb-1">終了日</label>
+                  <input
+                    type="date"
+                    value={endDate}
+                    onChange={e => setEndDate(e.target.value)}
+                    className="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* アンケート・意思決定投票設定 */}
+          <div className="p-4 bg-sky-50/70 border border-sky-200 rounded-xl space-y-3.5">
+            <label className="flex items-center justify-between cursor-pointer select-none">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 bg-sky-100 text-sky-700 rounded-lg">
+                  <BarChart2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-bold text-sky-950 flex items-center gap-1.5">
+                    アンケート / 意思決定投票を追加する
+                  </div>
+                  <div className="text-[11px] text-sky-700">
+                    意見集約、賛否投票、選択肢ごとの理由コメント必須化が可能です
+                  </div>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={hasPoll}
+                onChange={e => setHasPoll(e.target.checked)}
+                className="w-4 h-4 rounded text-sky-600 focus:ring-sky-500 border-sky-300 cursor-pointer"
+              />
+            </label>
+
+            {hasPoll && (
+              <div className="pt-3 border-t border-sky-200/80 space-y-3.5">
+                {/* 選択肢リスト */}
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs font-bold text-sky-900">
+                      選択肢（最低2つ）<span className="text-red-500">*</span>
+                    </label>
+                    <span className="text-[11px] text-sky-600 font-medium">
+                      選択肢ごとに「理由コメント必須」を設定可能
+                    </span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {pollOptions.map((opt, idx) => (
+                      <div
+                        key={opt.id}
+                        className="p-2.5 bg-white rounded-xl border border-sky-200/70 shadow-xs space-y-2"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="w-5 h-5 rounded-full bg-sky-100 text-sky-700 text-[11px] font-bold flex items-center justify-center shrink-0">
+                            {idx + 1}
+                          </span>
+                          <input
+                            type="text"
+                            value={opt.text}
+                            onChange={e => handleUpdateOptionText(opt.id, e.target.value)}
+                            placeholder={`例: ${idx === 0 ? '賛成（クラウド型PBX導入）' : idx === 1 ? '条件付き賛成（費用を要再考）' : 'どれも反対'}`}
+                            className="flex-1 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:bg-white"
+                          />
+                          {pollOptions.length > 2 && (
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveOption(opt.id)}
+                              className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+                              title="選択肢を削除"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+
+                        {/* 理由コメント必須チェック */}
+                        <div className="flex items-center justify-between pl-7 pr-1">
+                          <label className="flex items-center gap-2 cursor-pointer select-none text-[11px] font-semibold text-slate-600 hover:text-slate-900">
+                            <input
+                              type="checkbox"
+                              checked={!!opt.requireComment}
+                              onChange={() => handleToggleOptionRequireComment(opt.id)}
+                              className="w-3.5 h-3.5 rounded text-amber-600 focus:ring-amber-500 border-slate-300 cursor-pointer"
+                            />
+                            <span>⚠️ この選択肢を選んだ場合は理由コメントを必須にする</span>
+                          </label>
+                          {opt.requireComment && (
+                            <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-1.5 py-0.5 rounded">
+                              理由必須
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {pollOptions.length < 10 && (
+                    <button
+                      type="button"
+                      onClick={handleAddOption}
+                      className="mt-2.5 w-full py-2 bg-white hover:bg-sky-100/60 border border-dashed border-sky-300 text-sky-700 text-xs font-bold rounded-xl transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-2xs"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      選択肢を追加する（最大10件）
+                    </button>
+                  )}
+                </div>
+
+                {/* 回答期限 & 自動ピン留め設定 */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2 border-t border-sky-200/70">
+                  <div>
+                    <label className="block text-[11px] font-bold text-sky-950 mb-1">
+                      回答期限日（JST）<span className="text-red-500">*</span>
+                    </label>
+                    <input
+                      type="date"
+                      value={pollDeadline}
+                      onChange={e => setPollDeadline(e.target.value)}
+                      className="w-full px-3 py-1.5 bg-white border border-sky-200 rounded-lg text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                    />
+                    <p className="text-[10px] text-sky-700 mt-0.5">※ その日の23:59まで回答を受け付けます</p>
+                  </div>
+
+                  <div className="flex flex-col justify-center">
+                    <label className="flex items-start gap-2 cursor-pointer select-none p-2 bg-white rounded-lg border border-sky-200 shadow-2xs">
+                      <input
+                        type="checkbox"
+                        checked={pollAutoPin}
+                        onChange={e => setPollAutoPin(e.target.checked)}
+                        className="w-4 h-4 rounded text-sky-600 focus:ring-sky-500 border-sky-300 cursor-pointer mt-0.5 shrink-0"
+                      />
+                      <div>
+                        <div className="text-xs font-bold text-sky-950 flex items-center gap-1">
+                          📌 回答期限まで自動ピン留め
+                        </div>
+                        <div className="text-[10px] text-sky-700">
+                          期限到来までは一覧の最上部に固定され、終了後に自動解除
+                        </div>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                {/* 詳細オプション（複数選択、匿名） */}
+                <div className="pt-2 border-t border-sky-200/70 flex flex-wrap gap-4 text-xs font-medium text-sky-950">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={pollAllowMultiple}
+                      onChange={e => setPollAllowMultiple(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded text-sky-600 focus:ring-sky-500 border-sky-300 cursor-pointer"
+                    />
+                    <span>複数選択を許可する</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={pollIsAnonymous}
+                      onChange={e => setPollIsAnonymous(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded text-sky-600 focus:ring-sky-500 border-sky-300 cursor-pointer"
+                    />
+                    <span>匿名投票にする（誰が投票したかを非公開）</span>
+                  </label>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* ピン留め設定 */}
+          <div className="p-3.5 bg-amber-50/60 border border-amber-200/80 rounded-xl space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Pin className="w-4 h-4 text-amber-600" />
+                <div>
+                  <div className="text-xs font-bold text-amber-900">掲示板の上部にピン留めする</div>
+                  <div className="text-[11px] text-amber-700">重要な告知として一覧の最上部に固定表示されます</div>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={isPinned}
+                onChange={e => setIsPinned(e.target.checked)}
+                className="w-4 h-4 rounded text-amber-600 focus:ring-amber-500 border-amber-300 cursor-pointer"
+              />
+            </div>
+
+            {isPinned && (
+              <div className="pt-2.5 border-t border-amber-200/60">
+                <label className="block text-[11px] font-bold text-amber-900 mb-1.5">
+                  ピン留め期間
+                </label>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setPinnedPeriod('1week')}
+                    className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-all text-center cursor-pointer ${
+                      pinnedPeriod === '1week'
+                        ? 'bg-amber-500 text-white border-amber-600 shadow-xs'
+                        : 'bg-white text-slate-700 border-amber-200 hover:bg-amber-100/50'
+                    }`}
+                  >
+                    1週間（7日間）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPinnedPeriod('1month')}
+                    className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-all text-center cursor-pointer ${
+                      pinnedPeriod === '1month'
+                        ? 'bg-amber-500 text-white border-amber-600 shadow-xs'
+                        : 'bg-white text-slate-700 border-amber-200 hover:bg-amber-100/50'
+                    }`}
+                  >
+                    1ヶ月（30日間）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPinnedPeriod('forever')}
+                    className={`py-1.5 px-2 rounded-lg border text-xs font-bold transition-all text-center cursor-pointer ${
+                      pinnedPeriod === 'forever'
+                        ? 'bg-amber-500 text-white border-amber-600 shadow-xs'
+                        : 'bg-white text-slate-700 border-amber-200 hover:bg-amber-100/50'
+                    }`}
+                  >
+                    期限なし（常時）
+                  </button>
+                </div>
+                <div className="mt-1 text-[10px] text-amber-800">
+                  {pinnedPeriod === '1week' && '※ 1週間後に自動的に通常の掲示位置に戻ります。'}
+                  {pinnedPeriod === '1month' && '※ 1ヶ月後に自動的に通常の掲示位置に戻ります。'}
+                  {pinnedPeriod === 'forever' && '※ 手動で解除するまで常時最上部に固定されます。'}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Submit Actions */}
+          <div className="pt-2 flex items-center justify-end gap-3 border-t border-slate-200">
+            <button
+              type="button"
+              disabled={isUploading}
+              onClick={onClose}
+              className="px-4 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl transition-colors disabled:opacity-50"
+            >
+              キャンセル
+            </button>
+            <button
+              type="submit"
+              disabled={isUploading}
+              className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl shadow-md transition-all active:scale-[0.99] disabled:opacity-50 flex items-center gap-1.5"
+            >
+              {isUploading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+              {isUploading ? 'ファイル処理中...' : '投稿を公開する'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}

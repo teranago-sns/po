@@ -1,0 +1,4926 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback, lazy, Suspense } from 'react';
+import { API_BASE_URL, getAuthToken, setAuthToken, clearAuthToken } from './config/api';
+import { APP_VERSION } from './config/version';
+import { getAvatarUrl, sanitizeAvatarUrlForSave } from './utils/avatar';
+import { ensureJstIsoString } from './utils/dateUtils';
+import { Header } from './components/Header';
+import { Sidebar, AppTab } from './components/Sidebar';
+import { Timeline } from './components/Timeline';
+import { LoginScreen } from './components/LoginScreen';
+import { LazyTabFallback } from './components/common/LazyTabFallback';
+import { useMasterManagement } from './hooks/useMasterManagement';
+import { usePostManagement } from './hooks/usePostManagement';
+import { useMemoManagement } from './hooks/useMemoManagement';
+import { useReportManagement } from './hooks/useReportManagement';
+import { fetchWithRetry } from './utils/fetchWithRetry';
+
+import { lazyWithRetry } from './utils/lazyWithRetry';
+
+// 遅延読み込み (React.lazy + 自動リロード・再試行) によるコード分割
+const Calendar = lazyWithRetry(() => import('./components/Calendar').then(m => ({ default: m.Calendar })));
+const Workflow = lazyWithRetry(() => import('./components/Workflow').then(m => ({ default: m.Workflow })));
+const Board = lazyWithRetry(() => import('./components/Board').then(m => ({ default: m.Board })));
+const Chat = lazyWithRetry(() => import('./components/Chat').then(m => ({ default: m.Chat })));
+const MemoList = lazyWithRetry(() => import('./components/MemoList').then(m => ({ default: m.MemoList })));
+const DailyReportView = lazyWithRetry(() => import('./components/DailyReport').then(m => ({ default: m.DailyReportView })));
+const InspectionScheduler = lazyWithRetry(() => import('./components/InspectionScheduler').then(m => ({ default: m.InspectionScheduler })));
+const InspectionReportTab = lazyWithRetry(() => import('./components/inspection/InspectionReportTab').then(m => ({ default: m.InspectionReportTab })));
+const SiteManagement = lazyWithRetry(() => import('./components/SiteManagement/SiteManagement').then(m => ({ default: m.SiteManagement })));
+const AssetManagement = lazyWithRetry(() => import('./components/AssetManagement/AssetManagement').then(m => ({ default: m.AssetManagement })));
+const ProjectManagement = lazyWithRetry(() => import('./components/ProjectManagement/ProjectManagement').then(m => ({ default: m.ProjectManagement })));
+const SafetyConfirmation = lazyWithRetry(() => import('./components/SafetyConfirmation').then(m => ({ default: m.SafetyConfirmation })));
+const GuestSafetyResponse = lazyWithRetry(() => import('./components/GuestSafetyResponse').then(m => ({ default: m.GuestSafetyResponse })));
+const MyPage = lazyWithRetry(() => import('./components/MyPage').then(m => ({ default: m.MyPage })));
+const AdminPanel = lazyWithRetry(() => import('./components/AdminPanel').then(m => ({ default: m.AdminPanel })));
+const FileManager = lazyWithRetry(() => import('./components/FileManager'));
+const DocumentManager = lazyWithRetry(() => import('./components/DocumentManager'));
+const PhotoReportsTab = lazyWithRetry(() => import('./components/PhotoReportsTab').then(m => ({ default: m.PhotoReportsTab })));
+import { SchedulePollModal } from './components/SchedulePollModal';
+import { SchedulePoll } from './types/schedulePoll';
+import { Post, CalendarEvent, WorkflowApplication, User, OfficeMaster, DivisionMaster, PositionMaster, BoardTopic, ChatRoom, ApprovalFlowRule, ApprovalStepConfig, ItemMaster, ApplicationStatus, DailyReport, Memo, SafetyConfirmationEvent, SafetyConfirmationResponse } from './types';
+import { 
+  syncUserReadStatusesFromServer, 
+  isUserReadStatusSynced,
+  isMemoUnread, 
+  isTopicUnread, 
+  isWorkflowUnread, 
+  isEventUnread, 
+  isReportUnread, 
+  isChatUnread, 
+  markMemoAsRead, 
+  markMemoAsUnread, 
+  markEventAsRead, 
+  markTopicAsRead, 
+  markWorkflowAsRead, 
+  markReportAsRead, 
+  markChatRoomAsRead,
+  getRespondedSafetyEventIds,
+  getUnreadNotifications,
+  ProjectMySummary
+} from './utils/notifications';
+import { triggerPushNotification } from './utils/pushNotifications';
+import { dispatchNotificationEmail } from './utils/emailNotificationDispatcher';
+import { deleteAttachmentFiles } from './utils/fileUpload';
+import { TopicDetailModal } from './components/TopicDetailModal';
+import { GlobalEventDetailModal } from './components/GlobalEventDetailModal';
+import { GlobalMemoDetailModal } from './components/GlobalMemoDetailModal';
+import { GlobalReportDetailModal } from './components/GlobalReportDetailModal';
+import { GlobalWorkflowDetailModal } from './components/GlobalWorkflowDetailModal';
+import { UserDirectory } from './components/UserDirectory';
+import { UserDetailModal } from './components/UserDetailModal';
+import { filterStepsForApplicant, resolveApproverForStep, resolveApproversForStep, isUserCurrentApprover, getSupervisorAtLevel, findBestMatchingApprovalFlow } from './utils/workflowHelpers';
+import { planRecurrenceSave, planRecurrenceDelete, safeParseRecurrence, safeParseExceptions, expandRecurringEvents, isExpandedRecurrenceId, extractParentIdFromInstanceId, extractDateFromInstanceId } from './utils/recurrenceUtils';
+import { sortUsersByDivision } from './utils/userSort';
+import { getUserOfficeName, getUserDivisionName } from './utils/masterResolver';
+import { hasTopicTargetMembers, canUserViewTopic, getTopicScopeBadgeLabel } from './utils/boardHelpers';
+import { RecurrenceActionScope } from './components/RecurrenceActionModal';
+import { parseAppQueryParams, updateBrowserUrl, AppQueryParams } from './utils/urlParams';
+import { initColorTheme, initFontSize, applyFontSize, applyColorTheme, applyNotificationWindowSize } from './utils/theme';
+import { logActivity } from './utils/logger';
+import { schedulePreviewPrefetch } from './utils/previewPrefetch';
+import { isToggleableMenuKey, isOptionalMenuVisible } from './utils/menuVisibility';
+
+// Initialize saved color theme & font size scale
+initColorTheme();
+initFontSize();
+
+// Helper to map and sanitize API user objects to match frontend types safely
+const mapUserFromApi = (apiUser: any): User => {
+  const isAdmin = apiUser.isAdmin === true || apiUser.role === 'admin';
+  const office = apiUser.office || undefined;
+  const division = apiUser.division || undefined;
+  const position = (apiUser.position && apiUser.position !== '一般') ? apiUser.position : undefined;
+  const deptFromParts = [office, division, position].filter(Boolean).join(' ');
+  const department = (apiUser.department && typeof apiUser.department === 'string' && apiUser.department.trim() !== '') ? apiUser.department : (deptFromParts || '未設定');
+
+  let preferences = apiUser.preferences;
+  if (typeof preferences === 'string') {
+    try {
+      preferences = JSON.parse(preferences);
+    } catch (_) {
+      preferences = undefined;
+    }
+  }
+
+  // ローカルキャッシュの preferences とマージ（通知センター等の直前設定を完全保護）
+  let cachedPrefs: any = null;
+  try {
+    const cachedStr = localStorage.getItem(`user_preferences_${apiUser.id}`);
+    if (cachedStr) cachedPrefs = JSON.parse(cachedStr);
+  } catch (_) {}
+
+  const mergedPreferences = {
+    ...(cachedPrefs || {}),
+    ...(preferences || {}),
+    emailNotifications: {
+      ...(cachedPrefs?.emailNotifications || {}),
+      ...(preferences?.emailNotifications || {}),
+    },
+    menuVisibility: {
+      ...(cachedPrefs?.menuVisibility || {}),
+      ...(preferences?.menuVisibility || {}),
+    },
+  };
+
+  const officeId = apiUser.officeId || mergedPreferences?.officeId || undefined;
+  const divisionId = apiUser.divisionId || mergedPreferences?.divisionId || undefined;
+  const positionId = apiUser.positionId || mergedPreferences?.positionId || undefined;
+
+  return {
+    ...apiUser,
+    id: String(apiUser.id),
+    name: apiUser.name || '名前未設定',
+    avatarUrl: getAvatarUrl(apiUser.avatarUrl),
+    department,
+    officeId,
+    office,
+    divisionId,
+    division,
+    positionId,
+    position,
+    role: isAdmin ? 'admin' : 'user',
+    isAdmin: isAdmin,
+    sortOrder: typeof apiUser.sortOrder === 'number' ? apiUser.sortOrder : (apiUser.sortOrder !== undefined && apiUser.sortOrder !== null && apiUser.sortOrder !== '' ? parseInt(apiUser.sortOrder, 10) : undefined),
+    preferences: mergedPreferences,
+  };
+};
+
+// Helper to map and sanitize API posts to match frontend types safely
+const mapPostFromApi = (apiPost: any, allUsers: User[]): Post => {
+  let authorUser: User | undefined = undefined;
+
+  if (apiPost.author && typeof apiPost.author === 'object') {
+    authorUser = apiPost.author;
+  } else if (apiPost.authorId) {
+    authorUser = allUsers.find(u => u.id === apiPost.authorId);
+  }
+
+  if (!authorUser) {
+    authorUser = {
+      id: apiPost.authorId || (apiPost.author && apiPost.author.id) || 'unknown',
+      name: (apiPost.author && apiPost.author.name) || '匿名',
+      department: (apiPost.author && apiPost.author.department) || '未設定',
+      avatarUrl: '',
+    };
+  }
+
+  return {
+    id: String(apiPost.id),
+    author: {
+      ...authorUser,
+      id: String(authorUser.id),
+      avatarUrl: getAvatarUrl(authorUser.avatarUrl),
+      department: authorUser.department || '未設定',
+    },
+    content: apiPost.content || '',
+    tags: Array.isArray(apiPost.tags) ? apiPost.tags : [],
+    createdAt: apiPost.createdAt || new Date().toISOString(),
+    likes: typeof apiPost.likes === 'number' ? apiPost.likes : 0,
+    isLiked: !!apiPost.isLiked,
+    nasLink: apiPost.nasLink || undefined,
+  };
+};
+
+import { AlertCircle, RefreshCw, X } from 'lucide-react';
+import { ConfirmModal, ConfirmModalState } from './components/ConfirmModal';
+import { InstallPwaPrompt } from './components/InstallPwaPrompt';
+
+export default function App() {
+  const [usersList, setUsersList] = useState<User[]>([]);
+  const [fetchErrors, setFetchErrors] = useState<Record<string, string>>({});
+  const [confirmModal, setConfirmModal] = useState<ConfirmModalState>({ isOpen: false, title: '', message: '' });
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+  const handleOpenConfirmModal = (options: {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    isDangerous?: boolean;
+    onConfirm: () => void;
+  }) => {
+    setConfirmModal({
+      isOpen: true,
+      title: options.title,
+      message: options.message,
+      confirmText: options.confirmLabel || 'OK',
+      cancelText: options.cancelLabel || 'キャンセル',
+      type: options.isDangerous ? 'danger' : 'warning',
+      onConfirm: options.onConfirm,
+    });
+  };
+
+  // チャット同期・エラー制御用Ref
+  const chatConsecutiveErrorsRef = useRef<number>(0);
+  const isChatRefetchingRef = useRef<boolean>(false);
+
+  // URLクエリパラメータの初期解析（ディープリンク対応）
+  const initialUrlParams = useRef<AppQueryParams>(parseAppQueryParams()).current;
+
+  // カレンダー用パラメータ状態
+  const [calendarParams, setCalendarParams] = useState<{
+    office?: string;
+    division?: string;
+    groupId?: string;
+    mode?: 'personal' | 'team';
+    view?: 'month' | 'week' | 'day' | 'list';
+    date?: string;
+    type?: string;
+    targetUserId?: string;
+    requestKey?: number;
+  }>(() => ({
+    office: initialUrlParams.office,
+    division: initialUrlParams.division,
+    groupId: initialUrlParams.groupId,
+    mode: initialUrlParams.mode,
+    view: initialUrlParams.view,
+    date: initialUrlParams.date,
+    type: initialUrlParams.type,
+    targetUserId: initialUrlParams.targetUserId,
+  }));
+
+  // コンテンツディープリンク用のターゲットID状態
+  const [targetTopicId, setTargetTopicId] = useState<string | undefined>(initialUrlParams.topicId);
+  const [targetChatRoomId, setTargetChatRoomId] = useState<string | undefined>(initialUrlParams.chatRoomId);
+  const [targetMemoId, setTargetMemoId] = useState<string | undefined>(initialUrlParams.memoId);
+  const [targetApplicationId, setTargetApplicationId] = useState<string | undefined>(initialUrlParams.applicationId);
+  const [targetEventId, setTargetEventId] = useState<string | undefined>(initialUrlParams.eventId);
+  const [targetSiteId, setTargetSiteId] = useState<string | undefined>(undefined);
+  const [targetAssetId, setTargetAssetId] = useState<string | undefined>(initialUrlParams.assetId);
+  const [targetProjectId, setTargetProjectId] = useState<string | undefined>(initialUrlParams.projectId);
+  const [targetTaskId, setTargetTaskId] = useState<string | undefined>(initialUrlParams.taskId);
+  const [projectViewParam, setProjectViewParam] = useState<'kanban' | 'list' | 'mytasks' | undefined>(initialUrlParams.projectView);
+  const [assetParams, setAssetParams] = useState<{
+    assetMode?: 'my' | 'catalog' | 'shared' | 'inspections' | 'calendar';
+    assetCategory?: string;
+    assetOffice?: string;
+    assetDivision?: string;
+    assetAssignee?: string;
+    assetLens?: 'all' | 'inspection_due' | 'last_inspection' | 'attachments' | 'lease_alert';
+    assetAlert?: 'none' | 'all_alerts' | 'overdue' | 'inspection_1m' | 'replacement_6m';
+    assetQ?: string;
+    assetShowRetired?: boolean;
+    assetSubTab?: 'details' | 'inspections' | 'history';
+    assetSort?: string;
+    requestKey?: number;
+  }>(() => ({
+    assetMode: initialUrlParams.assetMode,
+    assetCategory: initialUrlParams.assetCategory,
+    assetOffice: initialUrlParams.assetOffice,
+    assetDivision: initialUrlParams.assetDivision,
+    assetAssignee: initialUrlParams.assetAssignee,
+    assetLens: initialUrlParams.assetLens,
+    assetAlert: initialUrlParams.assetAlert,
+    assetQ: initialUrlParams.assetQ,
+    assetShowRetired: initialUrlParams.assetShowRetired,
+    assetSubTab: initialUrlParams.assetSubTab,
+    assetSort: initialUrlParams.assetSort,
+  }));
+  const [targetReportId, setTargetReportId] = useState<string | undefined>(initialUrlParams.reportId);
+  const [targetSafetyEventId, setTargetSafetyEventId] = useState<string | undefined>(initialUrlParams.safetyEventId);
+  const [targetSafetyUserId, setTargetSafetyUserId] = useState<string | undefined>(initialUrlParams.safetyUserId);
+  const [initialSchedulePollId, setInitialSchedulePollId] = useState<string | null>(initialUrlParams.pollId || null);
+  const [dismissGuestSafety, setDismissGuestSafety] = useState<boolean>(false);
+
+  // グローバル詳細ポップアップ表示用の状態
+  const [globalSelectedEvent, setGlobalSelectedEvent] = useState<CalendarEvent | null>(null);
+  const [globalSelectedTopic, setGlobalSelectedTopic] = useState<BoardTopic | null>(null);
+  const [globalSelectedMemo, setGlobalSelectedMemo] = useState<Memo | null>(null);
+  const [globalSelectedReport, setGlobalSelectedReport] = useState<DailyReport | null>(null);
+  const [globalSelectedApplication, setGlobalSelectedApplication] = useState<WorkflowApplication | null>(null);
+  const [globalSelectedUser, setGlobalSelectedUser] = useState<User | null>(null);
+  const [autoOpenCreateMemo, setAutoOpenCreateMemo] = useState(false);
+  const [memoInitialRecipientId, setMemoInitialRecipientId] = useState<string | undefined>(undefined);
+
+  const handleOpenUserDetail = (userOrId: User | string) => {
+    const normalizeName = (s?: string) => String(s || '').replace(/[\s　]+/g, '').trim();
+    const allKnownUsers = userState.id
+      ? [userState, ...usersList.filter(u => u.id !== userState.id)]
+      : usersList;
+
+    if (typeof userOrId === 'string') {
+      const targetStr = userOrId.trim();
+      if (!targetStr || targetStr === 'システム' || targetStr === '匿名メンバー') return;
+      const normTarget = normalizeName(targetStr);
+      const found = allKnownUsers.find(
+        u =>
+          String(u.id) === targetStr ||
+          (u.loginId && String(u.loginId) === targetStr) ||
+          u.name === targetStr ||
+          (normTarget && normalizeName(u.name) === normTarget)
+      );
+      if (found) setGlobalSelectedUser(found);
+    } else if (userOrId) {
+      const targetId = userOrId.id ? String(userOrId.id) : '';
+      const targetLoginId = (userOrId as any).loginId ? String((userOrId as any).loginId) : '';
+      const normName = normalizeName(userOrId.name);
+      const enriched =
+        allKnownUsers.find(
+          u =>
+            (targetId && String(u.id) === targetId) ||
+            (targetLoginId && u.loginId && String(u.loginId) === targetLoginId) ||
+            (normName && normalizeName(u.name) === normName)
+        ) || userOrId;
+      if (enriched && (enriched.id || enriched.name)) {
+        setGlobalSelectedUser(enriched);
+      }
+    }
+  };
+
+  const handleSendMemoFromModal = (targetUser: User) => {
+    setGlobalSelectedUser(null);
+    setMemoInitialRecipientId(targetUser.id);
+    setAutoOpenCreateMemo(true);
+    setActiveTab('memo');
+  };
+
+  const handleOpenChatFromModal = (targetUser: User) => {
+    setGlobalSelectedUser(null);
+    if (targetUser?.id && targetUser.id !== userState?.id) {
+      const dmRoom = chatRooms.find(
+        r =>
+          r.type === 'dm' &&
+          Array.isArray(r.participants) &&
+          r.participants.length === 2 &&
+          r.participants.some(p => String(p.id) === String(targetUser.id)) &&
+          r.participants.some(p => String(p.id) === String(userState.id))
+      );
+      if (dmRoom) {
+        setTargetChatRoomId(dmRoom.id);
+      }
+    }
+    setActiveTab('chat');
+  };
+
+  // 全体からの社員ポップアップ呼び出しをリスニング
+  useEffect(() => {
+    const handleUserModalEvent = (e: any) => {
+      if (e.detail) {
+        handleOpenUserDetail(e.detail);
+      }
+    };
+    window.addEventListener('teranago:open-user-modal' as any, handleUserModalEvent);
+    return () => window.removeEventListener('teranago:open-user-modal' as any, handleUserModalEvent);
+  }, [usersList]);
+
+  const handleNavigateToContent = (target: {
+    tab: AppTab;
+    topicId?: string;
+    chatRoomId?: string;
+    memoId?: string;
+    applicationId?: string;
+    eventId?: string;
+    reportId?: string;
+    safetyEventId?: string;
+    openCreateMemo?: boolean;
+    office?: string;
+    division?: string;
+    groupId?: string;
+    mode?: 'personal' | 'team';
+    view?: 'month' | 'week' | 'day' | 'list';
+    date?: string;
+    type?: string;
+    targetUserId?: string;
+    assetId?: string;
+    assetSubTab?: 'details' | 'inspections' | 'history';
+    assetMode?: 'my' | 'catalog' | 'shared' | 'inspections' | 'calendar';
+    assetCategory?: string;
+    assetOffice?: string;
+    assetDivision?: string;
+    assetAssignee?: string;
+    assetLens?: 'all' | 'inspection_due' | 'last_inspection' | 'attachments' | 'lease_alert';
+    assetAlert?: 'none' | 'all_alerts' | 'overdue' | 'inspection_1m' | 'replacement_6m';
+    assetQ?: string;
+    assetShowRetired?: boolean;
+    assetSort?: string;
+    projectId?: string;
+    taskId?: string;
+    projectView?: 'kanban' | 'list' | 'mytasks';
+  }) => {
+    // プロジェクト・Todo・資料メモボード
+    if (target.tab === 'projects' || target.projectId || target.taskId) {
+      setTargetProjectId(target.projectId);
+      setTargetTaskId(target.taskId);
+      setProjectViewParam(target.projectView);
+      setActiveTab('projects');
+      updateBrowserUrl();
+      return;
+    }
+    // 資産管理（単体詳細・一覧条件ビュー）
+    if (target.tab === 'assets' || target.assetId) {
+      setAssetParams({
+        assetMode: target.assetMode,
+        assetCategory: target.assetCategory,
+        assetOffice: target.assetOffice,
+        assetDivision: target.assetDivision,
+        assetAssignee: target.assetAssignee,
+        assetLens: target.assetLens,
+        assetAlert: target.assetAlert,
+        assetQ: target.assetQ,
+        assetShowRetired: target.assetShowRetired,
+        assetSubTab: target.assetSubTab,
+        assetSort: target.assetSort,
+        requestKey: Date.now(),
+      });
+      setTargetAssetId(target.assetId);
+      setActiveTab('assets');
+      updateBrowserUrl();
+      return;
+    }
+    // スケジュール（eventId）
+    if (target.eventId) {
+      const searchStart = new Date();
+      searchStart.setMonth(searchStart.getMonth() - 6);
+      const searchEnd = new Date();
+      searchEnd.setMonth(searchEnd.getMonth() + 12);
+      const expanded = expandRecurringEvents(events, searchStart, searchEnd);
+
+      const found = expanded.find(e => e.id === target.eventId || e.recurrenceParentId === target.eventId);
+      if (found) {
+        if (userState?.id) {
+          markEventAsRead(userState.id, found.id);
+          if (found.recurrenceParentId) markEventAsRead(userState.id, found.recurrenceParentId);
+        }
+        setGlobalSelectedEvent(found);
+        return; // 画面遷移せずにポップアップ
+      }
+    }
+    // カレンダー表示条件（ブックマーク・共有リンクからの遷移）
+    if (target.tab === 'calendar' && !target.eventId && (target.mode || target.view || target.date || target.office || target.division || target.groupId || target.type || target.targetUserId)) {
+      setCalendarParams({
+        office: target.office || '全社',
+        division: target.division || '全部署',
+        groupId: target.groupId,
+        mode: target.mode,
+        view: target.view,
+        date: target.date || 'today',
+        type: target.type || 'all',
+        targetUserId: target.targetUserId,
+        requestKey: Date.now(),
+      });
+      setActiveTab('calendar');
+      setTargetEventId(undefined);
+      updateBrowserUrl();
+      return;
+    }
+    // 掲示板（topicId）
+    if (target.topicId) {
+      const found = topics.find(t => t.id === target.topicId);
+      if (found) {
+        if (userState?.id) markTopicAsRead(userState.id, found.id);
+        setGlobalSelectedTopic(found);
+        return; // 画面遷移せずにポップアップ
+      }
+    }
+    // 伝言メモ（memoId）
+    if (target.memoId) {
+      const found = memos.find(m => m.id === target.memoId);
+      if (found) {
+        if (userState?.id) markMemoAsRead(userState.id, found.id);
+        setGlobalSelectedMemo(found);
+        return; // 画面遷移せずにポップアップ
+      }
+    }
+    // 日報・週報（reportId）
+    if (target.reportId) {
+      const found = reports.find(r => r.id === target.reportId || String(r.id) === String(target.reportId));
+      if (found) {
+        if (userState?.id) markReportAsRead(userState.id, found.id);
+        setGlobalSelectedReport(found);
+        return; // 画面遷移せずにポップアップ
+      }
+    }
+    // ワークフロー申請（applicationId）: ピンポイントで詳細モーダルを表示
+    if (target.applicationId) {
+      const found = applications.find(a => a.id === target.applicationId || String(a.id) === String(target.applicationId));
+      if (found) {
+        if (userState?.id) markWorkflowAsRead(userState.id, found.id);
+        setGlobalSelectedApplication(found);
+        return; // 画面遷移せずにモーダルポップアップ表示
+      }
+    }
+    // 安否確認（safetyEventId）: 安否確認画面に遷移し、対象イベントの回答モーダルを即座に開く
+    if (target.safetyEventId) {
+      setActiveTab('safety_confirmation');
+      setTargetSafetyEventId(target.safetyEventId);
+      updateBrowserUrl();
+      return;
+    }
+
+    // 日程調整（pollId）
+    if ((target as any).pollId) {
+      setInitialSchedulePollId((target as any).pollId);
+      setShowSchedulePollModal(true);
+      return;
+    }
+
+    // チャット、ワークフローなど遷移して表示
+    setActiveTab(target.tab);
+    if (target.openCreateMemo) {
+      setAutoOpenCreateMemo(true);
+    }
+    setTargetTopicId(target.topicId);
+    setTargetChatRoomId(target.chatRoomId);
+    setTargetMemoId(target.memoId);
+    setTargetApplicationId(target.applicationId);
+    setTargetEventId(target.eventId);
+    setTargetReportId(target.reportId);
+    setTargetSafetyEventId(target.safetyEventId);
+
+    updateBrowserUrl();
+  };
+
+  // タブ切り替えハンドラー（明示的なタブ移動時に残留ターゲットIDをリセットして誤ポップアップを防止）
+  const handleSelectTab = (tab: AppTab) => {
+    setActiveTab(tab);
+    setTargetEventId(undefined);
+    setTargetSiteId(undefined);
+    setTargetAssetId(undefined);
+    setTargetTopicId(undefined);
+    setTargetMemoId(undefined);
+    setTargetChatRoomId(undefined);
+    setTargetApplicationId(undefined);
+    setTargetReportId(undefined);
+    setTargetSafetyEventId(undefined);
+  };
+
+  // 予定/現場の相互クロスナビゲーションハンドラー
+  const handleNavigateToSite = (siteIdOrCode: string) => {
+    setTargetSiteId(siteIdOrCode);
+    setActiveTab('site_management');
+  };
+
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    const wasLoggedIn = localStorage.getItem('is_logged_in') === 'true';
+    const hasToken = Boolean(getAuthToken());
+    if (wasLoggedIn && !hasToken) {
+      localStorage.removeItem('is_logged_in');
+      try {
+        sessionStorage.setItem(
+          'auth_relogin_notice',
+          'セキュリティ強化アップデートのため、再度ログインしてください。'
+        );
+      } catch {}
+      return false;
+    }
+    return wasLoggedIn && hasToken;
+  });
+
+  // URLの招待/パスワード再設定トークン優先表示フラグ（ログイン中ユーザーでもURLトークンがあれば設定画面を最優先表示）
+  const [showAuthScreen, setShowAuthScreen] = useState<boolean>(() => {
+    const validLogin = localStorage.getItem('is_logged_in') === 'true' && Boolean(getAuthToken());
+    return !validLogin || !!(initialUrlParams.resetToken || initialUrlParams.inviteToken || initialUrlParams.authMode === 'reset-password' || initialUrlParams.authMode === 'invite');
+  });
+
+  // サーバー側トークン失効・401検知時の自動ログアウト制御
+  useEffect(() => {
+    const handleSessionExpired = () => {
+      clearAuthToken();
+      localStorage.removeItem('is_logged_in');
+      setIsAuthenticated(false);
+      setShowAuthScreen(true);
+    };
+    window.addEventListener('auth_session_expired', handleSessionExpired);
+    return () => window.removeEventListener('auth_session_expired', handleSessionExpired);
+  }, []);
+
+  const [userState, setUserState] = useState<User>(() => {
+    const cachedUserData = localStorage.getItem('logged_in_user_data');
+    if (cachedUserData) {
+      try {
+        const parsed = JSON.parse(cachedUserData);
+        if (parsed && parsed.id && parsed.name && parsed.name !== 'ユーザー情報取得中...') {
+          return parsed;
+        }
+      } catch (_) {}
+    }
+    const savedUserId = localStorage.getItem('logged_in_user_id');
+    if (savedUserId) {
+      return { id: savedUserId, name: '', role: 'user', department: '', avatarUrl: '' };
+    }
+    return { id: 'u1', name: 'ユーザー', role: 'user', department: '', avatarUrl: '' };
+  });
+
+  // 代理ログイン中の元管理者情報（ワンクリック復帰用）
+  const [impersonatorAdmin, setImpersonatorAdmin] = useState<User | null>(() => {
+    try {
+      const saved = localStorage.getItem('impersonator_admin_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  useEffect(() => {
+    if (userState?.id && isAuthenticated) {
+      syncUserReadStatusesFromServer(userState.id);
+
+      // 自動ログイン時・PC起動時のセッション開始アクセスログ（ブラウザセッションまたは日付変わり目で自動記録）
+      if (userState.name && userState.name !== 'ユーザー情報取得中...') {
+        const sessionKey = `teranago_session_access_${userState.id}`;
+        const lastSessionDate = sessionStorage.getItem(sessionKey);
+        const todayStr = new Date().toDateString();
+        if (!lastSessionDate || lastSessionDate !== todayStr) {
+          logActivity('app_access', 'システムにアクセスしました（利用開始）', userState);
+          sessionStorage.setItem(sessionKey, todayStr);
+        }
+      }
+    }
+  }, [userState, isAuthenticated]);
+
+  const handleLogin = (user: User, token?: string) => {
+    if (token) {
+      setAuthToken(token);
+    }
+    try {
+      sessionStorage.removeItem('auth_relogin_notice');
+    } catch {}
+    setUserState(user);
+    setIsAuthenticated(true);
+    setShowAuthScreen(false);
+    localStorage.setItem('is_logged_in', 'true');
+    localStorage.setItem('logged_in_user_id', user.id);
+    localStorage.setItem('logged_in_user_data', JSON.stringify(user));
+    localStorage.removeItem('impersonator_admin_user');
+    setImpersonatorAdmin(null);
+    sessionStorage.setItem(`teranago_session_access_${user.id}`, new Date().toDateString());
+    logActivity('login', 'システムにログインしました', user);
+  };
+
+  const handleLogout = () => {
+    logActivity('logout', 'ログアウトしました', userState);
+    if (getAuthToken()) {
+      fetch(`${API_BASE_URL}/auth/logout`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      }).catch(() => {});
+    }
+    clearAuthToken();
+    setIsAuthenticated(false);
+    setShowAuthScreen(true);
+    localStorage.removeItem('is_logged_in');
+    localStorage.removeItem('logged_in_user_id');
+    localStorage.removeItem('logged_in_user_data');
+    localStorage.removeItem('impersonator_admin_user');
+    setImpersonatorAdmin(null);
+  };
+
+  const [activeTab, setActiveTab] = useState<AppTab>(() => initialUrlParams.tab || 'mypage');
+  const [showSchedulePollModal, setShowSchedulePollModal] = useState<boolean>(() => !!initialUrlParams.pollId);
+  const [schedulePolls, setSchedulePolls] = useState<SchedulePoll[]>([]);
+
+  // 主要タブ閲覧時のアクティビティログ（頻繁なスパムを防ぐため10分以内の同一タブ閲覧は抑制）
+  const lastLoggedTabRef = useRef<Record<string, number>>({});
+  useEffect(() => {
+    if (!isAuthenticated || !userState?.id || !userState.name || userState.name === 'ユーザー情報取得中...') return;
+    const now = Date.now();
+    const lastTime = lastLoggedTabRef.current[activeTab] || 0;
+    if (now - lastTime < 10 * 60 * 1000) return;
+
+    if (activeTab === 'chat') {
+      logActivity('chat_view', 'チャット画面を開きました', userState);
+      lastLoggedTabRef.current[activeTab] = now;
+    } else if (activeTab === 'board') {
+      logActivity('bulletin_view', '社内掲示板を開きました', userState);
+      lastLoggedTabRef.current[activeTab] = now;
+    }
+  }, [activeTab, isAuthenticated, userState]);
+
+  // URL末尾のクエリパラメータを完全除去してクリーンなURLを維持
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.search && window.history) {
+      try {
+        const cleanUrl = window.location.pathname + (window.location.hash ? window.location.hash.split('?')[0] : '');
+        window.history.replaceState({}, '', cleanUrl);
+      } catch (e) {
+        // ignore
+      }
+    }
+  }, []);
+
+  // ブラウザの戻る/進む（popstate）対応
+  useEffect(() => {
+    const handlePopState = () => {
+      const parsed = parseAppQueryParams();
+      if (parsed.tab) {
+        setActiveTab(parsed.tab);
+      }
+      if (parsed.office || parsed.division || parsed.groupId || parsed.mode || parsed.view || parsed.date || parsed.type) {
+        setCalendarParams(prev => ({
+          ...prev,
+          office: parsed.office ?? prev.office,
+          division: parsed.division ?? prev.division,
+          groupId: parsed.groupId,
+          mode: parsed.mode ?? prev.mode,
+          view: parsed.view ?? prev.view,
+          date: parsed.date ?? prev.date,
+          type: parsed.type ?? prev.type,
+        }));
+      }
+      if (parsed.applicationId !== undefined) setTargetApplicationId(parsed.applicationId);
+      if (parsed.memoId !== undefined) setTargetMemoId(parsed.memoId);
+      if (parsed.topicId !== undefined) setTargetTopicId(parsed.topicId);
+      if (parsed.chatRoomId !== undefined) setTargetChatRoomId(parsed.chatRoomId);
+      if (parsed.eventId !== undefined) setTargetEventId(parsed.eventId);
+      if (parsed.assetId !== undefined) setTargetAssetId(parsed.assetId);
+      if (parsed.projectId !== undefined) setTargetProjectId(parsed.projectId);
+      if (parsed.taskId !== undefined) setTargetTaskId(parsed.taskId);
+      if (parsed.projectView !== undefined) setProjectViewParam(parsed.projectView);
+      if (
+        parsed.tab === 'assets' ||
+        parsed.assetMode ||
+        parsed.assetCategory ||
+        parsed.assetOffice ||
+        parsed.assetDivision ||
+        parsed.assetAssignee ||
+        parsed.assetLens ||
+        parsed.assetAlert ||
+        parsed.assetQ ||
+        parsed.assetShowRetired ||
+        parsed.assetSubTab ||
+        parsed.assetSort
+      ) {
+        setAssetParams({
+          assetMode: parsed.assetMode,
+          assetCategory: parsed.assetCategory,
+          assetOffice: parsed.assetOffice,
+          assetDivision: parsed.assetDivision,
+          assetAssignee: parsed.assetAssignee,
+          assetLens: parsed.assetLens,
+          assetAlert: parsed.assetAlert,
+          assetQ: parsed.assetQ,
+          assetShowRetired: parsed.assetShowRetired,
+          assetSubTab: parsed.assetSubTab,
+          assetSort: parsed.assetSort,
+          requestKey: Date.now(),
+        });
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
+    return localStorage.getItem('is_sidebar_collapsed') === 'true';
+  });
+
+  useEffect(() => {
+    if (userState?.preferences?.isSidebarCollapsed !== undefined) {
+      setIsSidebarCollapsed(!!userState.preferences.isSidebarCollapsed);
+    }
+  }, [userState?.id, userState?.preferences?.isSidebarCollapsed]);
+
+  const [isUtilityOpen, setIsUtilityOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem('is_utility_open');
+    return saved !== null ? saved === 'true' : true;
+  });
+
+  useEffect(() => {
+    if (userState?.preferences?.isUtilityOpen !== undefined) {
+      setIsUtilityOpen(!!userState.preferences.isUtilityOpen);
+    }
+  }, [userState?.id, userState?.preferences?.isUtilityOpen]);
+  const [autoOpenSettings, setAutoOpenSettings] = useState(() => {
+    return !!(initialUrlParams.openSettings || initialUrlParams.openEmergencyContact);
+  });
+  const [autoOpenEmergencyContact, setAutoOpenEmergencyContact] = useState(() => {
+    return !!initialUrlParams.openEmergencyContact;
+  });
+
+  const handleOpenPersonalSettings = () => {
+    setActiveTab('mypage');
+    setAutoOpenSettings(true);
+  };
+
+  const handleRecordError = useCallback((key: string, message: string) => {
+    setFetchErrors(prev => {
+      if (prev[key] === message) return prev;
+      return { ...prev, [key]: message };
+    });
+  }, []);
+
+  const handleClearError = useCallback((key: string) => {
+    setFetchErrors(prev => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  const openConfirmModalHelper = (opts: {
+    title: string;
+    message: string;
+    type?: 'info' | 'warning' | 'danger';
+    confirmText?: string;
+    cancelText?: string;
+    onConfirm: () => void;
+  }) => {
+    setConfirmModal({
+      isOpen: true,
+      cancelText: 'キャンセル',
+      ...opts,
+    });
+  };
+
+  // Master Data Management Hook
+  const {
+    offices,
+    divisions,
+    positions,
+    approvalFlows,
+    itemMasters,
+    refetchMasters,
+    handleAddOffice,
+    handleUpdateOffice,
+    handleDeleteOffice,
+    handleAddDivision,
+    handleUpdateDivision,
+    handleDeleteDivision,
+    handleAddPosition,
+    handleUpdatePosition,
+    handleDeletePosition,
+    handleAddItemMaster,
+    handleUpdateItemMaster,
+    handleDeleteItemMaster,
+    handleAddApprovalFlow,
+    handleUpdateApprovalFlow,
+    handleDeleteApprovalFlow,
+  } = useMasterManagement({
+    onRecordError: handleRecordError,
+    onClearError: handleClearError,
+    showMasterErrorModal: (title, errorMsg) => {
+      let suggestion = '管理者様は SSMS (SQL Server Management Studio) から `ssms-db-setup.sql` を実行して、データベースのテーブルスキーマ（カラムの追加等）を最新に更新してください。';
+      const lowerMsg = errorMsg.toLowerCase();
+      if (lowerMsg.includes('phone') || lowerMsg.includes('location') || lowerMsg.includes('type') || lowerMsg.includes('code')) {
+        suggestion = 'SQL Server の `dbo.Offices` テーブルに `phone` などの新カラムが不足しているようです。`ssms-db-setup.sql` をお使いのデータベース（SSMS 等）に対して実行し、テーブルスキーマを最新の構成にアップデートしてください。';
+      } else if (lowerMsg.includes('description') || lowerMsg.includes('code')) {
+        suggestion = 'SQL Server の `dbo.Divisions` または `dbo.Positions` テーブルに `description` や `code` などの新カラムが不足しているようです。`ssms-db-setup.sql` をお使いのデータベースに対して実行し、テーブルスキーマをアップデートしてください。';
+      }
+      setConfirmModal({
+        isOpen: true,
+        title: `${title}に失敗しました`,
+        message: `データベースの同期中にエラーが発生したため、変更をロールバックしました。\n\n【詳細なエラー】\n${errorMsg}\n\n【推奨される解決策】\n${suggestion}`,
+        type: 'danger',
+        confirmText: '閉じる',
+      });
+    },
+  });
+
+  const {
+    posts,
+    setPosts,
+    isPostsLoading,
+    postsError,
+    refetchPosts,
+    handlePost,
+    handleToggleLike,
+    handleDeletePost,
+  } = usePostManagement({
+    currentUser: userState,
+    usersList,
+    onRecordError: handleRecordError,
+    onClearError: handleClearError,
+    openConfirmModal: openConfirmModalHelper,
+  });
+
+  const {
+    memos,
+    setMemos,
+    refetchMemos,
+    handleDeleteMemo,
+    handleUpdateMemos,
+    handleAddMemoComment,
+    handleDeleteMemoComment,
+  } = useMemoManagement({
+    currentUser: userState,
+    usersList,
+    onRecordError: handleRecordError,
+    onClearError: handleClearError,
+  });
+
+  const {
+    reports,
+    setReports,
+    refetchReports,
+    handleAddReport,
+    handleUpdateReport,
+    handleReviewReport,
+    handleDeleteReport,
+  } = useReportManagement({
+    currentUser: userState,
+    usersList,
+    onRecordError: handleRecordError,
+    onClearError: handleClearError,
+  });
+
+  const refetchUsers = async () => {
+    if (!getAuthToken()) return usersList;
+    try {
+      const response = await fetchWithRetry(`${API_BASE_URL}/users`, {
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP status ${response.status}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        const processedUsers = data.map((u: any) => mapUserFromApi(u));
+        const sortedUsers = sortUsersByDivision(processedUsers, divisions);
+        setUsersList(sortedUsers);
+        setFetchErrors(prev => { if (!prev.users) return prev; const next = { ...prev }; delete next.users; return next; });
+
+        // Synchronize logged-in user with the latest data from the database
+        const savedUserId = localStorage.getItem('logged_in_user_id');
+        const targetId = savedUserId || userState?.id;
+        if (targetId) {
+          const found = processedUsers.find(u => u.id === String(targetId));
+          if (found) {
+            setUserState(found);
+            localStorage.setItem('logged_in_user_data', JSON.stringify(found));
+
+            // ユーザー設定のフォントサイズ・カラーテーマ・通知ウィンドウサイズがあれば同期
+            if (found.preferences?.fontSize) {
+              applyFontSize(found.preferences.fontSize as any);
+            }
+            if (found.preferences?.colorTheme) {
+              applyColorTheme(found.preferences.colorTheme as any);
+            }
+            if (found.preferences?.notificationWindowSize) {
+              applyNotificationWindowSize(found.preferences.notificationWindowSize as any);
+            }
+          }
+        }
+        return processedUsers;
+      }
+    } catch (err: any) {
+      console.warn('Failed to load users from API:', err);
+      setFetchErrors(prev => ({ ...prev, users: `ユーザー一覧取得エラー: ${err?.message || '接続エラー'}` }));
+    }
+    return usersList;
+  };
+
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+  const [applications, setApplications] = useState<WorkflowApplication[]>([]);
+  const [topics, setTopics] = useState<BoardTopic[]>([]);
+  const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
+  const [safetyEvents, setSafetyEvents] = useState<SafetyConfirmationEvent[]>([]);
+  const [safetyResponses, setSafetyResponses] = useState<SafetyConfirmationResponse[]>([]);
+  const [projectSummary, setProjectSummary] = useState<ProjectMySummary>({
+    myPendingCount: 0,
+    overdueCount: 0,
+    dueSoonCount: 0,
+    tasks: [],
+  });
+  const [isProjectSummaryLoading, setIsProjectSummaryLoading] = useState(false);
+  const projectTasks = projectSummary.tasks;
+  const projectSummaryInFlightRef = useRef<Promise<void> | null>(null);
+  const lastProjectSummaryFetchRef = useRef<{ userId: string; at: number }>({ userId: '', at: 0 });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedTag, setSelectedTag] = useState<string | null>(null);
+
+  const handleViewScheduleFromModal = (targetUser: User) => {
+    setGlobalSelectedUser(null);
+    if (targetUser) {
+      const resolvedUser =
+        usersList.find(
+          u =>
+            (targetUser.id && String(u.id) === String(targetUser.id)) ||
+            (targetUser.name && u.name === targetUser.name)
+        ) || targetUser;
+      const targetOffice = getUserOfficeName(resolvedUser, offices) || resolvedUser.office;
+      const targetDivision = getUserDivisionName(resolvedUser, divisions) || resolvedUser.division;
+      setCalendarParams(prev => ({
+        ...prev,
+        mode: 'team',
+        view: prev.view === 'day' ? 'day' : 'week',
+        office: targetOffice || prev.office,
+        division: targetDivision || prev.division,
+        groupId: undefined,
+        targetUserId: undefined,
+        requestKey: Date.now(),
+      }));
+    }
+    setActiveTab('calendar');
+  };
+
+  const handleNavigateToCalendar = (eventId: string, date?: string, targetUser?: User) => {
+    setTargetEventId(eventId || undefined);
+    let resolvedUser: User | undefined = targetUser;
+    if (!resolvedUser && eventId) {
+      const targetEv = events.find(e => String(e.id) === String(eventId));
+      const firstAtt = targetEv?.attendees?.[0] || targetEv?.createdBy;
+      if (firstAtt) {
+        resolvedUser =
+          usersList.find(
+            u =>
+              (firstAtt.id && String(u.id) === String(firstAtt.id)) ||
+              (firstAtt.name && u.name === firstAtt.name)
+          ) || firstAtt;
+      }
+    } else if (resolvedUser) {
+      resolvedUser =
+        usersList.find(
+          u =>
+            (resolvedUser?.id && String(u.id) === String(resolvedUser.id)) ||
+            (resolvedUser?.name && u.name === resolvedUser.name)
+        ) || resolvedUser;
+    }
+    const fallbackUser = resolvedUser || userState;
+    const targetOffice = getUserOfficeName(fallbackUser, offices) || fallbackUser?.office;
+    const targetDivision = getUserDivisionName(fallbackUser, divisions) || fallbackUser?.division;
+    const datePart = date ? (date.includes('T') ? date.split('T')[0] : date) : undefined;
+    setCalendarParams(prev => ({
+      ...prev,
+      mode: 'team',
+      view: prev.view === 'day' ? 'day' : 'week',
+      office: targetOffice || prev.office,
+      division: targetDivision || prev.division,
+      groupId: undefined,
+      date: datePart || prev.date,
+      targetUserId: undefined,
+      requestKey: Date.now(),
+    }));
+    setActiveTab('calendar');
+  };
+
+  // URLパラメータ等で targetApplicationId が指定されている場合に初期ロード完了時にピンポイントモーダル表示
+  useEffect(() => {
+    if (targetApplicationId && applications.length > 0) {
+      const found = applications.find(a => a.id === targetApplicationId || String(a.id) === String(targetApplicationId));
+      if (found) {
+        setGlobalSelectedApplication(found);
+      }
+    }
+  }, [targetApplicationId, applications]);
+
+  // 通知更新イベントリスナー（既読・未読変更の即時反映）
+  const [notificationSyncTick, setNotificationSyncTick] = useState(0);
+
+  useEffect(() => {
+    const handleSync = () => setNotificationSyncTick((t) => t + 1);
+    window.addEventListener('notifications_updated', handleSync);
+    return () => window.removeEventListener('notifications_updated', handleSync);
+  }, []);
+
+  // 対象画面（タブ）を開いたタイミングで、その機能に関連する未読通知を自動既読化してベルマークのバッジ数を即座に更新
+  // ※ サーバーからの既読データ取得(isUserReadStatusSynced)が完了するまで待機し、過去データの誤既読POST送信とチラつきを防止
+  useEffect(() => {
+    if (!userState?.id || !isAuthenticated || !isUserReadStatusSynced(userState.id)) return;
+
+    if (activeTab === 'memo') {
+      const unreadMemos = memos.filter((m) => isMemoUnread(m, userState));
+      if (unreadMemos.length > 0) {
+        unreadMemos.forEach((m) => markMemoAsRead(userState.id, m.id));
+      }
+    } else if (activeTab === 'board') {
+      const unreadTopics = topics.filter((t) => isTopicUnread(t, userState));
+      if (unreadTopics.length > 0) {
+        unreadTopics.forEach((t) => markTopicAsRead(userState.id, t.id));
+      }
+    } else if (activeTab === 'workflow') {
+      const unreadWorkflows = applications.filter((app) => isWorkflowUnread(app, userState));
+      if (unreadWorkflows.length > 0) {
+        unreadWorkflows.forEach((app) => markWorkflowAsRead(userState.id, app.id));
+      }
+    } else if (activeTab === 'calendar' || activeTab === 'inspection_scheduler') {
+      const unreadEvents = events.filter((e) => isEventUnread(e, userState));
+      if (unreadEvents.length > 0) {
+        unreadEvents.forEach((e) => markEventAsRead(userState.id, e.id));
+      }
+    } else if (activeTab === 'daily_report') {
+      const unreadReports = reports.filter((r) => isReportUnread(r, userState));
+      if (unreadReports.length > 0) {
+        unreadReports.forEach((r) => markReportAsRead(userState.id, r.id));
+      }
+    }
+    // チャットの未読管理は Chat コンポーネント側でアクティブな部屋ごとに個別に既読処理
+  }, [activeTab, userState, isAuthenticated, memos, topics, applications, events, reports, notificationSyncTick]);
+
+  // サイドバー用の未読バッジ集計（既読データ同期完了後に確定表示し、現在開いている自動既読対象タブの1フレーム点滅を防止）
+  const sidebarUnreadCounts = useMemo(() => {
+    if (!userState || !isUserReadStatusSynced(userState.id)) return {};
+    const notifs = getUnreadNotifications({
+      user: userState,
+      memos,
+      applications,
+      topics,
+      events,
+      chatRooms,
+      reports,
+      safetyEvents,
+      safetyResponses,
+      projectTasks,
+    });
+    return {
+      chat: notifs.filter((n) => n.type === 'chat').length,
+      memo: activeTab === 'memo' ? 0 : notifs.filter((n) => n.type === 'memo').length,
+      workflow: activeTab === 'workflow' ? 0 : notifs.filter((n) => n.type === 'workflow').length,
+      board: activeTab === 'board' ? 0 : notifs.filter((n) => n.type === 'board').length,
+      event: (activeTab === 'calendar' || activeTab === 'inspection_scheduler') ? 0 : notifs.filter((n) => n.type === 'event').length,
+      report: activeTab === 'daily_report' ? 0 : notifs.filter((n) => n.type === 'report').length,
+      safety: notifs.filter((n) => n.type === 'safety').length,
+      project: notifs.filter((n) => n.type === 'project').length,
+    };
+  }, [userState, activeTab, memos, applications, topics, events, chatRooms, reports, safetyEvents, safetyResponses, projectTasks, notificationSyncTick]);
+
+  // カレンダー予定の更新処理実行中フラグ（更新処理中のポーリングによる古いデータ上書きを防止）
+  const isUpdatingCalendarEventsRef = useRef(false);
+  // 取得済みカレンダー予定の最古基準日（JSTでデフォルト180日前、過去月へ移動時に自動拡張）
+  const loadedEventsFromDateRef = useRef<string>(
+    (() => {
+      const d = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000 + 9 * 60 * 60 * 1000);
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+    })()
+  );
+  const loadedEventsAllRef = useRef(false);
+
+  const refetchEvents = async (
+    currentUsers = usersList,
+    force = false,
+    options?: { from?: string; all?: boolean }
+  ) => {
+    if (isUpdatingCalendarEventsRef.current && !force) {
+      return;
+    }
+    try {
+      if (options?.all) {
+        loadedEventsAllRef.current = true;
+      } else if (options?.from && options.from < loadedEventsFromDateRef.current) {
+        loadedEventsFromDateRef.current = options.from;
+      }
+
+      const queryParam = loadedEventsAllRef.current
+        ? '?all=true'
+        : `?from=${encodeURIComponent(loadedEventsFromDateRef.current)}`;
+
+      const response = await fetchWithRetry(`${API_BASE_URL}/events${queryParam}`, {
+        headers: { 'Accept': 'application/json' }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP status ${response.status}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        // 高速化：O(1) ユーザーハッシュマップを事前構築し、イベント×参加者の O(E*A*U) ループを排除
+        const userByIdMap = new Map<string, User>();
+        const userByKeyMap = new Map<string, User>();
+        for (const u of currentUsers) {
+          if (u.id) {
+            userByIdMap.set(String(u.id), u);
+            userByKeyMap.set(String(u.id), u);
+          }
+          if (u.loginId) userByKeyMap.set(String(u.loginId), u);
+          if (u.name) userByKeyMap.set(u.name, u);
+        }
+        if (userState?.id) {
+          userByIdMap.set(String(userState.id), userState);
+          userByKeyMap.set(String(userState.id), userState);
+          if (userState.loginId) userByKeyMap.set(String(userState.loginId), userState);
+          if (userState.name) userByKeyMap.set(userState.name, userState);
+        }
+
+        const mapped = data.map((e: any) => {
+          let detailsObj: any = {};
+          if (e.description && typeof e.description === 'string' && e.description.startsWith('{')) {
+            try { detailsObj = JSON.parse(e.description); } catch (_) {}
+          }
+          
+          let rawAttendees = e.attendees || detailsObj.attendees || [];
+          if (typeof rawAttendees === 'string') {
+            try { rawAttendees = JSON.parse(rawAttendees); } catch (_) {}
+          }
+          
+          const mappedAttendees = Array.isArray(rawAttendees)
+            ? rawAttendees.map((att: any) => {
+                if (typeof att === 'object' && att !== null && att.id) return att;
+                const found = userByIdMap.get(String(att)) || userByKeyMap.get(String(att));
+                return found || { id: String(att), name: String(att), avatarUrl: '', office: '', division: '', department: '', role: 'user' };
+              })
+            : [];
+
+          const parsedRecurrence = safeParseRecurrence(e.recurrence || detailsObj.recurrence);
+          const parsedExceptions = safeParseExceptions(e.recurrenceExceptions || detailsObj.recurrenceExceptions);
+
+          const rawCreatedBy = e.createdBy || detailsObj.createdBy || e.created_by || detailsObj.created_by || detailsObj.createdByUser || detailsObj.author || (e as any).user;
+          let mappedCreatedBy: any = undefined;
+          if (rawCreatedBy) {
+            if (typeof rawCreatedBy === 'object' && rawCreatedBy !== null && rawCreatedBy.id) {
+              mappedCreatedBy = rawCreatedBy;
+            } else {
+              const found = userByKeyMap.get(String(rawCreatedBy));
+              mappedCreatedBy = found || { id: String(rawCreatedBy), name: String(rawCreatedBy), avatarUrl: '', office: '', division: '', department: '', role: 'user' };
+            }
+          } else if (e.userId || detailsObj.userId || e.authorId || detailsObj.authorId || (e as any).createdById || detailsObj.createdById) {
+            const cId = e.userId || detailsObj.userId || e.authorId || detailsObj.authorId || (e as any).createdById || detailsObj.createdById;
+            const found = userByIdMap.get(String(cId));
+            if (found) mappedCreatedBy = found;
+          }
+
+          const rawStart = e.startAt || e.start;
+          const rawEnd = e.endAt || e.end || rawStart;
+          const safeStart = rawStart ? ensureJstIsoString(rawStart) : new Date().toISOString();
+          const safeEnd = rawEnd ? ensureJstIsoString(rawEnd) : safeStart;
+
+          return {
+            id: String(e.id),
+            title: e.title || '予定',
+            start: safeStart,
+            end: safeEnd,
+            isAllDay: e.isAllDay === true || e.isAllDay === 1 || e.isAllDay === 'true' || e.isAllDay === '1',
+            isPrivate: Boolean(e.isPrivate === true || e.isPrivate === 1 || e.isPrivate === 'true' || e.isPrivate === '1' || detailsObj.isPrivate === true || detailsObj.isPrivate === 1 || detailsObj.isPrivate === 'true' || detailsObj.isPrivate === '1' || e.isSecret === true || e.isSecret === 1),
+            type: e.category || 'personal',
+            office: e.office || '全社',
+            division: e.division || '全部署',
+            ...detailsObj,
+            location: e.location || detailsObj.location || '',
+            memo: e.memo || detailsObj.memo || '',
+            isGoogleSynced: false,
+            attachments: (e.attachments || e.attachmentsJson) 
+              ? (typeof (e.attachments || e.attachmentsJson) === 'string' && (e.attachments || e.attachmentsJson).startsWith('[') ? JSON.parse(e.attachments || e.attachmentsJson) : (e.attachments || e.attachmentsJson)) 
+              : (detailsObj.attachments || []),
+            attendees: mappedAttendees,
+            createdBy: mappedCreatedBy || detailsObj.createdBy || (e.createdById ? { id: e.createdById, name: '' } : undefined),
+            createdById: mappedCreatedBy?.id || detailsObj.createdById || e.createdById || e.userId || detailsObj.userId || undefined,
+            recurrence: parsedRecurrence,
+            recurrenceParentId: e.recurrenceParentId || detailsObj.recurrenceParentId || undefined,
+            recurrenceOriginalDate: e.recurrenceOriginalDate || detailsObj.recurrenceOriginalDate || undefined,
+            recurrenceExceptions: parsedExceptions,
+            createdAt: e.createdAt || detailsObj.createdAt || e.created_at || undefined,
+            updatedAt: e.updatedAt || detailsObj.updatedAt || e.updated_at || undefined,
+            draftSavedAt: e.draftSavedAt || detailsObj.draftSavedAt || undefined,
+            siteId: e.siteId || detailsObj.siteId || undefined,
+            siteCode: e.siteCode || detailsObj.siteCode || undefined,
+            siteName: e.siteName || detailsObj.siteName || undefined,
+            constructionPhase: e.constructionPhase || detailsObj.constructionPhase || undefined,
+          };
+        });
+        setEvents(mapped);
+        setFetchErrors(prev => { if (!prev.events) return prev; const next = { ...prev }; delete next.events; return next; });
+      }
+    } catch (err: any) {
+      console.warn('Failed to load events from API:', err);
+      setFetchErrors(prev => ({ ...prev, events: `カレンダー予定取得エラー: ${err?.message || '接続エラー'}` }));
+    }
+  };
+
+  const refetchApplications = async (currentUsers = usersList) => {
+    try {
+      const response = await fetchWithRetry(`${API_BASE_URL}/workflows`, {
+        headers: { 'Accept': 'application/json' }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP status ${response.status}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        // 高速化：O(1) ユーザーハッシュマップを事前構築し、申請ごとの find ループを排除
+        const userByIdMap = new Map<string, User>();
+        for (const u of currentUsers) {
+          if (u.id) userByIdMap.set(String(u.id), u);
+        }
+        if (userState?.id) {
+          userByIdMap.set(String(userState.id), userState);
+        }
+
+        const mapped = data.map((app: any) => {
+          let detailsObj: any = {};
+          if (app.details && typeof app.details === 'string' && app.details.startsWith('{')) {
+            try { detailsObj = JSON.parse(app.details); } catch (_) {}
+          }
+          const rawAppUserId = app.applicantId || detailsObj.applicantId || detailsObj.applicant?.id;
+          const applicantUser = (rawAppUserId ? userByIdMap.get(String(rawAppUserId)) : undefined) || app.applicant || detailsObj.applicant || userState;
+          const rawApproverId = app.approverId || detailsObj.approverId || detailsObj.approver?.id;
+          let approverUserObj = (rawApproverId ? userByIdMap.get(String(rawApproverId)) : undefined) || app.approver || detailsObj.approver;
+          
+          let rawStatus = app.status || detailsObj.status || 'pending';
+          if (rawStatus.includes('approved') || rawStatus.includes('承認済')) rawStatus = 'approved';
+          else if (rawStatus.includes('rejected') || rawStatus.includes('却下')) rawStatus = 'rejected';
+          else if (rawStatus.includes('draft') || rawStatus.includes('下書き')) rawStatus = 'draft';
+          else if (['pending', 'approved', 'rejected', 'draft'].includes(rawStatus)) { /* keep */ }
+          else rawStatus = 'pending';
+
+          const rawOfficeIdEarly = app.officeId || detailsObj.officeId || undefined;
+          const rawLocationEarly = app.location || detailsObj.location || undefined;
+
+          // 多段階承認ステップがあり、申請中の場合は、現在のステップの承認者に解決・同期する
+          if (detailsObj.stepsConfig && detailsObj.stepsConfig.length > 0 && rawStatus === 'pending') {
+            const curStepIdx = (detailsObj.currentStepIndex || 1) - 1;
+            const curStep = detailsObj.stepsConfig[curStepIdx];
+            if (curStep) {
+              const resolved = resolveApproverForStep(applicantUser, curStep, currentUsers, {
+                offices,
+                applicationOfficeId: rawOfficeIdEarly,
+                applicationLocation: rawLocationEarly,
+              });
+              if (resolved) {
+                approverUserObj = resolved;
+              }
+            }
+          }
+
+          let rawType = app.category || app.type || detailsObj.type || 'other';
+          if (['business_trip', 'inventory_issue', 'purchase_order', 'purchase_request', 'gold_silver_daily_report', 'other'].includes(rawType)) {
+            /* keep */
+          } else if (rawType === 'general') {
+            rawType = 'other';
+          } else {
+            rawType = 'other';
+          }
+
+          const rawPo = app.purchaseOrderNumber || detailsObj.purchaseOrderNumber || undefined;
+          const rawConstDate = app.constructionDate || detailsObj.constructionDate || undefined;
+          const rawLinkedInv = app.linkedInventoryIssueId || detailsObj.linkedInventoryIssueId || undefined;
+          const rawDelegateUserId = app.purchaserDelegateUserId || detailsObj.purchaserDelegateUserId || undefined;
+          const rawDelegateUser = rawDelegateUserId ? userByIdMap.get(String(rawDelegateUserId)) : (detailsObj.purchaserDelegateUser || undefined);
+
+          const rawOfficeId = app.officeId || detailsObj.officeId || undefined;
+          const rawLocation = app.location || detailsObj.location || undefined;
+          const rawPrevBalance = app.previousBalance !== undefined ? app.previousBalance : detailsObj.previousBalance;
+          const rawCurrBalance = app.currentBalance !== undefined ? app.currentBalance : detailsObj.currentBalance;
+
+          return {
+            id: String(app.id),
+            title: app.title || '無題の申請',
+            applicant: applicantUser,
+            approver: approverUserObj,
+            createdAt: app.createdAt || new Date().toISOString(),
+            ...detailsObj,
+            officeId: rawOfficeId,
+            location: rawLocation,
+            previousBalance: rawPrevBalance !== undefined ? Number(rawPrevBalance) : undefined,
+            currentBalance: rawCurrBalance !== undefined ? Number(rawCurrBalance) : undefined,
+            purchaseOrderNumber: rawPo,
+            constructionDate: rawConstDate,
+            linkedInventoryIssueId: rawLinkedInv,
+            purchaserDelegateUserId: rawDelegateUserId,
+            purchaserDelegateUser: rawDelegateUser,
+            status: rawStatus,
+            category: rawType,
+            type: rawType,
+          };
+        });
+        // Local deleted filter fallback to prevent deleted workflows from reappearing
+        let deletedIds: string[] = [];
+        try {
+          const stored = localStorage.getItem('deleted_workflow_ids');
+          if (stored) {
+            deletedIds = JSON.parse(stored);
+          }
+        } catch (_) {}
+
+        setApplications(mapped.filter((app: any) => !deletedIds.includes(app.id)));
+        setFetchErrors(prev => { if (!prev.workflows) return prev; const next = { ...prev }; delete next.workflows; return next; });
+      }
+    } catch (err: any) {
+      console.warn('Failed to load workflows from API:', err);
+      setFetchErrors(prev => ({ ...prev, workflows: `ワークフロー取得エラー: ${err?.message || '接続エラー'}` }));
+    }
+  };
+
+  const refetchSafetyEvents = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/safety-events`, {
+        headers: { 'Accept': 'application/json' }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data)) {
+          const activeEvents = data.filter((e: any) => e.status === 'active');
+          let allResp: any[] = [];
+          if (activeEvents.length > 0) {
+            try {
+              const respPromises = activeEvents.map(async (ev: any) => {
+                try {
+                  const respRes = await fetch(`${API_BASE_URL}/safety-events/${ev.id}/responses`, {
+                    headers: { 'Accept': 'application/json' }
+                  });
+                  if (respRes.ok) {
+                    const respData = await respRes.json();
+                    return Array.isArray(respData) ? respData : [];
+                  }
+                } catch (_) {}
+                return [];
+              });
+              const results = await Promise.allSettled(respPromises);
+              allResp = results
+                .filter((r): r is PromiseFulfilledResult<any[]> => r.status === 'fulfilled')
+                .flatMap(r => r.value)
+                .map((r: any) => ({
+                  id: String(r.id || `resp_${r.userId}`),
+                  eventId: String(r.eventId || r.event_id || ''),
+                  userId: String(r.userId || r.user_id || ''),
+                  userName: r.userName || r.user_name || '',
+                  office: r.office || r.userOffice || '',
+                  division: r.division || r.userDivision || '',
+                  safetyStatus: (r.safetyStatus || r.status || 'safe'),
+                  status: (r.status || r.safetyStatus || 'safe'),
+                  familyStatus: r.familyStatus || 'all_safe',
+                  houseStatus: r.houseStatus || 'no_damage',
+                  workAvailability: (r.workAvailability || r.canWork || 'available'),
+                  canWork: (r.canWork || r.workAvailability || 'available'),
+                  locationStatus: r.locationStatus || r.currentLocation || r.location || '自宅',
+                  currentLocation: r.currentLocation || r.locationStatus || r.location || '自宅',
+                  message: r.message || r.comment || '',
+                  comment: r.comment || r.message || '',
+                  respondedAt: r.respondedAt || new Date().toISOString()
+                }));
+            } catch (err) {
+              console.warn('Failed to fetch safety responses:', err);
+            }
+          }
+          setSafetyEvents(data);
+          setSafetyResponses(allResp);
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to fetch safety events:', err);
+    }
+  };
+
+  const refetchProjectTasks = async (
+    targetUser: User | null = userState,
+    options?: { force?: boolean }
+  ) => {
+    const u = targetUser || userState;
+    if (!u?.id) return;
+    if (!isOptionalMenuVisible(u, 'projects')) {
+      setProjectSummary({
+        myPendingCount: 0,
+        overdueCount: 0,
+        dueSoonCount: 0,
+        tasks: [],
+      });
+      setIsProjectSummaryLoading(false);
+      return;
+    }
+    const uid = String(u.id);
+    const now = Date.now();
+    const isSameUser = lastProjectSummaryFetchRef.current.userId === uid;
+
+    // 同一ユーザーへの同時重複呼び出し・直近3秒以内のバースト再取得を抑止（force時は即時再取得）
+    if (!options?.force && isSameUser) {
+      if (projectSummaryInFlightRef.current) {
+        return projectSummaryInFlightRef.current;
+      }
+      if (lastProjectSummaryFetchRef.current.at > 0 && now - lastProjectSummaryFetchRef.current.at < 3000) {
+        return;
+      }
+    }
+
+    // 初回実行直後の同時発火も1本に束ねるため、await 前に userId を確定
+    lastProjectSummaryFetchRef.current = {
+      userId: uid,
+      at: isSameUser ? lastProjectSummaryFetchRef.current.at : 0,
+    };
+
+    const runFetch = (async () => {
+      if (!isSameUser || projectSummary.tasks.length === 0) {
+        setIsProjectSummaryLoading(true);
+      }
+      try {
+        const params = new URLSearchParams({
+          userId: uid,
+          userName: u.name || '',
+          officeId: u.officeId || '',
+          office: u.office || '',
+          divisionId: u.divisionId || '',
+          division: u.division || '',
+          isAdmin: String(Boolean(u.isAdmin || u.role === 'admin')),
+        });
+        const res = await fetch(`${API_BASE_URL}/projects/my-summary?${params.toString()}`, {
+          headers: { 'Accept': 'application/json' },
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        lastProjectSummaryFetchRef.current = { userId: uid, at: Date.now() };
+        setProjectSummary({
+          myPendingCount: Number(data?.myPendingCount || 0),
+          overdueCount: Number(data?.overdueCount || 0),
+          dueSoonCount: Number(data?.dueSoonCount || 0),
+          tasks: Array.isArray(data?.tasks) ? data.tasks : [],
+        });
+      } catch (err) {
+        console.warn('Failed to fetch project tasks for notifications:', err);
+      } finally {
+        setIsProjectSummaryLoading(false);
+        projectSummaryInFlightRef.current = null;
+      }
+    })();
+
+    projectSummaryInFlightRef.current = runFetch;
+    return runFetch;
+  };
+
+  // 表示中のタブが個人設定・管理者設定で非表示に切り替えられた場合はマイページへ自動復帰
+  useEffect(() => {
+    if (isToggleableMenuKey(activeTab) && !isOptionalMenuVisible(userState, activeTab)) {
+      setActiveTab('mypage');
+    }
+  }, [activeTab, userState?.preferences?.menuVisibility]);
+
+  // プロジェクトメニューをOFF→ONへ再表示した際にマイタスクサマリーを再取得
+  const prevProjectsVisibleRef = useRef<boolean>(isOptionalMenuVisible(userState, 'projects'));
+  useEffect(() => {
+    const isNowVisible = isOptionalMenuVisible(userState, 'projects');
+    if (isNowVisible && !prevProjectsVisibleRef.current && isAuthenticated && userState?.id) {
+      refetchProjectTasks(userState, { force: true });
+    } else if (!isNowVisible && prevProjectsVisibleRef.current) {
+      setProjectSummary({
+        myPendingCount: 0,
+        overdueCount: 0,
+        dueSoonCount: 0,
+        tasks: [],
+      });
+    }
+    prevProjectsVisibleRef.current = isNowVisible;
+  }, [isAuthenticated, userState?.id, userState?.preferences?.menuVisibility?.projects]);
+
+  const refetchTopics = async (currentUsers = usersList, options?: { summary?: boolean }) => {
+    try {
+      const endpoint = options?.summary ? `${API_BASE_URL}/bulletins/summary?limit=30` : `${API_BASE_URL}/bulletins`;
+      let response = await fetchWithRetry(endpoint, {
+        headers: { 'Accept': 'application/json' }
+      });
+      // サーバー未更新時の 404 フォールバック（通常一覧への安全な切り替え）
+      if (!response.ok && options?.summary && response.status === 404) {
+        response = await fetchWithRetry(`${API_BASE_URL}/bulletins`, {
+          headers: { 'Accept': 'application/json' }
+        });
+      }
+      if (!response.ok) {
+        throw new Error(`HTTP status ${response.status}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        // 高速化：O(1) ハッシュマップ作成で数千回の find ループを排除
+        const userMap = new Map<string, User>();
+        for (const u of currentUsers) {
+          if (u.id) userMap.set(String(u.id), u);
+          if (u.loginId) userMap.set(String(u.loginId), u);
+          if (u.name) userMap.set(u.name, u);
+        }
+        if (userState?.id) {
+          userMap.set(String(userState.id), userState);
+          if (userState.loginId) userMap.set(String(userState.loginId), userState);
+          if (userState.name) userMap.set(userState.name, userState);
+        }
+
+        const mapped = data.map((t: any) => {
+          let detailsObj: any = {};
+          if (t.content && typeof t.content === 'string' && t.content.startsWith('{')) {
+            try { detailsObj = JSON.parse(t.content); } catch (_) {}
+          }
+          const authorUser = (t.authorId ? userMap.get(String(t.authorId)) : undefined) || t.author || userState;
+          
+          // APIから取得したコメントをそのまま使用
+          const commentsList = Array.isArray(t.comments) ? t.comments : [];
+
+          // APIから取得した閲覧者をそのまま使用
+          let rawViewers: any[] = [];
+          if (Array.isArray(t.viewers)) {
+            rawViewers = t.viewers;
+          } else if (typeof t.viewers === 'string' && t.viewers.startsWith('[')) {
+            try { rawViewers = JSON.parse(t.viewers); } catch (_) {}
+          } else if (detailsObj.viewers && Array.isArray(detailsObj.viewers)) {
+            rawViewers = detailsObj.viewers;
+          }
+
+          const parsedViewers = rawViewers.map((v: any) => {
+            if (!v) return null;
+            const uId = typeof v.user === 'string' ? v.user : (v.userId || v.user_id || v.id || v.user?.id || v.user?.userId);
+            const uName = v.user?.name || v.name || (typeof v.user === 'string' ? v.user : undefined);
+            const uLoginId = v.user?.loginId || v.loginId;
+
+            const matchedUser = (uId ? userMap.get(String(uId)) : undefined) ||
+                                (uLoginId ? userMap.get(String(uLoginId)) : undefined) ||
+                                (uName ? userMap.get(uName) : undefined);
+
+            let resolvedUser = matchedUser;
+            if (!resolvedUser) {
+              if (typeof v.user === 'object' && v.user) {
+                resolvedUser = v.user;
+              } else if (v.name || v.id) {
+                resolvedUser = v;
+              }
+            } else if (typeof v.user === 'object' && v.user) {
+              resolvedUser = { ...v.user, ...matchedUser };
+            }
+
+            if (!resolvedUser) return null;
+            return {
+              id: v.id || uId,
+              user: resolvedUser,
+              viewedAt: v.viewedAt || v.viewed_at || new Date().toISOString()
+            };
+          }).filter(Boolean);
+
+          let parsedAtts = [];
+          if (Array.isArray(t.attachments)) {
+            parsedAtts = t.attachments;
+          } else if (typeof t.attachments === 'string') {
+            try {
+              const p = JSON.parse(t.attachments);
+              if (Array.isArray(p)) parsedAtts = p;
+              else if (p) parsedAtts = [p];
+            } catch (_) {}
+          } else if (detailsObj.attachments && Array.isArray(detailsObj.attachments)) {
+            parsedAtts = detailsObj.attachments;
+          }
+
+          const rawContentText =
+            (typeof detailsObj.content === 'string' && detailsObj.content) ||
+            (typeof detailsObj.text === 'string' && detailsObj.text) ||
+            (typeof detailsObj.body === 'string' && detailsObj.body) ||
+            (typeof t.content === 'string' ? t.content : '');
+
+          let parsedTargetUserIds: string[] = [];
+          if (Array.isArray(t.targetUserIds)) {
+            parsedTargetUserIds = t.targetUserIds.map(String).filter(Boolean);
+          } else if (typeof t.targetUserIds === 'string' && t.targetUserIds.trim()) {
+            try {
+              const p = JSON.parse(t.targetUserIds);
+              if (Array.isArray(p)) {
+                parsedTargetUserIds = p.map(String).filter(Boolean);
+              }
+            } catch (_) {
+              parsedTargetUserIds = t.targetUserIds.split(',').map((s: string) => s.trim()).filter(Boolean);
+            }
+          } else if (Array.isArray(detailsObj.targetUserIds)) {
+            parsedTargetUserIds = detailsObj.targetUserIds.map(String).filter(Boolean);
+          }
+
+          return {
+            id: String(t.id),
+            category: t.category || 'general',
+            title: t.title,
+            author: authorUser,
+            createdAt: t.createdAt,
+            views: t.views || 0,
+            likes: t.likes || 0,
+            officeId: t.officeId || undefined,
+            office: t.office || '全社',
+            divisionId: t.divisionId || undefined,
+            division: t.division || '全部署',
+            scope: t.scope || '全社',
+            isStrictScope: t.isStrictScope === true || t.isStrictScope === 1,
+            targetUserIds: parsedTargetUserIds,
+            targetGroupName: t.targetGroupName || detailsObj.targetGroupName || '',
+            tags: Array.isArray(t.tags) ? t.tags : (typeof t.tags === 'string' ? t.tags.split(',').map((s: string) => s.trim()).filter(Boolean) : []),
+            isPinned: t.isPinned === true || t.isPinned === 1,
+            pinnedUntil: t.pinnedUntil || detailsObj.pinnedUntil || null,
+            pinnedDuration: t.pinnedDuration || detailsObj.pinnedDuration || undefined,
+            hasPeriod: t.hasPeriod === true || t.hasPeriod === 1,
+            startDate: t.startDate || '',
+            endDate: t.endDate || '',
+            comments: commentsList,
+            viewers: parsedViewers,
+            commentsCount: commentsList.length || t.commentsCount || 0,
+            poll: (typeof t.poll === 'string' && t.poll.startsWith('{'))
+              ? (() => { try { return JSON.parse(t.poll); } catch (_) { return null; } })()
+              : (t.poll || detailsObj.poll || null),
+            ...detailsObj,
+            content: rawContentText,
+            attachments: parsedAtts
+          };
+        });
+
+        // 差分比較 (Diff Checking) ＆ サマリー・バックグラウンド取得時のコンテンツ・選択肢データ保護マージ
+        setTopics(prevTopics => {
+          const prevMap = new Map(prevTopics.map(p => [p.id, p]));
+          const mergedList = mapped.map(item => {
+            const existing = prevMap.get(item.id);
+            if (!existing) return item;
+
+            // アンケート選択肢の保護: 既存にoptionsがあり、新しい側にoptionsが空の場合は既存を復元
+            let safePoll = item.poll;
+            if (existing.poll && Array.isArray(existing.poll.options) && existing.poll.options.length > 0) {
+              if (!item.poll || !Array.isArray(item.poll.options) || item.poll.options.length === 0) {
+                safePoll = {
+                  ...existing.poll,
+                  ...(item.poll || {}),
+                  options: existing.poll.options,
+                  votes: (item.poll && Array.isArray(item.poll.votes) && item.poll.votes.length > 0)
+                    ? item.poll.votes
+                    : (existing.poll.votes || [])
+                };
+              }
+            }
+
+            // content（本文）の保護: 新しい方のcontentが空で既存にcontentがある場合は保持
+            const safeContent = item.content || existing.content || '';
+
+            // commentsの保護: 新しい方のcommentsが空で既存にcommentsがある場合は保持
+            const safeComments = (item.comments && item.comments.length > 0) ? item.comments : (existing.comments || []);
+
+            // viewersの保護: 新しい方のviewersが空で既存にviewersがある場合は保持
+            const safeViewers = (item.viewers && item.viewers.length > 0) ? item.viewers : (existing.viewers || []);
+
+            return {
+              ...item,
+              content: safeContent,
+              poll: safePoll,
+              comments: safeComments,
+              viewers: safeViewers,
+              commentsCount: Math.max(item.commentsCount || 0, safeComments.length, existing.commentsCount || 0)
+            };
+          });
+
+          // 差分比較で不要なState更新（全画面・カードの再レンダリング・チラつき）を抑制
+          if (prevTopics.length !== mergedList.length) return mergedList;
+
+          let isChanged = false;
+          for (let i = 0; i < mergedList.length; i++) {
+            const m = mergedList[i];
+            const p = prevTopics[i];
+            if (
+              !p ||
+              p.id !== m.id ||
+              p.title !== m.title ||
+              p.content !== m.content ||
+              p.office !== m.office ||
+              p.division !== m.division ||
+              p.scope !== m.scope ||
+              !!p.isStrictScope !== !!m.isStrictScope ||
+              (p.targetGroupName || '') !== (m.targetGroupName || '') ||
+              (p.targetUserIds || []).join(',') !== (m.targetUserIds || []).join(',') ||
+              p.isPinned !== m.isPinned ||
+              p.views !== m.views ||
+              p.likes !== m.likes ||
+              p.commentsCount !== m.commentsCount
+            ) {
+              isChanged = true;
+              break;
+            }
+            // アンケート回答数の変化チェック
+            const pVotesCount = p.poll?.votes?.length || 0;
+            const mVotesCount = m.poll?.votes?.length || 0;
+            if (pVotesCount !== mVotesCount) {
+              isChanged = true;
+              break;
+            }
+            // 閲覧人数の変化チェック
+            const pViewersCount = p.viewers?.length || 0;
+            const mViewersCount = m.viewers?.length || 0;
+            if (pViewersCount !== mViewersCount) {
+              isChanged = true;
+              break;
+            }
+          }
+
+          return isChanged ? mergedList : prevTopics;
+        });
+
+        setFetchErrors(prev => { if (!prev.bulletins) return prev; const next = { ...prev }; delete next.bulletins; return next; });
+      }
+    } catch (err: any) {
+      console.warn('Failed to load bulletins from API:', err);
+      setFetchErrors(prev => ({ ...prev, bulletins: `掲示板取得エラー: ${err?.message || '接続エラー'}` }));
+    }
+  };
+
+  const refetchChatRooms = async (currentUsers = usersList, isBackground = false) => {
+    if (isChatRefetchingRef.current) return;
+    isChatRefetchingRef.current = true;
+
+    try {
+      const viewerId = userState?.id || (() => {
+        try {
+          return JSON.parse(localStorage.getItem('teranago_CurrentUser') || '{}')?.id || '';
+        } catch {
+          return '';
+        }
+      })();
+      const chatsUrl = viewerId
+        ? `${API_BASE_URL}/chats?userId=${encodeURIComponent(String(viewerId))}`
+        : `${API_BASE_URL}/chats`;
+      const response = await fetchWithRetry(chatsUrl, {
+        headers: { 'Accept': 'application/json' }
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP status ${response.status}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        let deletedIds: string[] = [];
+        try {
+          const stored = localStorage.getItem('deleted_chat_room_ids');
+          if (stored) deletedIds = JSON.parse(stored);
+        } catch (_) {}
+
+        // O(1) ユーザー高速照合用 Map の構築（ネストループ内の .find() による O(R*M*V*U) 計算を排除）
+        const userByIdMap = new Map<string, User>();
+        const userByNameMap = new Map<string, User>();
+        if (userState) {
+          if (userState.id) userByIdMap.set(String(userState.id), userState);
+          if (userState.loginId) userByIdMap.set(String(userState.loginId), userState);
+          if (userState.name) userByNameMap.set(userState.name, userState);
+        }
+        for (const u of currentUsers) {
+          if (!u) continue;
+          if (u.id) userByIdMap.set(String(u.id), u);
+          if (u.loginId) userByIdMap.set(String(u.loginId), u);
+          if (u.name && !userByNameMap.has(u.name)) userByNameMap.set(u.name, u);
+        }
+
+        const mapped = data
+          .filter((room: any) => !deletedIds.includes(String(room.id)))
+          .map((room: any) => {
+            // 参加者リストの構築
+            let resolvedParticipants: User[] = [];
+            if (Array.isArray(room.participants) && room.participants.length > 0) {
+              resolvedParticipants = room.participants;
+            }
+
+            // 安全なデフォルトフォールバック
+            if (resolvedParticipants.length === 0) {
+              if (room.type === 'dm') {
+                resolvedParticipants = currentUsers.slice(0, 3);
+              } else {
+                // 社内SNSのグループチャットは、デフォルトで社員（ユーザー）全員を参加者にする
+                resolvedParticipants = currentUsers;
+              }
+            }
+
+            const rawMessages = Array.isArray(room.messages) ? room.messages : [];
+            const resolvedMessages = rawMessages.map((msg: any) => {
+              if (!msg) return msg;
+              // 送信者(sender)のユーザー情報補正 (O(1) Map 検索)
+              let resolvedSender = msg.sender;
+              if (resolvedSender) {
+                const sId = String(resolvedSender.id ?? '');
+                const sName = resolvedSender.name;
+                const matchedSender =
+                  (sId ? userByIdMap.get(sId) : undefined) ||
+                  (sName && sName !== 'ユーザー情報取得中...' ? userByNameMap.get(sName) : undefined);
+
+                if (matchedSender) {
+                  resolvedSender = { ...resolvedSender, ...matchedSender };
+                } else if (resolvedSender.name === 'ユーザー情報取得中...') {
+                  resolvedSender = { ...resolvedSender, name: 'メンバー' };
+                }
+              }
+
+              // 既読者(viewers)のユーザー情報補正 (O(1) Map 検索)
+              let resolvedViewers = msg.viewers;
+              if (Array.isArray(msg.viewers)) {
+                resolvedViewers = msg.viewers.map((v: any) => {
+                  if (!v) return null;
+                  const vUserObj = typeof v.user === 'object' && v.user ? v.user : {};
+                  const vUserId = String(vUserObj.id ?? v.user ?? v.userId ?? v.user_id ?? v.id ?? '');
+                  const vUserName = vUserObj.name || v.name;
+                  const vLoginId = vUserObj.loginId || v.loginId;
+
+                  const matched =
+                    (vUserId ? userByIdMap.get(vUserId) : undefined) ||
+                    (vLoginId ? userByIdMap.get(String(vLoginId)) : undefined) ||
+                    (vUserName && vUserName !== 'ユーザー情報取得中...' ? userByNameMap.get(vUserName) : undefined);
+
+                  let resolvedUser = matched ? { ...vUserObj, ...matched } : vUserObj;
+                  if (!resolvedUser.name || resolvedUser.name === 'ユーザー情報取得中...') {
+                    resolvedUser = { ...resolvedUser, name: matched?.name || 'メンバー' };
+                  }
+
+                  return {
+                    ...v,
+                    id: v.id || vUserId,
+                    user: resolvedUser,
+                    viewedAt: v.viewedAt || v.viewed_at || new Date().toISOString()
+                  };
+                }).filter(Boolean);
+              }
+
+              return {
+                ...msg,
+                _persisted: true, // サーバーDBから取得された確定済みメッセージ
+                sender: resolvedSender,
+                viewers: resolvedViewers
+              };
+            });
+
+            return {
+              ...room,
+              id: String(room.id),
+              participants: resolvedParticipants,
+              messages: resolvedMessages,
+              totalMessagesCount: typeof room.totalMessagesCount === 'number' ? room.totalMessagesCount : resolvedMessages.length,
+              hasMoreMessages: Boolean(room.hasMoreMessages)
+            };
+          })
+          .filter((room: any) => {
+            if (!userState?.id) return true;
+            return room.participants.some((p: any) => String(p.id) === String(userState.id));
+          });
+
+        // サーバーからの取得結果（mapped）に対し、以下を保持マージする:
+        // 1. 上スクロールで既に読み込んだ古い履歴メッセージ（oldestServerTime より前の確定メッセージ）
+        // 2. まだサーバーDBに反映されていないローカルの未確定仮メッセージ（m_, stamp_, img_, album_等）
+        setChatRooms(prevRooms => {
+          const prevRoomMap = new Map(prevRooms.map(pr => [String(pr.id), pr]));
+
+          const mergedMapped = mapped.map(serverRoom => {
+            const prevRoom = prevRoomMap.get(String(serverRoom.id));
+            if (!prevRoom) return serverRoom;
+
+            const prevMsgByIdMap = new Map(
+              (prevRoom.messages || []).filter(Boolean).map((pm: any) => [String(pm.id), pm])
+            );
+
+            const serverMsgs = (serverRoom.messages || []).map((sm: any) => {
+              if (!sm) return sm;
+              const prevMsg = prevMsgByIdMap.get(String(sm.id));
+              if (!sm.quiz && prevMsg?.quiz) {
+                return { ...sm, quiz: prevMsg.quiz };
+              }
+              return sm;
+            });
+            const serverMsgIdSet = new Set(serverMsgs.map((sm: any) => String(sm.id)));
+            const oldestServerTime = serverMsgs.length > 0
+              ? new Date(serverMsgs[0].createdAt || 0).getTime()
+              : Infinity;
+
+            // 1. 既にページネーションで遡って取得済みの過去履歴メッセージを保持
+            const olderPersistedMsgs = (prevRoom.messages || []).filter((pm: any) => {
+              if (!pm || !pm.id || serverMsgIdSet.has(String(pm.id))) return false;
+              const isTempId =
+                typeof pm.id === 'string' &&
+                !pm._persisted &&
+                (pm.id.startsWith('m_') || pm.id.startsWith('stamp_') || pm.id.startsWith('img_') || pm.id.startsWith('album_') || pm.id.startsWith('c_'));
+              if (isTempId) return false;
+              const pmTime = new Date(pm.createdAt || 0).getTime();
+              return pmTime < oldestServerTime;
+            });
+
+            // 2. ローカルにのみ存在する仮メッセージ（送信中・未確定データ）を抽出
+            const localTempMsgs = (prevRoom.messages || []).filter((pm: any) => {
+              if (!pm || !pm.id) return false;
+              const isTempId =
+                typeof pm.id === 'string' &&
+                !pm._persisted &&
+                (pm.id.startsWith('m_') || pm.id.startsWith('stamp_') || pm.id.startsWith('img_') || pm.id.startsWith('album_') || pm.id.startsWith('c_'));
+              if (!isTempId) return false;
+
+              const existsOnServer = serverMsgs.some((sm: any) => {
+                if (String(sm.id) === String(pm.id)) return true;
+                if (
+                  String(sm.sender?.id ?? '') === String(pm.sender?.id ?? '') &&
+                  sm.content === pm.content &&
+                  Math.abs(new Date(sm.createdAt).getTime() - new Date(pm.createdAt).getTime()) < 15000
+                ) {
+                  return true;
+                }
+                return false;
+              });
+
+              return !existsOnServer;
+            });
+
+            const combinedMessages = [
+              ...olderPersistedMsgs,
+              ...serverMsgs,
+              ...localTempMsgs
+            ];
+            const persistedCount = olderPersistedMsgs.length + serverMsgs.length;
+            const totalCount = Math.max(serverRoom.totalMessagesCount || 0, persistedCount);
+            const hasMore = olderPersistedMsgs.length > 0
+              ? (prevRoom.hasMoreMessages ?? (totalCount > persistedCount))
+              : Boolean(serverRoom.hasMoreMessages || totalCount > persistedCount);
+
+            return {
+              ...serverRoom,
+              messages: combinedMessages,
+              totalMessagesCount: totalCount,
+              hasMoreMessages: hasMore
+            };
+          });
+
+          // 差分比較を行い、データに変更がない場合は不要なState更新（全画面再レンダリング）を抑制
+          if (prevRooms.length !== mergedMapped.length) return mergedMapped;
+          let isChanged = false;
+          for (let i = 0; i < mergedMapped.length; i++) {
+            const m = mergedMapped[i];
+            const p = prevRooms[i];
+            if (
+              !p ||
+              p.id !== m.id ||
+              p.name !== m.name ||
+              p.lastUpdated !== m.lastUpdated ||
+              p.hasMoreMessages !== m.hasMoreMessages ||
+              p.totalMessagesCount !== m.totalMessagesCount
+            ) {
+              isChanged = true;
+              break;
+            }
+            const pMsgs = p.messages || [];
+            const mMsgs = m.messages || [];
+            if (pMsgs.length !== mMsgs.length) {
+              isChanged = true;
+              break;
+            }
+            if (mMsgs.length > 0) {
+              const pLast = pMsgs[pMsgs.length - 1];
+              const mLast = mMsgs[mMsgs.length - 1];
+              if (pLast.id !== mLast.id || pLast.content !== mLast.content) {
+                isChanged = true;
+                break;
+              }
+              // 既読状態の件数差分チェック
+              const pViewersCount = pMsgs.reduce((sum: number, msg: any) => sum + (msg.viewers?.length || 0), 0);
+              const mViewersCount = mMsgs.reduce((sum: number, msg: any) => sum + (msg.viewers?.length || 0), 0);
+              if (pViewersCount !== mViewersCount) {
+                isChanged = true;
+                break;
+              }
+            }
+          }
+          return isChanged ? mergedMapped : prevRooms;
+        });
+
+        // 成功時はエラー状態とカウンターをリセット
+        chatConsecutiveErrorsRef.current = 0;
+        setFetchErrors(prev => {
+          if (!prev.chats) return prev;
+          const next = { ...prev };
+          delete next.chats;
+          return next;
+        });
+      }
+    } catch (err: any) {
+      chatConsecutiveErrorsRef.current += 1;
+      if (!isBackground) {
+        console.warn('Failed to load chat rooms from API:', err);
+        setFetchErrors(prev => ({ ...prev, chats: `チャット取得エラー: ${err?.message || '接続エラー'}` }));
+      } else {
+        // バックグラウンド同期時（APIサーバー再起動等）は画面全体を覆う赤色エラーバナーを出さず抑制
+        if (chatConsecutiveErrorsRef.current === 1 || chatConsecutiveErrorsRef.current % 10 === 0) {
+          console.warn(`[Chat Polling] バックグラウンド接続待機中 (試行回数: ${chatConsecutiveErrorsRef.current}):`, err?.message);
+        }
+      }
+    } finally {
+      isChatRefetchingRef.current = false;
+    }
+  };
+
+
+
+  const refetchSchedulePolls = useCallback(async () => {
+    if (!userState?.id) return;
+    try {
+      const res = await fetch(`${API_BASE_URL}/schedule-polls?userId=${userState.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setSchedulePolls(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.warn('[App] Failed to load schedule polls:', err);
+    }
+  }, [userState?.id]);
+
+  const pendingSchedulePolls = useMemo(() => {
+    if (!userState?.id || !schedulePolls.length) return [];
+    return schedulePolls.filter(poll => {
+      if (poll.status !== 'open') return false;
+      if (poll.organizerId === userState.id) return false;
+      if (!poll.targetUserIds || !poll.targetUserIds.includes(userState.id)) return false;
+      if (poll.answeredUserIds && poll.answeredUserIds.includes(userState.id)) return false;
+      if (poll.hasAnswered) return false;
+      if (poll.deadlineAt) {
+        const deadline = new Date(poll.deadlineAt);
+        if (deadline.getTime() < Date.now()) return false;
+      }
+      return true;
+    });
+  }, [userState?.id, schedulePolls]);
+
+  // 確定前（status === 'open'）で自身が主催または参加対象の日程調整一覧
+  const openSchedulePolls = useMemo(() => {
+    if (!userState?.id || !schedulePolls.length) return [];
+    return schedulePolls.filter(poll => {
+      if (poll.status !== 'open') return false;
+      const myId = String(userState.id);
+      const isOrganizer = String(poll.organizerId) === myId;
+      const isTarget = Array.isArray(poll.targetUserIds) && poll.targetUserIds.map(String).includes(myId);
+      return isOrganizer || isTarget;
+    });
+  }, [userState?.id, schedulePolls]);
+
+  // アクション（参加者の未回答、または主催者で全員回答完了かつ未確定）が必要な件数
+  const actionablePollCount = useMemo(() => {
+    if (!userState?.id || !openSchedulePolls.length) return 0;
+    return openSchedulePolls.filter(poll => {
+      const myId = String(userState.id);
+      const isOrganizer = String(poll.organizerId) === myId;
+      if (isOrganizer) {
+        const targetCount = Array.isArray(poll.targetUserIds) ? poll.targetUserIds.length : 0;
+        const ansCount = poll.answeredCount !== undefined
+          ? poll.answeredCount
+          : (poll.answeredUserIds || []).filter(uid => (poll.targetUserIds || []).includes(uid)).length;
+        return targetCount > 0 && ansCount >= targetCount;
+      } else {
+        const isTarget = Array.isArray(poll.targetUserIds) && poll.targetUserIds.map(String).includes(myId);
+        const hasAnswered = (poll.answeredUserIds || []).map(String).includes(myId) || poll.hasAnswered;
+        return isTarget && !hasAnswered;
+      }
+    }).length;
+  }, [openSchedulePolls, userState?.id]);
+
+  const refetchAll = async (existingUsers?: User[]) => {
+    const latestUsers = (existingUsers && existingUsers.length > 0) ? existingUsers : await refetchUsers();
+    const isMyPage = activeTab === 'mypage';
+    await Promise.all([
+      refetchMasters(),
+      refetchPosts(latestUsers),
+      refetchEvents(latestUsers),
+      refetchApplications(latestUsers),
+      refetchTopics(latestUsers, { summary: isMyPage }),
+      refetchChatRooms(latestUsers, false),
+      refetchMemos(latestUsers),
+      refetchReports(latestUsers),
+      refetchSafetyEvents(),
+      refetchSchedulePolls(),
+      refetchProjectTasks(),
+    ]);
+    if (isMyPage) {
+      setTimeout(() => {
+        refetchTopics(latestUsers);
+      }, 1500);
+    }
+  };
+
+  useEffect(() => {
+    // アプリ起動後、アイドル時にファイルプレビュー用ライブラリ（PDF/Excel/Word）を裏で先読み
+    schedulePreviewPrefetch(3000);
+
+    // 認証トークン保持時のみユーザー一覧および各機能データを取得
+    if (isAuthenticated && getAuthToken()) {
+      refetchUsers().then((latestUsers) => {
+        refetchAll(latestUsers);
+      });
+    }
+  }, [isAuthenticated]);
+
+  useEffect(() => {
+    if (userState?.id && isAuthenticated) {
+      refetchSchedulePolls();
+      refetchProjectTasks(userState);
+    }
+  }, [userState?.id, isAuthenticated, refetchSchedulePolls]);
+
+  // チャットルームの自動更新（タブに応じた動的インターバル制御）
+  useEffect(() => {
+    if (!isAuthenticated) return;
+
+    let timeoutId: any = null;
+    let isCancelled = false;
+
+    // チャット画面を開いたときは即時に最新データをフェッチしてリアルタイム性を確保
+    if (activeTab === 'chat') {
+      refetchChatRooms(usersList, true);
+    }
+
+    const scheduleNextPoll = () => {
+      if (isCancelled) return;
+
+      const isChatTab = activeTab === 'chat';
+      const isDocumentHidden = typeof document !== 'undefined' && document.hidden;
+
+      // チャットタブ閲覧時は高リアルタイム性 (2.5秒)
+      // マイページや他タブ閲覧時でも新着を素早く検知できるよう10秒おきに軽快に取得
+      let baseDelay = isChatTab ? 2500 : 10000;
+      if (isDocumentHidden) {
+        baseDelay = isChatTab ? 15000 : 30000;
+      }
+
+      // サーバー再起動中などの連続エラー時はバックオフを適用してリクエスト過多を抑制
+      const consecutiveErrors = chatConsecutiveErrorsRef.current;
+      let delay = baseDelay;
+      if (consecutiveErrors > 0) {
+        if (isChatTab) {
+          delay = Math.min(30000, 2500 * Math.pow(1.5, Math.min(consecutiveErrors, 6)));
+        } else {
+          delay = Math.min(60000, 10000 + consecutiveErrors * 5000);
+        }
+      }
+
+      timeoutId = setTimeout(async () => {
+        if (isCancelled) return;
+        await refetchChatRooms(usersList, true);
+        scheduleNextPoll();
+      }, delay);
+    };
+
+    scheduleNextPoll();
+
+    // ウィンドウ復帰時・タブアクティブ時の即時同期イベント（3秒クールダウンで過剰発火を抑制）
+    const handleVisibilityOrFocus = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        const now = Date.now();
+        if (now - lastChatFocusSyncAtRef.current >= 3000) {
+          lastChatFocusSyncAtRef.current = now;
+          refetchChatRooms(usersList, true);
+        }
+      }
+    };
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+
+    return () => {
+      isCancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+    };
+  }, [isAuthenticated, activeTab, usersList]);
+
+  // フォーカス時・タブ切替時の重複バースト通信を抑止するための最終取得タイムスタンプRef
+  const lastChatFocusSyncAtRef = useRef<number>(0);
+  const lastOverallSyncAtRef = useRef<number>(0);
+  const lastResourceFetchAtRef = useRef<Record<string, number>>({});
+
+  // 全体データ自動同期ポーリング (Unified Background & Active Polling)
+  // 伝言メモ、ワークフロー申請、掲示板、カレンダー予定、日報・週報、安否確認
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    let isCancelled = false;
+    let timeoutId: any = null;
+    let isSyncing = false;
+
+    const runOverallSync = async () => {
+      if (isCancelled || isSyncing) return;
+      try {
+        isSyncing = true;
+        const now = Date.now();
+        lastOverallSyncAtRef.current = now;
+        const isMyPageFastLoad = activeTab === 'mypage' && topics.length === 0;
+        // 掲示板タブ・タイムラインタブ以外を閲覧中のバックグラウンド巡回では軽量サマリーAPIを活用
+        const useTopicSummary = isMyPageFastLoad || (activeTab !== 'board' && activeTab !== 'timeline');
+        await Promise.allSettled([
+          refetchMemos(usersList),
+          refetchApplications(usersList),
+          refetchTopics(usersList, { summary: useTopicSummary }),
+          refetchEvents(usersList),
+          refetchReports(usersList),
+          refetchSafetyEvents(),
+          refetchProjectTasks(),
+        ]);
+        const stamp = Date.now();
+        lastResourceFetchAtRef.current = {
+          board: useTopicSummary ? (lastResourceFetchAtRef.current.board || 0) : stamp,
+          safety: stamp,
+          workflow: stamp,
+          memo: stamp,
+          calendar: stamp,
+          report: stamp,
+          projects: stamp,
+        };
+        if (isMyPageFastLoad) {
+          setTimeout(() => {
+            if (!isCancelled) refetchTopics(usersList);
+          }, 1500);
+        }
+      } catch (err) {
+        console.warn('[Overall Polling] Sync error:', err);
+      } finally {
+        isSyncing = false;
+      }
+    };
+
+    const scheduleNextOverallPoll = () => {
+      if (isCancelled) return;
+      const isDocumentHidden = typeof document !== 'undefined' && document.hidden;
+      // 画面表示中は25秒おき、バックグラウンド時は60秒おきに全体巡回
+      const delay = isDocumentHidden ? 60000 : 25000;
+
+      timeoutId = setTimeout(async () => {
+        if (isCancelled) return;
+        await runOverallSync();
+        scheduleNextOverallPoll();
+      }, delay);
+    };
+
+    scheduleNextOverallPoll();
+
+    // タブ切り替え時の即時再取得（直近5秒以内に取得済みの場合はスキップして連続クリック負荷を排除）
+    const now = Date.now();
+    const shouldFetch = (key: string, cooldownMs = 5000) => {
+      const last = lastResourceFetchAtRef.current[key] || 0;
+      if (now - last < cooldownMs) return false;
+      lastResourceFetchAtRef.current[key] = now;
+      return true;
+    };
+
+    if (activeTab === 'board' && shouldFetch('board')) {
+      refetchTopics(usersList);
+    } else if (activeTab === 'safety_confirmation' && shouldFetch('safety')) {
+      refetchSafetyEvents();
+    } else if ((activeTab === 'workflow' || activeTab === 'mypage') && shouldFetch('workflow')) {
+      refetchApplications(usersList);
+    } else if (activeTab === 'memo' && shouldFetch('memo')) {
+      refetchMemos(usersList);
+    } else if ((activeTab === 'calendar' || activeTab === 'inspection_scheduler') && shouldFetch('calendar')) {
+      refetchEvents(usersList);
+    } else if (activeTab === 'daily_report' && shouldFetch('report')) {
+      refetchReports(usersList);
+    } else if (activeTab === 'projects' && shouldFetch('projects')) {
+      refetchProjectTasks();
+    }
+
+    // ウィンドウ復帰時・タブ復帰時の即時同期（10秒クールダウンで過剰バーストを防止）
+    const handleVisibilityOrFocus = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        if (Date.now() - lastOverallSyncAtRef.current >= 10000) {
+          runOverallSync();
+        }
+      }
+    };
+
+    // 各カスタム更新イベントは対象リソースのみをピンポイント再取得（無関係な他5APIの無駄な全件再取得を排除）
+    const handleBulletinsUpdated = () => {
+      lastResourceFetchAtRef.current.board = Date.now();
+      refetchTopics(usersList);
+    };
+    const handleSafetyUpdated = () => {
+      lastResourceFetchAtRef.current.safety = Date.now();
+      refetchSafetyEvents();
+    };
+    const handleMemosUpdated = () => {
+      lastResourceFetchAtRef.current.memo = Date.now();
+      refetchMemos(usersList);
+    };
+    const handleWorkflowsUpdated = () => {
+      lastResourceFetchAtRef.current.workflow = Date.now();
+      refetchApplications(usersList);
+    };
+    const handleEventsUpdated = () => {
+      lastResourceFetchAtRef.current.calendar = Date.now();
+      refetchEvents(usersList);
+    };
+    const handleReportsUpdated = () => {
+      lastResourceFetchAtRef.current.report = Date.now();
+      refetchReports(usersList);
+    };
+    const handleProjectsUpdated = () => {
+      lastResourceFetchAtRef.current.projects = Date.now();
+      refetchProjectTasks(userState, { force: true });
+    };
+
+    window.addEventListener('focus', handleVisibilityOrFocus);
+    document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    window.addEventListener('bulletins_updated', handleBulletinsUpdated);
+    window.addEventListener('safety_updated', handleSafetyUpdated);
+    window.addEventListener('memos_updated', handleMemosUpdated);
+    window.addEventListener('workflows_updated', handleWorkflowsUpdated);
+    window.addEventListener('events_updated', handleEventsUpdated);
+    window.addEventListener('reports_updated', handleReportsUpdated);
+    window.addEventListener('projects_updated', handleProjectsUpdated);
+
+    return () => {
+      isCancelled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      window.removeEventListener('focus', handleVisibilityOrFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      window.removeEventListener('bulletins_updated', handleBulletinsUpdated);
+      window.removeEventListener('safety_updated', handleSafetyUpdated);
+      window.removeEventListener('memos_updated', handleMemosUpdated);
+      window.removeEventListener('workflows_updated', handleWorkflowsUpdated);
+      window.removeEventListener('events_updated', handleEventsUpdated);
+      window.removeEventListener('reports_updated', handleReportsUpdated);
+      window.removeEventListener('projects_updated', handleProjectsUpdated);
+    };
+  }, [isAuthenticated, activeTab, usersList]);
+
+  // Board Handlers
+  const handleAddTopic = async (topicData: Omit<BoardTopic, 'id' | 'createdAt' | 'views' | 'commentsCount'>) => {
+    const tempId = `t-temp-${Date.now()}`;
+    const newTopic: BoardTopic = {
+      ...topicData,
+      id: tempId,
+      createdAt: new Date().toISOString(),
+      views: 0,
+      commentsCount: 0,
+    };
+    setTopics([newTopic, ...topics]);
+
+    if (userState?.id) {
+      markTopicAsRead(userState.id, tempId);
+    }
+
+    const isMemberScoped = hasTopicTargetMembers(topicData);
+    const scopeLabelForEmail = getTopicScopeBadgeLabel(topicData, offices, divisions);
+
+    // 掲示板プッシュ通知・メール通知の配信先決定
+    let targetBoardUsers: User[] = [];
+    if (isMemberScoped) {
+      const targetIdSet = new Set((topicData.targetUserIds || []).map(String));
+      targetBoardUsers = usersList.filter(
+        u => String(u.id) !== String(topicData.author.id) && targetIdSet.has(String(u.id))
+      );
+      const pushRecipientIds = Array.from(targetIdSet).filter(id => id !== String(topicData.author.id));
+      if (pushRecipientIds.length > 0) {
+        triggerPushNotification({
+          targetUserIds: pushRecipientIds,
+          excludeUserId: topicData.author.id,
+          title: `📢 掲示板新着: ${topicData.title}`,
+          body: `${topicData.author.name}さんが「${topicData.title}」を投稿しました。`,
+          url: `/?tab=board&topicId=${tempId}`,
+          tag: `topic-${tempId}`
+        });
+      }
+    } else if (topicData.isStrictScope) {
+      targetBoardUsers = usersList.filter(
+        u => String(u.id) !== String(topicData.author.id) && canUserViewTopic(topicData, u, offices, divisions)
+      );
+      const pushRecipientIds = targetBoardUsers.map(u => String(u.id));
+      if (pushRecipientIds.length > 0) {
+        triggerPushNotification({
+          targetUserIds: pushRecipientIds,
+          excludeUserId: topicData.author.id,
+          title: `📢 掲示板新着: ${topicData.title}`,
+          body: `${topicData.author.name}さんが「${topicData.title}」を投稿しました。`,
+          url: `/?tab=board&topicId=${tempId}`,
+          tag: `topic-${tempId}`
+        });
+      }
+    } else {
+      targetBoardUsers = usersList.filter(u => String(u.id) !== String(topicData.author.id));
+      // 全ユーザーに掲示板のプッシュ通知を配信
+      triggerPushNotification({
+        targetUserId: 'all',
+        excludeUserId: topicData.author.id,
+        title: `📢 掲示板新着: ${topicData.title}`,
+        body: `${topicData.author.name}さんが「${topicData.title}」を投稿しました。`,
+        url: `/?tab=board&topicId=${tempId}`,
+        tag: `topic-${tempId}`
+      });
+    }
+
+    // 掲示板メール通知をユーザー設定に応じて配信
+    if (targetBoardUsers.length > 0) {
+      dispatchNotificationEmail(targetBoardUsers, {
+        category: 'bulletin',
+        categoryLabel: '掲示板',
+        title: `掲示板投稿: ${topicData.title}`,
+        actorName: topicData.author.name,
+        details: [
+          { label: 'カテゴリ', value: topicData.category || '掲示' },
+          { label: 'タイトル', value: topicData.title },
+          { label: '公開範囲', value: scopeLabelForEmail },
+          { label: '投稿者', value: topicData.author.name },
+        ],
+        mainContent: topicData.content,
+        pathParams: `tab=board&topicId=${tempId}`,
+      }, topicData.author);
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/bulletins`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category: topicData.category,
+          title: topicData.title,
+          content: topicData.content,
+          authorId: topicData.author.id,
+          author: topicData.author,
+          office: topicData.office || '全社',
+          division: topicData.division || '全部署',
+          scope: topicData.scope || (isMemberScoped ? 'members' : '全社'),
+          isStrictScope: !!topicData.isStrictScope,
+          targetUserIds: topicData.targetUserIds || [],
+          targetGroupName: topicData.targetGroupName || '',
+          tags: topicData.tags || [],
+          isPinned: topicData.isPinned ? 1 : 0,
+          pinnedUntil: topicData.pinnedUntil || null,
+          pinnedDuration: topicData.pinnedDuration || null,
+          hasPeriod: topicData.hasPeriod ? 1 : 0,
+          startDate: topicData.startDate || null,
+          endDate: topicData.endDate || null,
+          attachments: topicData.attachments || [],
+          poll: topicData.poll || null,
+          comments: topicData.comments || [],
+          viewers: topicData.viewers || [],
+        })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        if (data && data.id && userState?.id) {
+          markTopicAsRead(userState.id, data.id);
+        }
+        await refetchTopics();
+      }
+    } catch (err) {
+      console.error('Failed to save bulletin via API, keeping locally:', err);
+    }
+  };
+
+  const handleUpdateTopic = async (
+    updatedTopic: BoardTopic,
+    options?: { skipServerPut?: boolean; skipRefetch?: boolean }
+  ) => {
+    // 既存の状態および投票データからアンケート選択肢(options)を保護・自動復元
+    const currentInState = topics.find(t => t.id === updatedTopic.id);
+    if (updatedTopic.poll) {
+      let safePoll = updatedTopic.poll;
+      if (!safePoll.options || !Array.isArray(safePoll.options) || safePoll.options.length === 0) {
+        let restoredOptions = (currentInState?.poll && Array.isArray(currentInState.poll.options) && currentInState.poll.options.length > 0)
+          ? currentInState.poll.options
+          : [];
+        if (restoredOptions.length === 0) {
+          const effectiveVotes = (safePoll.votes && Array.isArray(safePoll.votes) && safePoll.votes.length > 0)
+            ? safePoll.votes
+            : (currentInState?.poll?.votes || []);
+          const votedIds = Array.from(new Set(effectiveVotes.flatMap((v: any) => v.selectedOptionIds || [])));
+          votedIds.sort((a: any, b: any) => String(a).localeCompare(String(b), undefined, { numeric: true }));
+          if (votedIds.length > 0) {
+            restoredOptions = votedIds.map((optId: any, idx: number) => ({
+              id: optId,
+              text: optId === 'opt-1' ? '選択肢 1' : optId === 'opt-2' ? '選択肢 2' : optId === 'opt-3' ? '選択肢 3' : `選択肢 ${idx + 1}`,
+              requireComment: false,
+            }));
+          }
+        }
+        if (restoredOptions.length === 0) {
+          restoredOptions = [
+            { id: 'opt-1', text: '選択肢 1', requireComment: false },
+            { id: 'opt-2', text: '選択肢 2', requireComment: false },
+            { id: 'opt-3', text: '選択肢 3', requireComment: false },
+          ];
+        }
+        safePoll = {
+          ...(currentInState?.poll || {}),
+          ...safePoll,
+          options: restoredOptions,
+          votes: (safePoll.votes && Array.isArray(safePoll.votes) && safePoll.votes.length > 0)
+            ? safePoll.votes
+            : (currentInState?.poll?.votes || []),
+        };
+        updatedTopic = { ...updatedTopic, poll: safePoll };
+      }
+    }
+
+    // ローカル状態を即座に更新し、UIやモーダルに確実に反映させる
+    setTopics(prev => prev.map(t => t.id === updatedTopic.id ? updatedTopic : t));
+
+    // 個別エンドポイント（/viewers, /comments, /poll/vote, /detail等）で同期済みの場合は全体PUT・全件再取得をスキップ
+    if (options?.skipServerPut) {
+      window.dispatchEvent(new CustomEvent('notifications_updated'));
+      return;
+    }
+
+    // 閲覧者（viewers / views）のみの変更（ヘッダー一括既読やマイページクリック等）の場合は軽量な /viewers API のみ呼び出し
+    if (currentInState && userState?.id) {
+      const isOnlyViewerChange =
+        currentInState.title === updatedTopic.title &&
+        currentInState.content === updatedTopic.content &&
+        currentInState.category === updatedTopic.category &&
+        currentInState.office === updatedTopic.office &&
+        currentInState.division === updatedTopic.division &&
+        currentInState.scope === updatedTopic.scope &&
+        !!currentInState.isStrictScope === !!updatedTopic.isStrictScope &&
+        (currentInState.targetGroupName || '') === (updatedTopic.targetGroupName || '') &&
+        (currentInState.targetUserIds || []).join(',') === (updatedTopic.targetUserIds || []).join(',') &&
+        currentInState.isPinned === updatedTopic.isPinned &&
+        currentInState.pinnedUntil === updatedTopic.pinnedUntil &&
+        currentInState.hasPeriod === updatedTopic.hasPeriod &&
+        currentInState.startDate === updatedTopic.startDate &&
+        currentInState.endDate === updatedTopic.endDate &&
+        currentInState.poll === updatedTopic.poll &&
+        (currentInState.comments?.length || 0) === (updatedTopic.comments?.length || 0) &&
+        (currentInState.attachments?.length || 0) === (updatedTopic.attachments?.length || 0);
+
+      if (isOnlyViewerChange) {
+        fetch(`${API_BASE_URL}/bulletins/${updatedTopic.id}/viewers`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: userState.id, user: userState })
+        }).catch(() => {});
+        window.dispatchEvent(new CustomEvent('notifications_updated'));
+        return;
+      }
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/bulletins/${updatedTopic.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          category: updatedTopic.category,
+          title: updatedTopic.title,
+          content: updatedTopic.content,
+          authorId: updatedTopic.author.id,
+          author: updatedTopic.author,
+          office: updatedTopic.office || '全社',
+          division: updatedTopic.division || '全部署',
+          scope: updatedTopic.scope || (hasTopicTargetMembers(updatedTopic) ? 'members' : '全社'),
+          isStrictScope: !!updatedTopic.isStrictScope,
+          targetUserIds: updatedTopic.targetUserIds || [],
+          targetGroupName: updatedTopic.targetGroupName || '',
+          tags: updatedTopic.tags || [],
+          isPinned: updatedTopic.isPinned ? 1 : 0,
+          pinnedUntil: updatedTopic.pinnedUntil || null,
+          pinnedDuration: updatedTopic.pinnedDuration || null,
+          hasPeriod: updatedTopic.hasPeriod ? 1 : 0,
+          startDate: updatedTopic.startDate || null,
+          endDate: updatedTopic.endDate || null,
+          attachments: updatedTopic.attachments || [],
+          poll: updatedTopic.poll !== undefined ? updatedTopic.poll : null,
+          views: updatedTopic.views,
+          skipChildSync: true,
+        })
+      });
+      if (response.ok && options?.skipRefetch === false) {
+        await refetchTopics();
+      }
+    } catch (err) {
+      console.warn('Failed to update bulletin via API:', err);
+    } finally {
+      window.dispatchEvent(new CustomEvent('notifications_updated'));
+    }
+  };
+
+  const handleDeleteTopic = async (topicId: string) => {
+    const targetTopic = topics.find(t => t.id === topicId);
+    if (targetTopic) {
+      let commentsForCleanup = targetTopic.comments || [];
+      if (commentsForCleanup.length === 0 && (targetTopic.commentsCount || 0) > 0) {
+        try {
+          const detailRes = await fetch(`${API_BASE_URL}/bulletins/${topicId}/detail`, {
+            headers: { 'Accept': 'application/json' }
+          });
+          if (detailRes.ok) {
+            const detailData = await detailRes.json();
+            if (Array.isArray(detailData?.comments)) {
+              commentsForCleanup = detailData.comments;
+            }
+          }
+        } catch (_) {}
+      }
+      const allAttachments = [
+        ...(targetTopic.attachments || []),
+        ...commentsForCleanup.flatMap((c: any) => c.attachments || [])
+      ];
+      if (allAttachments.length > 0) {
+        await deleteAttachmentFiles(allAttachments);
+      }
+    }
+
+    setTopics(prev => prev.filter(t => t.id !== topicId));
+
+    try {
+      await fetch(`${API_BASE_URL}/bulletins/${topicId}`, {
+        method: 'DELETE'
+      });
+    } catch (err) {
+      console.error('Failed to delete bulletin via API:', err);
+    }
+  };
+
+  if (!isAuthenticated) {
+    // 安否確認メール・直通URLからのゲスト回答モード（ログイン不要・他画面隔離）
+    if (targetSafetyEventId && !dismissGuestSafety) {
+      return (
+        <GuestSafetyResponse
+          eventId={targetSafetyEventId}
+          userId={targetSafetyUserId}
+          allUsers={usersList}
+          onGoToLogin={() => setDismissGuestSafety(true)}
+        />
+      );
+    }
+
+    return (
+      <LoginScreen
+        users={usersList}
+        offices={offices}
+        divisions={divisions}
+        positions={positions}
+        initialAuthMode={initialUrlParams.authMode || 'login'}
+        initialInviteToken={initialUrlParams.inviteToken}
+        initialResetToken={initialUrlParams.resetToken}
+        onLogin={handleLogin}
+        onUserRegistered={(newUser) => {
+          setUsersList(prev => [...prev, newUser]);
+        }}
+      />
+    );
+  }
+
+  // Switch active user for testing permissions / impersonation
+  const handleSwitchUser = (targetUser: User) => {
+    // もし切り替え先が元管理者自身なら元に戻す
+    if (impersonatorAdmin && targetUser.id === impersonatorAdmin.id) {
+      handleRevertToAdmin();
+      return;
+    }
+
+    // まだ元管理者が記録されていない場合、現在のユーザーが管理者であれば記録
+    if (!impersonatorAdmin) {
+      if (userState?.isAdmin) {
+        setImpersonatorAdmin(userState);
+        localStorage.setItem('impersonator_admin_user', JSON.stringify(userState));
+      }
+    }
+
+    setUserState(targetUser);
+    localStorage.setItem('logged_in_user_id', targetUser.id);
+    localStorage.setItem('logged_in_user_data', JSON.stringify(targetUser));
+    refetchApplications(usersList);
+  };
+
+  // 管理者アカウントへワンクリックで復帰
+  const handleRevertToAdmin = () => {
+    if (!impersonatorAdmin) return;
+    const admin = impersonatorAdmin;
+    setUserState(admin);
+    localStorage.setItem('logged_in_user_id', admin.id);
+    localStorage.setItem('logged_in_user_data', JSON.stringify(admin));
+    localStorage.removeItem('impersonator_admin_user');
+    setImpersonatorAdmin(null);
+    refetchApplications(usersList);
+  };
+
+  // User Management
+  const handleAddUser = async (userData: Omit<User, 'id'>) => {
+    const tempId = `u-${Date.now()}`;
+    const newUser: User = {
+      ...userData,
+      avatarUrl: sanitizeAvatarUrlForSave(userData.avatarUrl),
+      id: tempId,
+    };
+    // Optimistic UI update
+    setUsersList(prev => [...prev, newUser]);
+
+    try {
+      console.log('Attempting to create user via POST to /api/users...');
+      const response = await fetch(`${API_BASE_URL}/users`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify(newUser),
+      });
+
+      if (response.ok) {
+        console.log('User successfully created on server.');
+        await refetchUsers();
+      } else {
+        const errText = await response.text().catch(() => '');
+        console.warn(`POST /api/users failed with status ${response.status}: ${errText}. Keeping locally.`);
+      }
+    } catch (err: any) {
+      console.warn('Failed to create user via API, keeping locally:', err);
+    }
+  };
+
+  const handleUpdateUser = async (updatedUser: User) => {
+    const sanitizedUser = {
+      ...updatedUser,
+      avatarUrl: sanitizeAvatarUrlForSave(updatedUser.avatarUrl),
+    };
+
+    // Optimistically update GUI state instantly with division/sort order
+    setUsersList(prev => sortUsersByDivision(prev.map((u) => (u.id === sanitizedUser.id ? sanitizedUser : u)), divisions));
+    if (sanitizedUser.id === userState.id) {
+      setUserState(sanitizedUser);
+    }
+
+    // ローカルストレージに個人設定・通知設定を即座にバックアップ
+    if (sanitizedUser.preferences) {
+      try {
+        localStorage.setItem(`user_preferences_${sanitizedUser.id}`, JSON.stringify(sanitizedUser.preferences));
+      } catch (_) {}
+
+      // preferences 専用エンドポイントへも並行して直接送信（二重保護）
+      fetch(`${API_BASE_URL}/users/${sanitizedUser.id}/preferences`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(sanitizedUser.preferences),
+      }).catch(() => {});
+    }
+
+    try {
+      const urlWithId = `${API_BASE_URL}/users/${sanitizedUser.id}`;
+      console.log(`Attempting update: PUT to ${urlWithId}...`);
+      let response = await fetch(urlWithId, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: JSON.stringify(sanitizedUser),
+      });
+
+      if (!response.ok) {
+        console.warn(`PUT /api/users/:id failed with status ${response.status}. Trying POST fallback...`);
+        // Fallback 1: POST /api/users/:id
+        response = await fetch(urlWithId, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(sanitizedUser),
+        });
+      }
+
+      if (!response.ok) {
+        console.warn(`POST /api/users/:id failed with status ${response.status}. Trying PUT to /api/users...`);
+        // Fallback 2: PUT /api/users
+        response = await fetch(`${API_BASE_URL}/users`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(sanitizedUser),
+        });
+      }
+
+      if (!response.ok) {
+        console.warn(`PUT /api/users failed with status ${response.status}. Trying POST to /api/users...`);
+        // Fallback 3: POST /api/users (many simple APIs accept POST here to insert or update)
+        response = await fetch(`${API_BASE_URL}/users`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(sanitizedUser),
+        });
+      }
+
+      if (response.ok) {
+        console.log('User successfully updated in backend DB.');
+        await refetchUsers();
+      } else {
+        const errText = await response.text().catch(() => '');
+        console.warn(`All fallback updates failed. Last status: ${response.status}: ${errText}. Keeping locally.`);
+      }
+    } catch (err: any) {
+      console.warn('Failed to update user via API, keeping locally:', err);
+    }
+  };
+
+  const handleToggleSidebarCollapse = (collapsed: boolean) => {
+    setIsSidebarCollapsed(collapsed);
+    localStorage.setItem('is_sidebar_collapsed', String(collapsed));
+
+    if (userState && userState.id) {
+      const updatedUser: User = {
+        ...userState,
+        preferences: {
+          ...(userState.preferences || {}),
+          isSidebarCollapsed: collapsed,
+        },
+      };
+      handleUpdateUser(updatedUser);
+    }
+  };
+
+  const handleToggleUtilityOpen = (open: boolean) => {
+    setIsUtilityOpen(open);
+    localStorage.setItem('is_utility_open', String(open));
+
+    if (userState && userState.id) {
+      const updatedUser: User = {
+        ...userState,
+        preferences: {
+          ...(userState.preferences || {}),
+          isUtilityOpen: open,
+        },
+      };
+      handleUpdateUser(updatedUser);
+    }
+  };
+
+  const handleDeleteUser = async (userId: string) => {
+    // UIを即時更新
+    setUsersList(prev => prev.filter((u) => u.id !== userId));
+
+    try {
+      console.log(`Attempting to delete user via DELETE on /api/users/${userId}...`);
+      const response = await fetch(`${API_BASE_URL}/users/${userId}`, {
+        method: 'DELETE',
+        headers: {
+          'Accept': 'application/json',
+        },
+      });
+
+      if (response.ok) {
+        console.log('User successfully deleted from server DB.');
+        await refetchUsers();
+      } else {
+        const errData = await response.json().catch(() => ({}));
+        console.warn(`DELETE /api/users/:id failed with status ${response.status}.`, errData);
+        alert(`ユーザーの削除に失敗しました: ${errData.error || response.statusText}`);
+        await refetchUsers();
+      }
+    } catch (err: any) {
+      console.warn('Failed to delete user via API:', err);
+      alert(`通信エラーによりユーザーを削除できませんでした: ${err.message}`);
+      await refetchUsers();
+    }
+  };
+
+  const handleToggleUserAdmin = async (userId: string) => {
+    let targetUser: User | undefined;
+
+    setUsersList(prev => prev.map(u => {
+      if (u.id === userId) {
+        const updatedIsAdmin = !u.isAdmin;
+        const updated = { ...u, isAdmin: updatedIsAdmin, role: (updatedIsAdmin ? 'admin' : 'user') as 'admin' | 'user' };
+        if (u.id === userState.id) {
+          setUserState(updated);
+        }
+        targetUser = updated;
+        return updated;
+      }
+      return u;
+    }));
+
+    if (targetUser) {
+      try {
+        console.log(`Attempting to toggle admin status for user ${userId}...`);
+        const urlWithId = `${API_BASE_URL}/users/${userId}`;
+        let response = await fetch(urlWithId, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify(targetUser),
+        });
+
+        if (!response.ok) {
+          response = await fetch(`${API_BASE_URL}/users`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json',
+            },
+            body: JSON.stringify(targetUser),
+          });
+        }
+
+        if (response.ok) {
+          console.log('User admin status successfully updated.');
+          await refetchUsers();
+        } else {
+          console.warn(`Admin toggle API failed with status ${response.status}. Keeping locally.`);
+        }
+      } catch (err: any) {
+        console.warn('Failed to toggle admin status via API, keeping locally:', err);
+      }
+    }
+  };
+
+
+
+  // Helper to persist event to API
+  const saveEventToApi = async (ev: CalendarEvent, isNew = false) => {
+    const createdByData = ev.createdBy || userState;
+    const descObj = {
+      attendees: ev.attendees || [],
+      viewers: (ev as any).viewers || [],
+      memo: ev.memo || '',
+      attachments: ev.attachments || [],
+      isPrivate: Boolean(ev.isPrivate || (ev as any).isSecret),
+      recurrence: ev.recurrence || null,
+      recurrenceParentId: ev.recurrenceParentId || null,
+      recurrenceOriginalDate: ev.recurrenceOriginalDate || null,
+      recurrenceExceptions: ev.recurrenceExceptions || [],
+      createdBy: createdByData,
+      createdById: createdByData?.id,
+      siteId: ev.siteId || null,
+      siteCode: ev.siteCode || null,
+      siteName: ev.siteName || null,
+      constructionPhase: ev.constructionPhase || null,
+    };
+
+    const safeStart = ensureJstIsoString(ev.start);
+    const safeEnd = ensureJstIsoString(ev.end || ev.start);
+
+    const payload = {
+      title: ev.title,
+      startAt: safeStart,
+      endAt: safeEnd,
+      start: safeStart,
+      end: safeEnd,
+      isAllDay: ev.isAllDay ? 1 : 0,
+      isPrivate: (ev.isPrivate || (ev as any).isSecret) ? 1 : 0,
+      category: ev.type,
+      office: ev.office || '全社',
+      division: ev.division || '全部署',
+      location: ev.location || '',
+      attendees: ev.attendees || [],
+      memo: ev.memo || '',
+      attachments: ev.attachments || [],
+      recurrence: ev.recurrence || null,
+      recurrenceParentId: ev.recurrenceParentId || null,
+      recurrenceOriginalDate: ev.recurrenceOriginalDate || null,
+      recurrenceExceptions: ev.recurrenceExceptions || [],
+      status: ev.status || 'published',
+      targetYearMonth: ev.targetYearMonth || null,
+      draftSavedAt: ev.draftSavedAt || null,
+      createdBy: createdByData,
+      createdById: createdByData?.id,
+      userId: createdByData?.id,
+      siteId: ev.siteId || null,
+      siteCode: ev.siteCode || null,
+      siteName: ev.siteName || null,
+      constructionPhase: ev.constructionPhase || null,
+      description: JSON.stringify(descObj),
+      details: JSON.stringify(descObj)
+    };
+
+    const isTempId = !ev.id || ev.id.startsWith('e-temp-') || ev.id.startsWith('e-recur-split-');
+    if (isNew || isTempId) {
+      return fetch(`${API_BASE_URL}/events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    } else {
+      return fetch(`${API_BASE_URL}/events/${ev.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+    }
+  };
+
+  // Handle new event creation
+  const handleAddEvent = async (eventData: Omit<CalendarEvent, 'id'>) => {
+    const tempId = `e-temp-${Date.now()}`;
+    const newEvent: CalendarEvent = {
+      ...eventData,
+      id: tempId,
+      createdBy: eventData.createdBy || userState,
+    };
+    setEvents([...events, newEvent]);
+
+    if (userState?.id) {
+      markEventAsRead(userState.id, tempId);
+    }
+
+    // 参加者にプッシュ通知を配信
+    const attendeeIds = (eventData.attendees || [])
+      .map(a => a.id)
+      .filter(id => id && id !== userState.id);
+    if (attendeeIds.length > 0) {
+      triggerPushNotification({
+        targetUserIds: attendeeIds,
+        excludeUserId: userState.id,
+        title: `📅 新しい予定: ${eventData.title}`,
+        body: `${userState.name}さんが「${eventData.title}」を追加しました。`,
+        url: `/?tab=calendar&eventId=${tempId}`,
+        tag: `event-${tempId}`
+      });
+
+      const targetScheduleAttendees = (eventData.attendees || [])
+        .map(a => usersList.find(u => u.id === a.id))
+        .filter((u): u is User => !!u && u.id !== userState.id);
+      if (targetScheduleAttendees.length > 0) {
+        dispatchNotificationEmail(targetScheduleAttendees, {
+          category: 'schedule',
+          categoryLabel: 'スケジュール',
+          title: `新しい予定: ${eventData.title}`,
+          actorName: userState.name,
+          details: [
+            { label: 'タイトル', value: eventData.title },
+            { label: '日時', value: `${eventData.start || ''}${eventData.end ? ` ～ ${eventData.end}` : ''}` },
+            { label: '場所', value: eventData.location || 'なし' },
+            { label: '区分', value: eventData.type || '予定' },
+            { label: '登録者', value: userState.name },
+          ],
+          mainContent: eventData.memo,
+          pathParams: `tab=calendar&eventId=${tempId}`,
+        }, userState);
+      }
+    }
+
+    try {
+      const response = await saveEventToApi(newEvent, true);
+      if (response && response.ok) {
+        const data = await response.json();
+        if (data && data.id && userState?.id) {
+          markEventAsRead(userState.id, data.id);
+        }
+        await refetchEvents();
+      }
+    } catch (err) {
+      console.error('Failed to add event via API, keeping locally:', err);
+    }
+  };
+
+  // Handle event update
+  const handleUpdateEvent = async (
+    updatedEvent: CalendarEvent,
+    scope: RecurrenceActionScope = 'all',
+    originalInstanceDate?: string
+  ) => {
+    const originalEvents = [...events];
+
+    // 繰り返しスコープに応じた分割・更新プランを生成
+    const plan = planRecurrenceSave(events, updatedEvent, scope, originalInstanceDate || updatedEvent.instanceDate);
+    setEvents(plan.updatedEvents);
+    if (userState?.id) {
+      plan.toSave.forEach(ev => {
+        markEventAsRead(userState.id, ev.id);
+        if (ev.recurrenceParentId) markEventAsRead(userState.id, ev.recurrenceParentId);
+      });
+    }
+
+    // 保存中のバックグラウンドポーリングによる古いデータ上書きを防止
+    isUpdatingCalendarEventsRef.current = true;
+
+    try {
+      // 1. 更新/新規作成対象を保存
+      await Promise.all(
+        plan.toSave.map(ev => saveEventToApi(ev, !originalEvents.some(oe => String(oe.id) === String(ev.id))))
+      );
+
+      // 2. 削除対象を削除
+      await Promise.all(
+        plan.toDelete.map(delId =>
+          fetch(`${API_BASE_URL}/events/${delId}`, { method: 'DELETE' }).catch(() => {})
+        )
+      );
+
+      // 保存完了後に強制リフレッシュ
+      await refetchEvents(usersList, true);
+    } catch (err) {
+      console.error('Failed to update event via API, rolling back:', err);
+      setEvents(originalEvents);
+    } finally {
+      isUpdatingCalendarEventsRef.current = false;
+      window.dispatchEvent(new CustomEvent('notifications_updated'));
+    }
+  };
+
+  // Handle event deletion
+  const handleDeleteEvent = async (
+    eventId: string,
+    scope: RecurrenceActionScope = 'all',
+    instanceDate?: string
+  ) => {
+    if (eventId.startsWith('e-temp-')) {
+      setEvents(events.filter(e => e.id !== eventId));
+      return;
+    }
+
+    const isExpandedInstance = isExpandedRecurrenceId(eventId);
+    const targetEvent = events.find(e => e.id === eventId);
+    const parentId = targetEvent?.recurrenceParentId || (isExpandedInstance ? extractParentIdFromInstanceId(eventId) : eventId);
+    const parentEvent = events.find(e => e.id === parentId);
+    const targetDate = instanceDate || targetEvent?.instanceDate || (isExpandedInstance ? extractDateFromInstanceId(eventId) : (targetEvent?.start ? targetEvent.start.split('T')[0] : undefined));
+
+    const hasRecurrence = isExpandedInstance ||
+      !!(targetEvent && (targetEvent.recurrence?.frequency !== 'none' || targetEvent.recurrenceParentId || targetEvent.instanceDate)) ||
+      !!(parentEvent && parentEvent.recurrence?.frequency !== 'none');
+
+    const performDelete = async () => {
+      const originalEvents = [...events];
+      const plan = planRecurrenceDelete(events, eventId, scope, targetDate);
+      setEvents(plan.updatedEvents);
+
+      try {
+        // 1. 親などの更新対象を保存 (exceptions 追加や endDate 短縮)
+        await Promise.all(
+          plan.toSave.map(ev => saveEventToApi(ev, false))
+        );
+
+        // 2. 削除対象を削除 (仮想IDや一時IDを正規化し、重複除去)
+        const realDeleteIds = Array.from(new Set(
+          plan.toDelete
+            .map(delId => isExpandedRecurrenceId(delId) ? extractParentIdFromInstanceId(delId) : delId)
+            .filter(delId => delId && !delId.startsWith('e-temp-'))
+        ));
+
+        await Promise.all(
+          realDeleteIds.map(delId =>
+            fetch(`${API_BASE_URL}/events/${delId}`, { method: 'DELETE' }).catch((err) => {
+              console.warn(`[Delete Event API] Failed to delete event id ${delId}:`, err);
+            })
+          )
+        );
+
+        await refetchEvents();
+      } catch (err) {
+        console.error('Failed to delete event via API, rolling back:', err);
+        setEvents(originalEvents);
+      }
+    };
+
+    if (scope !== 'all' || !hasRecurrence) {
+      // モーダルで既に確認済み、または単発予定
+      await performDelete();
+    } else {
+      setConfirmModal({
+        isOpen: true,
+        title: hasRecurrence ? '定期予定（全期間）の削除' : '予定の削除',
+        message: hasRecurrence
+          ? 'この予定は繰り返し予定です。シリーズに含まれる【すべての予定（全期間）】が完全に削除されますが、本当によろしいですか？'
+          : 'この予定を削除してもよろしいですか？',
+        type: 'danger',
+        confirmText: hasRecurrence ? 'すべての予定を削除' : '削除する',
+        cancelText: 'キャンセル',
+        onConfirm: performDelete
+      });
+    }
+  };
+
+  // Handle new workflow application
+  const handleAddApplication = async (appData: Omit<WorkflowApplication, 'id' | 'createdAt' | 'status'> & { status?: ApplicationStatus }) => {
+    // 送信データに承認フローが指定されていればそれを優先、なければ拠点×種別で自動検索
+    let selectedFlow = approvalFlows.find(f => f.id === appData.flowId);
+    if (!selectedFlow) {
+      selectedFlow = findBestMatchingApprovalFlow(approvalFlows, appData.type, (appData as any).officeId, offices) || undefined;
+    }
+
+    const resolveCtx = {
+      offices,
+      applicationOfficeId: (appData as any).officeId,
+      applicationLocation: (appData as any).location,
+    };
+
+    const rawSteps: ApprovalStepConfig[] = appData.stepsConfig && appData.stepsConfig.length > 0 
+      ? appData.stepsConfig 
+      : (selectedFlow ? selectedFlow.steps : [
+          { stepNumber: 1, approverType: 'supervisor_1', stepName: '一次承認（直属上長）' }
+        ]);
+
+    // 申請者に合わせたステップ調整（自己承認・重複承認・不在上長を除外）
+    const stepsConfig = appData.stepsConfig && appData.stepsConfig.length > 0
+      ? rawSteps
+      : filterStepsForApplicant(appData.applicant, rawSteps, usersList, resolveCtx);
+
+    const firstStep = stepsConfig[0] || rawSteps[0];
+    const resolvedFirstApprovers = firstStep
+      ? resolveApproversForStep(appData.applicant, firstStep, usersList, resolveCtx)
+      : [];
+    const initialApprover =
+      appData.approver ||
+      resolvedFirstApprovers[0] ||
+      resolveApproverForStep(appData.applicant, firstStep, usersList, resolveCtx);
+
+    // ステップ1のOR候補スナップショットを最新化（軽量未読チェックでも全員に表示されるようにする）
+    const normalizedStepsConfig: ApprovalStepConfig[] = stepsConfig.map((st, idx) => {
+      if (idx !== 0) return st;
+      const nonSelfIds = resolvedFirstApprovers
+        .filter((u) => String(u.id) !== String(appData.applicant.id))
+        .map((u) => String(u.id));
+      const isOr = nonSelfIds.length > 1;
+      return {
+        ...st,
+        approvalMode: isOr ? 'or' : (st.approvalMode || 'single'),
+        resolvedApproverId: st.resolvedApproverId || (initialApprover?.id ? String(initialApprover.id) : undefined),
+        orApproverUserIds:
+          st.orApproverUserIds && st.orApproverUserIds.length > 0
+            ? st.orApproverUserIds
+            : isOr
+            ? nonSelfIds
+            : undefined,
+      };
+    });
+
+    const tempId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const newApp: WorkflowApplication = {
+      ...appData,
+      id: tempId,
+      createdAt: new Date().toISOString(),
+      status: appData.status || 'pending',
+      approver: initialApprover,
+      flowId: appData.flowId || selectedFlow?.id,
+      flowName: appData.flowName || selectedFlow?.name || '標準承認フロー',
+      currentStepIndex: 1,
+      totalSteps: normalizedStepsConfig.length,
+      stepsConfig: normalizedStepsConfig,
+      history: [],
+    };
+    setApplications([newApp, ...applications]);
+
+    // 承認者（OR承認の場合は全候補者）にプッシュ通知・メールを配信
+    if (appData.status !== 'draft') {
+      const recipientMap = new Map<string, User>();
+      const rawRecipients = resolvedFirstApprovers.length > 0 ? resolvedFirstApprovers : (initialApprover ? [initialApprover] : []);
+      for (const u of rawRecipients) {
+        if (!u?.id || String(u.id) === String(appData.applicant.id)) continue;
+        const hydrated = usersList.find((usr) => String(usr.id) === String(u.id)) || u;
+        recipientMap.set(String(hydrated.id), hydrated);
+      }
+      const notifyRecipients = Array.from(recipientMap.values());
+      const isMultiOr = notifyRecipients.length > 1;
+
+      if (notifyRecipients.length > 0) {
+        for (const rec of notifyRecipients) {
+          triggerPushNotification({
+            targetUserId: rec.id,
+            excludeUserId: appData.applicant.id,
+            title: `📋 承認依頼: ${appData.title}`,
+            body: isMultiOr
+              ? `${appData.applicant.name}さんから新しい申請が届きました（OR承認・いずれか1名の承認で完了）。`
+              : `${appData.applicant.name}さんから新しい申請が届きました。`,
+            url: `/?tab=workflow&appId=${tempId}`,
+            tag: `wf-${tempId}`
+          });
+        }
+
+        dispatchNotificationEmail(notifyRecipients, {
+          category: 'workflow',
+          categoryLabel: 'ワークフロー',
+          title: isMultiOr ? `承認依頼（OR承認）: ${appData.title}` : `承認依頼: ${appData.title}`,
+          actorName: appData.applicant.name,
+          details: [
+            { label: '申請タイトル', value: appData.title },
+            { label: '申請者', value: appData.applicant.name },
+            { label: '申請種別', value: (appData as any).typeLabel || (appData as any).flowName || '各種申請' },
+            ...(isMultiOr ? [{ label: '承認方式', value: `OR承認（候補: ${notifyRecipients.map(r => r.name).join(' / ')} のうちいずれか1名）` }] : []),
+          ],
+          mainContent: (appData as any).reason || (appData as any).description,
+          pathParams: `tab=workflow&appId=${tempId}`,
+        }, appData.applicant);
+      }
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/workflows`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: tempId,
+          title: appData.title,
+          description: appData.description || appData.title || '',
+          applicantId: appData.applicant.id,
+          approverId: initialApprover.id,
+          status: appData.status || 'pending',
+          category: appData.type || 'other',
+          officeId: (appData as any).officeId || null,
+          location: (appData as any).location || null,
+          previousBalance: (appData as any).previousBalance !== undefined ? (appData as any).previousBalance : null,
+          currentBalance: (appData as any).currentBalance !== undefined ? (appData as any).currentBalance : null,
+          purchaseOrderNumber: appData.purchaseOrderNumber || null,
+          constructionDate: appData.constructionDate || null,
+          linkedInventoryIssueId: appData.linkedInventoryIssueId || null,
+          details: JSON.stringify({
+            ...appData,
+            applicantId: appData.applicant.id,
+            approverId: initialApprover.id,
+            applicant: appData.applicant,
+            approver: initialApprover,
+            status: appData.status || 'pending',
+            flowId: appData.flowId || selectedFlow?.id,
+            flowName: appData.flowName || selectedFlow?.name || '標準承認フロー',
+            currentStepIndex: 1,
+            totalSteps: normalizedStepsConfig.length,
+            stepsConfig: normalizedStepsConfig,
+            history: [],
+            purchaseOrderNumber: appData.purchaseOrderNumber || null,
+            constructionDate: appData.constructionDate || null,
+            linkedInventoryIssueId: appData.linkedInventoryIssueId || null,
+            reason: (appData as any).reason || '',
+            purchaseItems: (appData as any).purchaseItems || [],
+            purchasePurpose: (appData as any).purchasePurpose || '',
+            purchaseTiming: (appData as any).purchaseTiming || 'urgent',
+            purchaseDueDate: (appData as any).purchaseDueDate || '',
+            purchaseVendor: (appData as any).purchaseVendor || '',
+            purchaseMethod: (appData as any).purchaseMethod || 'self',
+            purchaserDelegateUserId: (appData as any).purchaserDelegateUserId || '',
+            purchaserDelegateUser: (appData as any).purchaserDelegateUser || null,
+            leaveStart: (appData as any).leaveStart || '',
+            leaveEnd: (appData as any).leaveEnd || '',
+            expenseType: (appData as any).expenseType || '',
+            amount: (appData as any).amount || 0,
+            attachmentUrl: (appData as any).attachmentUrl || '',
+          })
+        })
+      });
+      if (response.ok) {
+        await refetchApplications();
+      }
+    } catch (err) {
+      console.error('Failed to submit workflow via API, keeping locally:', err);
+    }
+  };
+
+  // Handle workflow approval / rejection (Multi-step & OR approval processing)
+  const handleWorkflowAction = async (id: string, actionStatus: 'approved' | 'rejected', comment?: string) => {
+    const targetApp = applications.find(a => a.id === id);
+    if (!targetApp) return;
+
+    // 先着1名・二重承認防止ガード（既に別候補者が処理済み・または権限外の場合は最新一覧を再取得して終了）
+    if (targetApp.status !== 'pending' || !isUserCurrentApprover(targetApp, userState, usersList, offices)) {
+      await refetchApplications();
+      return;
+    }
+
+    let resultApp: WorkflowApplication;
+    let nextStepRecipients: User[] = [];
+
+    if (actionStatus === 'rejected') {
+      resultApp = {
+        ...targetApp,
+        status: 'rejected',
+        rejectReason: comment || '理由未記入',
+        history: [
+          ...(targetApp.history || []),
+          {
+            stepNumber: targetApp.currentStepIndex || 1,
+            approver: userState,
+            status: 'rejected',
+            actionAt: new Date().toISOString(),
+            comment: comment,
+          }
+        ]
+      };
+    } else {
+      // 承認アクション (actionStatus === 'approved')
+      let currentStep = targetApp.currentStepIndex || 1;
+      const stepsConfig = (targetApp.stepsConfig && targetApp.stepsConfig.length > 0)
+        ? targetApp.stepsConfig.map(s => ({ ...s }))
+        : null;
+      const totalSteps = stepsConfig ? stepsConfig.length : (targetApp.totalSteps || 1);
+
+      let newHistory = [...(targetApp.history || [])];
+
+      // 現在のステップを承認履歴に追加
+      newHistory.push({
+        stepNumber: currentStep,
+        approver: userState,
+        status: 'approved',
+        actionAt: new Date().toISOString(),
+        comment: comment,
+      });
+
+      // 次のステップへ
+      currentStep++;
+
+      const resolveCtx = {
+        offices,
+        applicationOfficeId: targetApp.officeId,
+        applicationLocation: targetApp.location,
+      };
+      const alreadyApprovedIds = new Set<string>(
+        newHistory
+          .filter(h => h.status === 'approved' && h.approver?.id)
+          .map(h => String(h.approver.id))
+      );
+      const applicantId = targetApp.applicant?.id ? String(targetApp.applicant.id) : '';
+
+      // 次のステップが存在し、全候補が申請者本人または今回の承認者・既承認者がOR候補に含まれる場合（案1）は自動スキップ
+      while (currentStep <= totalSteps && stepsConfig) {
+        const nextStepConfig = stepsConfig[currentStep - 1];
+        const nextCandidates = resolveApproversForStep(targetApp.applicant, nextStepConfig, usersList, resolveCtx);
+        const isOrStep =
+          nextCandidates.length > 1 ||
+          nextStepConfig.approvalMode === 'or' ||
+          (Array.isArray(nextStepConfig.orApprovers) && nextStepConfig.orApprovers.length > 0);
+
+        const isAllSelf =
+          nextCandidates.length > 0 &&
+          Boolean(applicantId) &&
+          nextCandidates.every(c => String(c.id) === applicantId);
+
+        const matchedPriorApprover = nextCandidates.find(
+          c => String(c.id) === String(userState.id) || alreadyApprovedIds.has(String(c.id))
+        );
+
+        if (isAllSelf) {
+          newHistory.push({
+            stepNumber: currentStep,
+            approver: nextCandidates[0],
+            status: 'approved',
+            actionAt: new Date().toISOString(),
+            comment: '（申請者本人のため自動スキップ）',
+          });
+          currentStep++;
+        } else if (matchedPriorApprover) {
+          newHistory.push({
+            stepNumber: currentStep,
+            approver: matchedPriorApprover,
+            status: 'approved',
+            actionAt: new Date().toISOString(),
+            comment: isOrStep
+              ? '（同一承認者がOR候補に含まれるため自動スキップ）'
+              : '（同一承認者のため自動スキップ）',
+          });
+          currentStep++;
+        } else {
+          break;
+        }
+      }
+
+      if (currentStep <= totalSteps && stepsConfig) {
+        const nextStepConfig = stepsConfig[currentStep - 1];
+        const nextCandidates = resolveApproversForStep(targetApp.applicant, nextStepConfig, usersList, resolveCtx);
+        const eligibleNext =
+          applicantId && nextCandidates.some(c => String(c.id) !== applicantId)
+            ? nextCandidates.filter(c => String(c.id) !== applicantId)
+            : nextCandidates;
+        const nextApprover = eligibleNext[0] || resolveApproverForStep(targetApp.applicant, nextStepConfig, usersList, resolveCtx);
+
+        // 次ステップのORスナップショットを最新化
+        if (eligibleNext.length > 1) {
+          stepsConfig[currentStep - 1] = {
+            ...nextStepConfig,
+            approvalMode: 'or',
+            resolvedApproverId: String(nextApprover.id),
+            orApproverUserIds: eligibleNext.map(c => String(c.id)),
+          };
+        } else if (nextApprover?.id) {
+          stepsConfig[currentStep - 1] = {
+            ...nextStepConfig,
+            resolvedApproverId: String(nextApprover.id),
+          };
+        }
+
+        nextStepRecipients = eligibleNext.length > 0 ? eligibleNext : (nextApprover ? [nextApprover] : []);
+
+        resultApp = {
+          ...targetApp,
+          currentStepIndex: currentStep,
+          totalSteps: totalSteps,
+          stepsConfig: stepsConfig,
+          approver: nextApprover,
+          status: 'pending',
+          history: newHistory,
+        };
+      } else {
+        resultApp = {
+          ...targetApp,
+          status: 'approved',
+          currentStepIndex: totalSteps,
+          totalSteps: totalSteps,
+          stepsConfig: stepsConfig || targetApp.stepsConfig,
+          history: newHistory,
+        };
+      }
+    }
+
+    // 申請者に結果を通知 (却下または全承認時)
+    if (resultApp.applicant && resultApp.applicant.id !== userState.id) {
+      const applicantUser = usersList.find(u => u.id === resultApp.applicant.id) || resultApp.applicant;
+
+      if (actionStatus === 'rejected') {
+        triggerPushNotification({
+          targetUserId: resultApp.applicant.id,
+          excludeUserId: userState.id,
+          title: `❌ 申請却下: ${resultApp.title}`,
+          body: `${userState.name}さんにより却下されました。理由: ${comment || '未記入'}`,
+          url: `/?tab=workflow&appId=${id}`,
+          tag: `wf-${id}`
+        });
+
+        dispatchNotificationEmail([applicantUser], {
+          category: 'workflow',
+          categoryLabel: 'ワークフロー',
+          title: `申請判定: 却下 (${resultApp.title})`,
+          actorName: userState.name,
+          details: [
+            { label: '申請タイトル', value: resultApp.title },
+            { label: '判定結果', value: '却下 (差し戻し)' },
+            { label: '判定者', value: userState.name },
+            { label: '理由・コメント', value: comment || 'なし' },
+          ],
+          pathParams: `tab=workflow&appId=${id}`,
+        }, userState);
+      } else if (resultApp.status === 'approved') {
+        triggerPushNotification({
+          targetUserId: resultApp.applicant.id,
+          excludeUserId: userState.id,
+          title: `✅ 申請承認完了: ${resultApp.title}`,
+          body: `${userState.name}さんにより最終承認されました。`,
+          url: `/?tab=workflow&appId=${id}`,
+          tag: `wf-${id}`
+        });
+
+        dispatchNotificationEmail([applicantUser], {
+          category: 'workflow',
+          categoryLabel: 'ワークフロー',
+          title: `申請判定: 承認完了 (${resultApp.title})`,
+          actorName: userState.name,
+          details: [
+            { label: '申請タイトル', value: resultApp.title },
+            { label: '判定結果', value: '最終承認完了' },
+            { label: '最終承認者', value: userState.name },
+          ],
+          pathParams: `tab=workflow&appId=${id}`,
+        }, userState);
+
+        // 購入申請で購入依頼先が指定されている場合、依頼先ユーザーへ「購入手続き依頼」を通知
+        if (resultApp.type === 'purchase_order' && resultApp.purchaseMethod === 'delegate' && resultApp.purchaserDelegateUserId) {
+          const delegateUser = usersList.find(u => u.id === resultApp.purchaserDelegateUserId) || resultApp.purchaserDelegateUser;
+          if (delegateUser && delegateUser.id !== userState.id) {
+            triggerPushNotification({
+              targetUserId: delegateUser.id,
+              excludeUserId: userState.id,
+              title: `🛒 購入手続き依頼: ${resultApp.title}`,
+              body: `申請「${resultApp.title}」が決裁されました。購入・手配の手続きをお願いします。`,
+              url: `/?tab=workflow&appId=${id}`,
+              tag: `wf-delegate-${id}`
+            });
+
+            dispatchNotificationEmail([delegateUser], {
+              category: 'workflow',
+              categoryLabel: 'ワークフロー',
+              title: `【購入手続き依頼】申請承認完了: ${resultApp.title}`,
+              actorName: userState.name,
+              details: [
+                { label: '申請タイトル', value: resultApp.title },
+                { label: '申請者', value: resultApp.applicant.name },
+                { label: '購入元', value: resultApp.purchaseVendor || '未指定' },
+                { label: '購入時期', value: resultApp.purchaseTiming === 'urgent' ? '至急手配' : `${resultApp.purchaseDueDate || ''} まで` },
+                { label: '購入目的', value: resultApp.purchasePurpose || resultApp.description || '' },
+                { label: '最終承認者', value: userState.name },
+              ],
+              pathParams: `tab=workflow&appId=${id}`,
+            }, userState);
+          }
+        }
+      }
+    }
+
+    // 次の承認者（OR承認の場合は全候補者）に依頼を通知
+    if (actionStatus === 'approved' && resultApp.status === 'pending') {
+      const nextRecMap = new Map<string, User>();
+      const rawNextRecs = nextStepRecipients.length > 0 ? nextStepRecipients : (resultApp.approver ? [resultApp.approver] : []);
+      for (const u of rawNextRecs) {
+        if (!u?.id || String(u.id) === String(userState.id)) continue;
+        const hydrated = usersList.find(usr => String(usr.id) === String(u.id)) || u;
+        nextRecMap.set(String(hydrated.id), hydrated);
+      }
+      const finalNextRecs = Array.from(nextRecMap.values());
+      const isMultiOrNext = finalNextRecs.length > 1;
+
+      if (finalNextRecs.length > 0) {
+        for (const rec of finalNextRecs) {
+          triggerPushNotification({
+            targetUserId: rec.id,
+            excludeUserId: userState.id,
+            title: `📋 次期承認依頼: ${resultApp.title}`,
+            body: isMultiOrNext
+              ? `${targetApp.applicant.name}さんの申請（ステップ ${resultApp.currentStepIndex}/${resultApp.totalSteps}・OR承認）の確認をお願いします。`
+              : `${targetApp.applicant.name}さんの申請（ステップ ${resultApp.currentStepIndex}/${resultApp.totalSteps}）の確認をお願いします。`,
+            url: `/?tab=workflow&appId=${id}`,
+            tag: `wf-${id}`
+          });
+        }
+
+        dispatchNotificationEmail(finalNextRecs, {
+          category: 'workflow',
+          categoryLabel: 'ワークフロー',
+          title: isMultiOrNext ? `次期承認依頼（OR承認）: ${resultApp.title}` : `次期承認依頼: ${resultApp.title}`,
+          actorName: userState.name,
+          details: [
+            { label: '申請タイトル', value: resultApp.title },
+            { label: '申請者', value: targetApp.applicant.name },
+            { label: '進行ステップ', value: `${resultApp.currentStepIndex}/${resultApp.totalSteps}` },
+            ...(isMultiOrNext ? [{ label: '承認方式', value: `OR承認（候補: ${finalNextRecs.map(r => r.name).join(' / ')} のうちいずれか1名）` }] : []),
+          ],
+          pathParams: `tab=workflow&appId=${id}`,
+        }, userState);
+      }
+    }
+
+    try {
+      const { applicant, approver, ...restDetails } = resultApp as any;
+      const response = await fetch(`${API_BASE_URL}/workflows/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: resultApp.title,
+          applicantId: resultApp.applicant.id,
+          approverId: resultApp.approver?.id || userState.id,
+          status: resultApp.status,
+          category: resultApp.type || 'other',
+          purchaseOrderNumber: resultApp.purchaseOrderNumber || null,
+          constructionDate: resultApp.constructionDate || null,
+          linkedInventoryIssueId: resultApp.linkedInventoryIssueId || null,
+          details: JSON.stringify({
+            ...restDetails,
+            status: resultApp.status,
+            flowId: resultApp.flowId,
+            flowName: resultApp.flowName,
+            currentStepIndex: resultApp.currentStepIndex,
+            totalSteps: resultApp.totalSteps,
+            stepsConfig: resultApp.stepsConfig,
+            history: resultApp.history,
+            rejectReason: resultApp.rejectReason,
+            purchaseOrderNumber: resultApp.purchaseOrderNumber || null,
+            constructionDate: resultApp.constructionDate || null,
+            linkedInventoryIssueId: resultApp.linkedInventoryIssueId || null,
+            reason: (resultApp as any).reason || '',
+            purchaseItems: (resultApp as any).purchaseItems || [],
+            purchasePurpose: (resultApp as any).purchasePurpose || '',
+            purchaseTiming: (resultApp as any).purchaseTiming || 'urgent',
+            purchaseDueDate: (resultApp as any).purchaseDueDate || '',
+            purchaseVendor: (resultApp as any).purchaseVendor || '',
+            purchaseMethod: (resultApp as any).purchaseMethod || 'self',
+            purchaserDelegateUserId: (resultApp as any).purchaserDelegateUserId || '',
+            purchaserDelegateUser: (resultApp as any).purchaserDelegateUser || null,
+            leaveStart: (resultApp as any).leaveStart || '',
+            leaveEnd: (resultApp as any).leaveEnd || '',
+            expenseType: (resultApp as any).expenseType || '',
+            amount: (resultApp as any).amount || 0,
+            attachmentUrl: (resultApp as any).attachmentUrl || '',
+          })
+        })
+      });
+      if (response.ok) {
+        await refetchApplications();
+      } else {
+        setApplications(prev => prev.map(a => a.id === id ? resultApp : a));
+      }
+    } catch (err) {
+      console.error('Failed to sync workflow action with API:', err);
+      setApplications(prev => prev.map(a => a.id === id ? resultApp : a));
+    }
+    window.dispatchEvent(new CustomEvent('notifications_updated'));
+  };
+
+  // 申請の更新（再申請、下書き保存、発注No付与、取り下げ等）
+  const handleUpdateApplication = async (updatedApp: WorkflowApplication) => {
+    let finalAppObj: WorkflowApplication | undefined;
+
+    setApplications(prevApps => prevApps.map(app => {
+      if (app.id !== updatedApp.id) return app;
+
+      const targetStatus = updatedApp.status ? updatedApp.status : 'pending';
+
+      let selectedFlow = approvalFlows.find(f => f.id === updatedApp.flowId);
+      if (!selectedFlow) {
+        selectedFlow = findBestMatchingApprovalFlow(approvalFlows, updatedApp.type, updatedApp.officeId, offices) || undefined;
+      }
+
+      const resolveCtx = {
+        offices,
+        applicationOfficeId: updatedApp.officeId,
+        applicationLocation: updatedApp.location,
+      };
+
+      const stepsConfig: ApprovalStepConfig[] = updatedApp.stepsConfig && updatedApp.stepsConfig.length > 0 
+        ? updatedApp.stepsConfig 
+        : (selectedFlow ? selectedFlow.steps : [
+            { stepNumber: 1, approverType: 'supervisor_1', stepName: '一次承認（直属上長）' }
+          ]);
+
+      const firstStepApprovers = stepsConfig[0]
+        ? resolveApproversForStep(updatedApp.applicant, stepsConfig[0], usersList, resolveCtx)
+        : [];
+      const initialApprover =
+        updatedApp.approver ||
+        firstStepApprovers[0] ||
+        resolveApproverForStep(updatedApp.applicant, stepsConfig[0], usersList, resolveCtx);
+      const isSubmittingFromDraftOrReject = (app.status === 'draft' || app.status === 'rejected') && targetStatus === 'pending';
+
+      const normalizedStepsConfig: ApprovalStepConfig[] = stepsConfig.map((st, idx) => {
+        if (idx !== 0) return st;
+        const nonSelfIds = firstStepApprovers
+          .filter(u => String(u.id) !== String(updatedApp.applicant.id))
+          .map(u => String(u.id));
+        const isOr = nonSelfIds.length > 1;
+        return {
+          ...st,
+          approvalMode: isOr ? 'or' : (st.approvalMode || 'single'),
+          resolvedApproverId: st.resolvedApproverId || (initialApprover?.id ? String(initialApprover.id) : undefined),
+          orApproverUserIds:
+            st.orApproverUserIds && st.orApproverUserIds.length > 0
+              ? st.orApproverUserIds
+              : isOr
+              ? nonSelfIds
+              : undefined,
+        };
+      });
+
+      const resultApp: WorkflowApplication = {
+        ...updatedApp,
+        status: targetStatus,
+        rejectReason: targetStatus === 'pending' ? undefined : updatedApp.rejectReason,
+        currentStepIndex: targetStatus === 'pending' ? 1 : updatedApp.currentStepIndex,
+        totalSteps: normalizedStepsConfig.length,
+        stepsConfig: normalizedStepsConfig,
+        approver: initialApprover,
+        flowId: updatedApp.flowId || selectedFlow?.id,
+        flowName: updatedApp.flowName || selectedFlow?.name || '標準承認フロー',
+        history: isSubmittingFromDraftOrReject ? [
+          ...(app.history || []),
+          {
+            stepNumber: 0,
+            approver: userState,
+            status: 'approved',
+            actionAt: new Date().toISOString(),
+            comment: app.status === 'draft' ? '下書きから申請提出' : '内容を修正して再申請提出'
+          }
+        ] : (updatedApp.history || app.history || [])
+      };
+      finalAppObj = resultApp;
+      return resultApp;
+    }));
+
+    if (finalAppObj) {
+      // 下書きからの提出・却下からの再申請時、OR候補全員に通知を配信
+      const prevExisting = applications.find(a => a.id === updatedApp.id);
+      const wasDraftOrReject = prevExisting && (prevExisting.status === 'draft' || prevExisting.status === 'rejected');
+      if (wasDraftOrReject && finalAppObj.status === 'pending' && finalAppObj.stepsConfig?.[0]) {
+        const resubmitCtx = {
+          offices,
+          applicationOfficeId: finalAppObj.officeId,
+          applicationLocation: finalAppObj.location,
+        };
+        const resubmitCandidates = resolveApproversForStep(finalAppObj.applicant, finalAppObj.stepsConfig[0], usersList, resubmitCtx);
+        const recMap = new Map<string, User>();
+        for (const u of (resubmitCandidates.length > 0 ? resubmitCandidates : (finalAppObj.approver ? [finalAppObj.approver] : []))) {
+          if (!u?.id || String(u.id) === String(finalAppObj.applicant.id)) continue;
+          const hydrated = usersList.find(usr => String(usr.id) === String(u.id)) || u;
+          recMap.set(String(hydrated.id), hydrated);
+        }
+        const recs = Array.from(recMap.values());
+        const isMultiOr = recs.length > 1;
+        if (recs.length > 0) {
+          for (const rec of recs) {
+            triggerPushNotification({
+              targetUserId: rec.id,
+              excludeUserId: finalAppObj.applicant.id,
+              title: `📋 承認依頼: ${finalAppObj.title}`,
+              body: isMultiOr
+                ? `${finalAppObj.applicant.name}さんから申請が提出されました（OR承認・いずれか1名）。`
+                : `${finalAppObj.applicant.name}さんから申請が提出されました。`,
+              url: `/?tab=workflow&appId=${finalAppObj.id}`,
+              tag: `wf-${finalAppObj.id}`
+            });
+          }
+          dispatchNotificationEmail(recs, {
+            category: 'workflow',
+            categoryLabel: 'ワークフロー',
+            title: isMultiOr ? `承認依頼（OR承認）: ${finalAppObj.title}` : `承認依頼: ${finalAppObj.title}`,
+            actorName: finalAppObj.applicant.name,
+            details: [
+              { label: '申請タイトル', value: finalAppObj.title },
+              { label: '申請者', value: finalAppObj.applicant.name },
+              ...(isMultiOr ? [{ label: '承認方式', value: `OR承認（候補: ${recs.map(r => r.name).join(' / ')} のうちいずれか1名）` }] : []),
+            ],
+            pathParams: `tab=workflow&appId=${finalAppObj.id}`,
+          }, finalAppObj.applicant);
+        }
+      }
+      try {
+        const { applicant, approver, ...restDetails } = finalAppObj as any;
+        await fetch(`${API_BASE_URL}/workflows/${updatedApp.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: finalAppObj.title,
+            applicantId: finalAppObj.applicant.id,
+            approverId: finalAppObj.approver?.id || userState.id,
+            status: finalAppObj.status,
+            category: finalAppObj.type || 'other',
+            purchaseOrderNumber: finalAppObj.purchaseOrderNumber || null,
+            constructionDate: finalAppObj.constructionDate || null,
+            linkedInventoryIssueId: finalAppObj.linkedInventoryIssueId || null,
+            details: JSON.stringify({
+              ...restDetails,
+              status: finalAppObj.status,
+              flowId: finalAppObj.flowId,
+              flowName: finalAppObj.flowName,
+              currentStepIndex: finalAppObj.currentStepIndex,
+              totalSteps: finalAppObj.totalSteps,
+              stepsConfig: finalAppObj.stepsConfig,
+              history: finalAppObj.history,
+              rejectReason: finalAppObj.rejectReason,
+              purchaseOrderNumber: finalAppObj.purchaseOrderNumber || null,
+              constructionDate: finalAppObj.constructionDate || null,
+              linkedInventoryIssueId: finalAppObj.linkedInventoryIssueId || null,
+              reason: (finalAppObj as any).reason || '',
+              purchaseItems: (finalAppObj as any).purchaseItems || [],
+              purchasePurpose: (finalAppObj as any).purchasePurpose || '',
+              purchaseTiming: (finalAppObj as any).purchaseTiming || 'urgent',
+              purchaseDueDate: (finalAppObj as any).purchaseDueDate || '',
+              purchaseVendor: (finalAppObj as any).purchaseVendor || '',
+              purchaseMethod: (finalAppObj as any).purchaseMethod || 'self',
+              purchaserDelegateUserId: (finalAppObj as any).purchaserDelegateUserId || '',
+              purchaserDelegateUser: (finalAppObj as any).purchaserDelegateUser || null,
+              leaveStart: (finalAppObj as any).leaveStart || '',
+              leaveEnd: (finalAppObj as any).leaveEnd || '',
+              expenseType: (finalAppObj as any).expenseType || '',
+              amount: (finalAppObj as any).amount || 0,
+              attachmentUrl: (finalAppObj as any).attachmentUrl || '',
+            })
+          })
+        });
+        await refetchApplications();
+      } catch (err) {
+        console.error('Failed to sync updated workflow via API:', err);
+      }
+    }
+  };
+
+  // 申請の削除処理
+  const handleDeleteApplication = async (applicationId: string) => {
+    console.log(`[DELETE WORKFLOW] 削除処理が開始されました。ID: ${applicationId}`);
+    try {
+      let deletedIds: string[] = [];
+      const stored = localStorage.getItem('deleted_workflow_ids');
+      if (stored) {
+        deletedIds = JSON.parse(stored);
+      }
+      if (!deletedIds.includes(applicationId)) {
+        deletedIds.push(applicationId);
+        localStorage.setItem('deleted_workflow_ids', JSON.stringify(deletedIds));
+      }
+    } catch (_) {}
+
+    setApplications(prevApps => prevApps.filter(app => app.id !== applicationId));
+
+    let deleteSuccess = false;
+
+    // 1. 標準的な HTTP DELETE による削除の試行
+    const deleteUrl = `${API_BASE_URL}/workflows/${applicationId}`;
+    console.log(`[DELETE WORKFLOW] ①標準HTTP DELETEリクエストを送信します。URL: ${deleteUrl}`);
+    try {
+      const response = await fetch(deleteUrl, {
+        method: 'DELETE',
+        headers: {
+          'Accept': 'application/json'
+        }
+      });
+      console.log(`[DELETE WORKFLOW] ①DELETEレスポンスステータス: ${response.status}`);
+      if (response.ok) {
+        deleteSuccess = true;
+        console.log(`[DELETE WORKFLOW] ①標準DELETEによる削除に成功しました。`);
+      } else {
+        console.warn(`[DELETE WORKFLOW] ①標準DELETEがステータス ${response.status} で失敗しました。リバースプロキシのメソッド制限を考慮し、フォールバックPOSTを実行します。`);
+      }
+    } catch (err) {
+      console.warn('[DELETE WORKFLOW] ①標準DELETEでネットワークエラーが発生しました:', err, '。フォールバックPOSTを試行します。');
+    }
+
+    // 2. リバースプロキシ制限対策としての POST /workflows/:id/delete によるフォールバック
+    if (!deleteSuccess) {
+      const postDeleteUrl = `${API_BASE_URL}/workflows/${applicationId}/delete`;
+      console.log(`[DELETE WORKFLOW] ②フォールバックPOSTリクエストを送信します。URL: ${postDeleteUrl}`);
+      try {
+        const response = await fetch(postDeleteUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }
+        });
+        console.log(`[DELETE WORKFLOW] ②POSTレスポンスステータス: ${response.status}`);
+        if (response.ok) {
+          deleteSuccess = true;
+          console.log(`[DELETE WORKFLOW] ②フォールバックPOSTによる削除に成功しました。`);
+        } else {
+          console.error(`[DELETE WORKFLOW] ②標準DELETEおよびフォールバックPOSTの両方の削除リクエストが失敗しました。`);
+        }
+      } catch (err) {
+        console.error('[DELETE WORKFLOW] ②フォールバックPOST送信中にエラーが発生しました:', err);
+      }
+    }
+
+    if (deleteSuccess) {
+      await refetchApplications();
+    }
+  };
+
+  const handleDeleteChatRoom = async (roomId: string) => {
+    try {
+      let deletedIds: string[] = [];
+      const stored = localStorage.getItem('deleted_chat_room_ids');
+      if (stored) deletedIds = JSON.parse(stored);
+      if (!deletedIds.includes(roomId)) {
+        deletedIds.push(roomId);
+        localStorage.setItem('deleted_chat_room_ids', JSON.stringify(deletedIds));
+      }
+    } catch (_) {}
+
+    setChatRooms(prevRooms => prevRooms.filter(room => room.id !== roomId));
+    try {
+      await fetch(`${API_BASE_URL}/chats/${roomId}`, {
+        method: 'DELETE'
+      });
+      await refetchChatRooms();
+    } catch (err) {
+      console.error('Failed to delete chat room via API:', err);
+    }
+  };
+
+  const handleDeleteChatMessage = async (roomId: string, messageId: string) => {
+    setChatRooms(prevRooms => prevRooms.map(room => {
+      if (room.id === roomId) {
+        return {
+          ...room,
+          messages: (room.messages || []).filter(msg => msg.id !== messageId)
+        };
+      }
+      return room;
+    }));
+
+    try {
+      await fetch(`${API_BASE_URL}/chats/messages/${messageId}`, {
+        method: 'DELETE'
+      });
+      await refetchChatRooms();
+    } catch (err) {
+      console.error('Failed to delete chat message via API:', err);
+    }
+  };
+
+
+
+  const handleUpdateRooms = async (updatedRooms: ChatRoom[]) => {
+    const prevRooms = [...chatRooms];
+    setChatRooms(updatedRooms);
+
+    try {
+      // 変更があったチャットルーム（メッセージ追加、または参加者変更）を検知して同期
+      for (const updatedRoom of updatedRooms) {
+        const originalRoom = prevRooms.find(r => r.id === updatedRoom.id);
+        
+        const isNewRoom = !originalRoom;
+        const isParticipantsChanged = isNewRoom || 
+          JSON.stringify(originalRoom.participants) !== JSON.stringify(updatedRoom.participants) ||
+          JSON.stringify(originalRoom.adminIds) !== JSON.stringify(updatedRoom.adminIds) ||
+          originalRoom.name !== updatedRoom.name ||
+          originalRoom.avatarUrl !== updatedRoom.avatarUrl;
+        
+        const originalMsgs = originalRoom?.messages || [];
+        const updatedMsgs = updatedRoom.messages || [];
+        const isMessagesChanged = originalMsgs.length !== updatedMsgs.length;
+
+        if (isParticipantsChanged || isMessagesChanged) {
+          // 1-A. 新規ルーム作成時は専用の POST /api/chats/rooms を明示的に呼び出してアイコン・管理者・参加者を初期保存
+          if (isNewRoom) {
+            try {
+              await fetch(`${API_BASE_URL}/chats/rooms`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  id: updatedRoom.id,
+                  name: updatedRoom.name,
+                  type: updatedRoom.type || 'group',
+                  avatarUrl: updatedRoom.avatarUrl || null,
+                  participants: updatedRoom.participants || [],
+                  adminIds: updatedRoom.adminIds || []
+                })
+              });
+            } catch (createErr) {
+              console.warn('[Chat] Failed to create room via /chats/rooms, falling back to PUT:', createErr);
+            }
+          }
+
+          // 1-B. チャットルーム情報（参加者、既読ステータス、アイコンなど）を PUT で更新
+          await fetch(`${API_BASE_URL}/chats/${updatedRoom.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: updatedRoom.name,
+              avatarUrl: updatedRoom.avatarUrl || null,
+              participants: updatedRoom.participants || [],
+              adminIds: updatedRoom.adminIds || [],
+              readStatus: updatedRoom.readStatus || {},
+              messages: updatedMsgs
+            })
+          });
+
+          // 2. 新着メッセージがあれば POST で同期 (クイズなどの専用API経由メッセージは二重登録を防ぐため除外)
+          if (isMessagesChanged && updatedMsgs.length > 0) {
+            const lastMsg = updatedMsgs[updatedMsgs.length - 1];
+            const isNewMsg = originalMsgs.length === 0 || !originalMsgs.some(m => m.id === lastMsg.id);
+            const isAlreadyHandledByType = lastMsg.type === 'quiz' || (lastMsg.id && String(lastMsg.id).startsWith('m_quiz_'));
+
+            if (isNewMsg && !isAlreadyHandledByType) {
+              const payload = {
+                roomId: updatedRoom.id,
+                senderId: lastMsg.sender.id,
+                message: lastMsg.content,
+                content: lastMsg.content,
+                createdAt: lastMsg.createdAt,
+                roomName: updatedRoom.name,
+                roomType: updatedRoom.type,
+                avatarUrl: updatedRoom.avatarUrl || null,
+                roomAvatarUrl: updatedRoom.avatarUrl || null,
+                adminIds: updatedRoom.adminIds || [],
+                participants: updatedRoom.participants,
+                type: lastMsg.type || 'text',
+                quizId: lastMsg.quizId || null,
+                imageUrl: lastMsg.imageUrl || null,
+                thumbnailUrl: lastMsg.thumbnailUrl || null,
+                images: lastMsg.images || null,
+                stampId: lastMsg.stampId || null,
+                stampText: lastMsg.stampText || null,
+                stampCategory: lastMsg.stampCategory || null,
+                attachments: lastMsg.attachments || []
+              };
+              let response = await fetch(`${API_BASE_URL}/chats`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+              });
+              if (!response.ok) {
+                await fetch(`${API_BASE_URL}/chats/message`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload)
+                });
+              }
+            }
+          }
+        }
+      }
+      await refetchChatRooms();
+    } catch (err) {
+      console.warn('Failed to sync chat message via API:', err);
+    }
+  };
+
+  const handleUpdateChatRooms = async (updatedRooms: ChatRoom[]) => {
+    // 楽観的UI更新: 即座にローカルStateへ反映
+    setChatRooms(updatedRooms);
+
+    try {
+      for (const room of updatedRooms) {
+        await fetch(`${API_BASE_URL}/chats/${room.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: room.name,
+            participants: room.participants || [],
+            adminIds: room.adminIds || [],
+            readStatus: room.readStatus || {},
+            messages: room.messages || []
+          })
+        });
+      }
+      await refetchChatRooms();
+    } catch (err) {
+      console.warn('Failed to update chat room read status via API:', err);
+    } finally {
+      window.dispatchEvent(new CustomEvent('notifications_updated'));
+    }
+  };
+
+
+
+  if (showAuthScreen || !isAuthenticated) {
+    return (
+      <LoginScreen
+        users={usersList}
+        offices={offices}
+        divisions={divisions}
+        positions={positions}
+        initialAuthMode={initialUrlParams.authMode || (initialUrlParams.resetToken ? 'reset-password' : initialUrlParams.inviteToken ? 'invite' : 'login')}
+        initialInviteToken={initialUrlParams.inviteToken}
+        initialResetToken={initialUrlParams.resetToken}
+        isAlreadyLoggedIn={isAuthenticated}
+        onLogin={(user, token) => {
+          handleLogin(user, token);
+          setShowAuthScreen(false);
+        }}
+        onUserRegistered={(newUser) => {
+          setUsersList(prev => [...prev, newUser]);
+        }}
+        onCancelReset={() => {
+          setShowAuthScreen(false);
+        }}
+        onRefetchUsers={refetchUsers}
+      />
+    );
+  }
+
+  return (
+    <div className={`min-h-screen ${activeTab === 'chat' ? 'h-[100dvh] flex flex-col overflow-hidden sm:h-auto sm:overflow-visible sm:block' : ''} text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-900 overflow-x-clip transition-colors duration-300`} style={{ backgroundColor: 'var(--app-bg, #f5f7fa)' }}>
+      <InstallPwaPrompt />
+      <Header 
+        searchQuery={searchQuery} 
+        onSearchChange={setSearchQuery} 
+        currentUser={userState}
+        allUsers={usersList}
+        onSwitchUser={handleSwitchUser}
+        impersonatorAdmin={impersonatorAdmin}
+        onRevertToAdmin={handleRevertToAdmin}
+        onLogout={handleLogout}
+        memos={memos}
+        applications={applications}
+        topics={topics}
+        events={events}
+        chatRooms={chatRooms}
+        reports={reports}
+        posts={posts}
+        safetyEvents={safetyEvents}
+        safetyResponses={safetyResponses}
+        projectTasks={projectTasks}
+        userRespondedSafetyEventIds={getRespondedSafetyEventIds(userState?.id)}
+        onSelectTab={handleSelectTab}
+        onOpenSettings={handleOpenPersonalSettings}
+        onNavigateToContent={handleNavigateToContent}
+        onUpdateMemos={handleUpdateMemos}
+        onUpdateTopic={handleUpdateTopic}
+        onUpdateEvent={handleUpdateEvent}
+        onUpdateRooms={handleUpdateChatRooms}
+        onToggleMobileMenu={() => setIsMobileMenuOpen(prev => !prev)}
+        onUpdateUser={handleUpdateUser}
+        activeTab={activeTab}
+      />
+
+      {/* Mobile Navigation Drawer */}
+      {isMobileMenuOpen && (
+        <div className="fixed inset-0 z-50 lg:hidden">
+          {/* Dark Backdrop */}
+          <div
+            className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs transition-opacity"
+            onClick={() => setIsMobileMenuOpen(false)}
+          />
+          {/* Drawer Content */}
+          <div className="fixed inset-y-0 left-0 w-72 max-w-[85vw] bg-white z-50 p-4 overflow-y-auto shadow-2xl flex flex-col gap-4 animate-in slide-in-from-left duration-200">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200">
+              <div
+                onClick={() => {
+                  setActiveTab('mypage');
+                  setIsMobileMenuOpen(false);
+                }}
+                className="flex items-center gap-2 cursor-pointer select-none hover:opacity-90 transition-opacity relative group/teranago-logo"
+                title={`マイページへ (TERAPO ${APP_VERSION.display})`}
+              >
+                <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-xs">
+                  <span className="text-white font-bold text-lg leading-none">T</span>
+                </div>
+                <div className="relative flex items-center">
+                  <span className="text-lg font-bold tracking-tight text-slate-800">
+                    TERA<span className="text-indigo-600">PO</span>
+                  </span>
+                  {/* バージョン表示ツールチップ */}
+                  <div className="absolute left-0 top-full mt-1.5 hidden group-hover/teranago-logo:flex items-center gap-1.5 px-2 py-0.5 bg-slate-900/95 text-white text-[10px] font-medium rounded-md shadow-xl border border-slate-700/60 backdrop-blur-xs whitespace-nowrap z-50 pointer-events-none transition-all duration-150 animate-in fade-in">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span className="font-semibold text-emerald-300">{APP_VERSION.display}</span>
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsMobileMenuOpen(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+                title="閉じる"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <Sidebar
+              posts={posts}
+              topics={topics}
+              selectedTag={selectedTag}
+              onSelectTag={(tag) => {
+                setSelectedTag(tag);
+                setIsMobileMenuOpen(false);
+              }}
+              activeTab={activeTab}
+              onChangeTab={(tab) => {
+                handleSelectTab(tab);
+                setIsMobileMenuOpen(false);
+              }}
+              currentUser={userState}
+              impersonatorAdmin={impersonatorAdmin}
+              onRevertToAdmin={handleRevertToAdmin}
+              unreadCounts={sidebarUnreadCounts}
+              isUtilityOpen={isUtilityOpen}
+              onToggleUtility={handleToggleUtilityOpen}
+              pendingPollCount={actionablePollCount}
+              onOpenSchedulePollModal={() => {
+                setShowSchedulePollModal(true);
+                setIsMobileMenuOpen(false);
+              }}
+              className="bg-white flex flex-col gap-6"
+            />
+          </div>
+        </div>
+      )}
+
+      {Object.keys(fetchErrors).length > 0 && (
+        <div className="bg-rose-50 border-b border-rose-200 py-3 px-4 text-rose-800 text-sm">
+          <div className="w-full px-4 sm:px-6 lg:px-8 flex items-start justify-between gap-4">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+              <div>
+                <span className="font-semibold text-rose-900">データ同期エラー ({Object.keys(fetchErrors).length}件):</span>
+                <p className="text-xs text-rose-700 mt-0.5">
+                  データの取得に失敗しました。APIサーバーまたはデータベースの接続状態を確認してください。
+                </p>
+                <ul className="list-disc list-inside mt-1.5 text-xs text-rose-700 space-y-0.5">
+                  {Object.entries(fetchErrors).map(([key, msg]) => (
+                    <li key={key}><span className="font-medium text-rose-800">{key}:</span> {msg}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+            <button 
+              onClick={() => { setFetchErrors({}); refetchAll(); }}
+              className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded-md text-xs font-medium transition shrink-0 flex items-center gap-1.5 shadow-sm"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              再試行
+            </button>
+          </div>
+        </div>
+      )}
+
+      <main className={`w-full ${activeTab === 'chat' ? 'p-0 sm:px-6 lg:px-8 sm:py-6 flex-1 min-h-0' : activeTab === 'calendar' ? 'px-2 py-2 sm:px-6 lg:px-8 sm:py-6' : 'px-4 sm:px-6 lg:px-8 py-6'} flex flex-col lg:flex-row gap-6 transition-all duration-300`}>
+        
+        {/* Left Sidebar Column / Restore Button */}
+        {!isSidebarCollapsed ? (
+          <aside className="hidden lg:block lg:w-64 shrink-0 transition-all duration-300">
+            <Sidebar
+              posts={posts}
+              topics={topics}
+              selectedTag={selectedTag}
+              onSelectTag={setSelectedTag}
+              activeTab={activeTab}
+              onChangeTab={handleSelectTab}
+              currentUser={userState}
+              impersonatorAdmin={impersonatorAdmin}
+              onRevertToAdmin={handleRevertToAdmin}
+              unreadCounts={sidebarUnreadCounts}
+              isUtilityOpen={isUtilityOpen}
+              onToggleUtility={handleToggleUtilityOpen}
+              pendingPollCount={pendingSchedulePolls.length}
+              onOpenSchedulePollModal={() => setShowSchedulePollModal(true)}
+              onCollapse={() => handleToggleSidebarCollapse(true)}
+            />
+          </aside>
+        ) : (
+          <div className="hidden lg:block shrink-0 transition-all duration-300">
+            <button
+              type="button"
+              onClick={() => handleToggleSidebarCollapse(false)}
+              className="sticky top-24 p-2.5 bg-white hover:bg-slate-50 border border-slate-200 text-slate-500 hover:text-slate-700 rounded-xl shadow-xs hover:shadow-sm transition-all duration-200 flex items-center justify-center group cursor-pointer"
+              title="メニューを表示"
+            >
+              <svg className="w-4 h-4 fill-current text-indigo-600 group-hover:scale-110 transition-transform" viewBox="0 0 24 24">
+                <path d="M10 17l5-5-5-5v10z" />
+              </svg>
+            </button>
+          </div>
+        )}
+
+        {/* Main Content Area */}
+        <Suspense fallback={<LazyTabFallback message="画面を読み込み中..." />}>
+          {activeTab === 'timeline' && (
+            <Timeline 
+              posts={posts}
+              events={events}
+              topics={topics}
+              offices={offices}
+              divisions={divisions}
+              searchQuery={searchQuery}
+              selectedTag={selectedTag}
+              onPost={handlePost}
+              onToggleLike={handleToggleLike}
+              onSelectTag={setSelectedTag}
+              onChangeTab={handleSelectTab}
+              isLoading={isPostsLoading}
+              error={postsError}
+              onRefetchPosts={refetchAll}
+              onDeletePost={handleDeletePost}
+              currentUser={userState}
+              onUpdateUser={handleUpdateUser}
+            />
+          )}
+          {activeTab === 'calendar' && (
+            <Calendar 
+              events={events}
+              onAddEvent={handleAddEvent}
+              onUpdateEvent={handleUpdateEvent}
+              onDeleteEvent={handleDeleteEvent}
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+              initialEventId={targetEventId}
+              onClearInitialEventId={() => setTargetEventId(undefined)}
+              initialOffice={calendarParams.office}
+              initialDivision={calendarParams.division}
+              initialGroupId={calendarParams.groupId}
+              initialMode={calendarParams.mode}
+              initialView={calendarParams.view}
+              initialDate={calendarParams.date}
+              initialTypeFilter={calendarParams.type}
+              initialTargetUserId={calendarParams.targetUserId}
+              targetUserRequestKey={calendarParams.requestKey}
+              memos={memos}
+              onUpdateMemos={handleUpdateMemos}
+              onRefetchEvents={(opts) => refetchEvents(usersList, false, opts)}
+              onNavigateToInspectionScheduler={() => setActiveTab('inspection_scheduler')}
+              onNavigateToSite={handleNavigateToSite}
+              onNavigateToAsset={(assetId, subTab: 'details' | 'inspections' | 'history' = 'inspections') =>
+                handleNavigateToContent({
+                  tab: 'assets',
+                  assetId,
+                  assetSubTab: subTab,
+                })
+              }
+              pendingPollCount={pendingSchedulePolls.length}
+              openSchedulePolls={openSchedulePolls}
+              onOpenSchedulePollModal={(pollId?: string) => {
+                setInitialSchedulePollId(pollId || null);
+                setShowSchedulePollModal(true);
+              }}
+              onUpdateUser={handleUpdateUser}
+            />
+          )}
+          {activeTab === 'inspection_scheduler' && (
+            <InspectionScheduler
+              allUsers={usersList}
+              currentUser={userState}
+              offices={offices}
+              divisions={divisions}
+              events={events}
+              onAddEvents={(newEvents) => {
+                newEvents.forEach((evt) => {
+                  const { id, ...eventData } = evt;
+                  handleAddEvent(eventData);
+                });
+              }}
+              onUpdateEvent={handleUpdateEvent}
+              onDeleteEvent={handleDeleteEvent}
+              onNavigateToCalendar={() => setActiveTab('calendar')}
+            />
+          )}
+          {activeTab === 'inspection_report' && (
+            <InspectionReportTab
+              currentUser={userState}
+              allUsers={usersList}
+              events={events}
+              offices={offices}
+              divisions={divisions}
+              applications={applications}
+              onAddApplication={handleAddApplication}
+              onUpdateApplication={handleUpdateApplication}
+              approvalFlows={approvalFlows}
+              itemMasters={itemMasters}
+            />
+          )}
+          {activeTab === 'site_management' && (
+            <SiteManagement
+              currentUser={userState}
+              allUsers={usersList}
+              events={events}
+              initialSiteId={targetSiteId}
+              onClearInitialSiteId={() => setTargetSiteId(undefined)}
+              onNavigateToCalendar={handleNavigateToCalendar}
+            />
+          )}
+          {activeTab === 'assets' && (
+            <AssetManagement
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+              initialAssetId={targetAssetId}
+              initialAssetParams={assetParams}
+              onClearInitialAssetId={() => setTargetAssetId(undefined)}
+              onUpdateUser={handleUpdateUser}
+            />
+          )}
+          {activeTab === 'projects' && (
+            <ProjectManagement
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+              initialProjectId={targetProjectId}
+              initialTaskId={targetTaskId}
+              initialProjectView={projectViewParam}
+              onClearInitialParams={() => {
+                setTargetProjectId(undefined);
+                setTargetTaskId(undefined);
+                setProjectViewParam(undefined);
+              }}
+              onUpdateUser={handleUpdateUser}
+            />
+          )}
+          {activeTab === 'workflow' && (
+            <Workflow 
+              applications={applications}
+              onAddApplication={handleAddApplication}
+              onUpdateApplication={handleUpdateApplication}
+              onDeleteApplication={handleDeleteApplication}
+              allUsers={usersList}
+              currentUser={userState}
+              approvalFlows={approvalFlows}
+              onWorkflowAction={handleWorkflowAction}
+              itemMasters={itemMasters}
+              initialAppId={targetApplicationId}
+              offices={offices}
+            />
+          )}
+          {activeTab === 'board' && (
+            <Board
+              topics={topics}
+              onAddTopic={handleAddTopic}
+              onUpdateTopic={handleUpdateTopic}
+              onDeleteTopic={handleDeleteTopic}
+              currentUser={userState}
+              offices={offices}
+              divisions={divisions}
+              initialTopicId={targetTopicId}
+              onClearInitialTopicId={() => setTargetTopicId(undefined)}
+              onUpdateUser={handleUpdateUser}
+            />
+          )}
+          {activeTab === 'chat' && (
+            <Chat 
+              rooms={chatRooms} 
+              users={usersList}
+              currentUser={userState}
+              offices={offices}
+              divisions={divisions}
+              onUpdateRooms={handleUpdateRooms}
+              onDeleteRoom={handleDeleteChatRoom}
+              onDeleteMessage={handleDeleteChatMessage}
+              initialRoomId={targetChatRoomId}
+              onClearInitialRoomId={() => setTargetChatRoomId(undefined)}
+              refetchRooms={refetchChatRooms}
+              onUpdateUser={handleUpdateUser}
+            />
+          )}
+          {activeTab === 'memo' && (
+            <MemoList 
+              memos={memos}
+              offices={offices}
+              divisions={divisions}
+              users={usersList}
+              currentUser={userState}
+              onUpdateMemos={handleUpdateMemos}
+              onDeleteMemo={handleDeleteMemo}
+              onAddComment={handleAddMemoComment}
+              onDeleteComment={handleDeleteMemoComment}
+              initialMemoId={targetMemoId}
+              onClearInitialMemoId={() => setTargetMemoId(undefined)}
+              initialOpenCreate={autoOpenCreateMemo}
+              initialRecipientId={memoInitialRecipientId}
+              onCloseCreateModal={() => {
+                setAutoOpenCreateMemo(false);
+                setMemoInitialRecipientId(undefined);
+              }}
+              onSelectUser={handleOpenUserDetail}
+            />
+          )}
+          {activeTab === 'documents' && (
+            <DocumentManager 
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+            />
+          )}
+          {activeTab === 'members' && (
+            <UserDirectory
+              users={usersList}
+              offices={offices}
+              divisions={divisions}
+              currentUser={userState}
+              onSelectUser={handleOpenUserDetail}
+              onSendMemo={handleSendMemoFromModal}
+              onViewSchedule={handleViewScheduleFromModal}
+              onOpenChat={handleOpenChatFromModal}
+            />
+          )}
+          {activeTab === 'daily_report' && (
+            <DailyReportView 
+              reports={reports} 
+              onAddReport={handleAddReport}
+              onUpdateReport={handleUpdateReport}
+              onReviewReport={handleReviewReport}
+              onDeleteReport={handleDeleteReport}
+              currentUser={userState}
+              allUsers={usersList}
+              divisions={divisions}
+              refetchReports={refetchReports}
+              calendarEvents={events}
+              initialReportId={targetReportId}
+              applications={applications}
+              onAddApplication={handleAddApplication}
+              onUpdateApplication={handleUpdateApplication}
+              approvalFlows={approvalFlows}
+              itemMasters={itemMasters}
+              offices={offices}
+              positions={positions}
+            />
+          )}
+          {activeTab === 'files' && (
+            <FileManager 
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+            />
+          )}
+          {activeTab === 'safety_confirmation' && (
+            <SafetyConfirmation
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+              onOpenConfirmModal={handleOpenConfirmModal}
+              initialEventId={targetSafetyEventId}
+            />
+          )}
+          {activeTab === 'photo_reports' && (
+            <PhotoReportsTab
+              currentUser={userState}
+              allUsers={usersList}
+              events={events}
+            />
+          )}
+          {activeTab === 'mypage' && (
+            <MyPage 
+              user={userState} 
+              events={events}
+              topics={topics}
+              memos={memos}
+              applications={applications}
+              chatRooms={chatRooms}
+              reports={reports}
+              offices={offices}
+              divisions={divisions}
+              positions={positions}
+              allUsers={usersList}
+              onChangeTab={handleSelectTab}
+              onNavigateToContent={handleNavigateToContent}
+              onUpdateUser={handleUpdateUser}
+              onUpdateMemo={handleUpdateMemos}
+              onUpdateTopic={handleUpdateTopic}
+              onUpdateApplication={(updatedApp) => {
+                if (updatedApp.status === 'approved' || updatedApp.status === 'rejected') {
+                  handleWorkflowAction(updatedApp.id, updatedApp.status);
+                } else {
+                  setApplications(applications.map(a => a.id === updatedApp.id ? updatedApp : a));
+                }
+              }}
+              onLogout={handleLogout}
+              impersonatorAdmin={impersonatorAdmin}
+              onRevertToAdmin={handleRevertToAdmin}
+              autoOpenSettings={autoOpenSettings}
+              onCloseSettings={() => setAutoOpenSettings(false)}
+              autoOpenEmergencyContact={autoOpenEmergencyContact}
+              onCloseEmergencyContact={() => setAutoOpenEmergencyContact(false)}
+              onAddEvent={handleAddEvent}
+              onUpdateEvent={handleUpdateEvent}
+              onDeleteEvent={handleDeleteEvent}
+              onAddTopic={handleAddTopic}
+              onAddApplication={handleAddApplication}
+              approvalFlows={approvalFlows}
+              itemMasters={itemMasters}
+              schedulePolls={openSchedulePolls}
+              pendingSchedulePolls={pendingSchedulePolls}
+              onOpenSchedulePollModal={(pollId?: string) => {
+                setInitialSchedulePollId(pollId || null);
+                setShowSchedulePollModal(true);
+              }}
+              projectSummary={projectSummary}
+              isProjectSummaryLoading={isProjectSummaryLoading}
+              onUpdateProjectSummary={setProjectSummary}
+            />
+          )}
+          {activeTab === 'admin' && (
+            <AdminPanel 
+              currentUser={userState}
+              allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
+              positions={positions}
+              approvalFlows={approvalFlows}
+              itemMasters={itemMasters}
+              applications={applications}
+              onDeleteApplication={handleDeleteApplication}
+              onAddOffice={handleAddOffice}
+              onUpdateOffice={handleUpdateOffice}
+              onDeleteOffice={handleDeleteOffice}
+              onAddDivision={handleAddDivision}
+              onUpdateDivision={handleUpdateDivision}
+              onDeleteDivision={handleDeleteDivision}
+              onAddPosition={handleAddPosition}
+              onUpdatePosition={handleUpdatePosition}
+              onDeletePosition={handleDeletePosition}
+              onAddUser={handleAddUser}
+              onUpdateUser={handleUpdateUser}
+              onDeleteUser={handleDeleteUser}
+              onToggleUserAdmin={handleToggleUserAdmin}
+              onSwitchUser={handleSwitchUser}
+              impersonatorAdmin={impersonatorAdmin}
+              onRevertToAdmin={handleRevertToAdmin}
+              onAddApprovalFlow={handleAddApprovalFlow}
+              onUpdateApprovalFlow={handleUpdateApprovalFlow}
+              onDeleteApprovalFlow={handleDeleteApprovalFlow}
+              onAddItemMaster={handleAddItemMaster}
+              onUpdateItemMaster={handleUpdateItemMaster}
+              onDeleteItemMaster={handleDeleteItemMaster}
+            />
+          )}
+        </Suspense>
+      </main>
+
+      <ConfirmModal
+        {...confirmModal}
+        onClose={() => setConfirmModal(prev => ({ ...prev, isOpen: false }))}
+      />
+
+      {/* グローバル詳細ポップアップ */}
+      {globalSelectedEvent && (
+        <GlobalEventDetailModal
+          isOpen={!!globalSelectedEvent}
+          event={globalSelectedEvent}
+          currentUser={userState}
+          onNavigateToSite={handleNavigateToSite}
+          onClose={() => setGlobalSelectedEvent(null)}
+          onEditInCalendar={(eventId) => {
+            // カレンダータブへ遷移して指定イベントを展開
+            setActiveTab('calendar');
+            setTargetEventId(eventId);
+          }}
+          onDelete={(evt, scope, instanceDate) => {
+            handleDeleteEvent(evt.id, scope || 'all', instanceDate || evt.instanceDate);
+            setGlobalSelectedEvent(null);
+          }}
+        />
+      )}
+
+      {globalSelectedTopic && (
+        <TopicDetailModal
+          isOpen={!!globalSelectedTopic}
+          topic={globalSelectedTopic}
+          currentUser={userState}
+          onClose={() => setGlobalSelectedTopic(null)}
+          onUpdateTopic={(updated) => {
+            setGlobalSelectedTopic(updated);
+            handleUpdateTopic(updated);
+          }}
+          offices={offices}
+          divisions={divisions}
+          users={usersList}
+          onUpdateUser={handleUpdateUser}
+        />
+      )}
+
+      {globalSelectedMemo && (
+        <GlobalMemoDetailModal
+          isOpen={!!globalSelectedMemo}
+          memo={memos.find(m => m.id === globalSelectedMemo.id) || globalSelectedMemo}
+          currentUser={userState}
+          onClose={() => setGlobalSelectedMemo(null)}
+          onAddComment={handleAddMemoComment}
+          onDeleteComment={handleDeleteMemoComment}
+          onToggleStatus={(memoId) => {
+            // メモの未読/対応トグル処理
+            const updated = memos.map((m) => {
+              if (m.id === memoId) {
+                const nowIso = new Date().toISOString();
+                const statuses = m.recipientStatuses || [];
+                const isRecipient = statuses.some((st) => st.userId === userState.id);
+
+                if (!isRecipient) {
+                  // 宛先メンバーでない場合はステータス配列を改変しない
+                  return m;
+                }
+
+                const myStatus = statuses.find((st) => st.userId === userState.id);
+                const nextHandled = !myStatus?.isHandled;
+
+                // キャッシュ同期
+                if (nextHandled) {
+                  markMemoAsRead(userState.id, memoId);
+                } else {
+                  markMemoAsUnread(userState.id, memoId);
+                }
+
+                const nextRecipientStatuses = statuses.map((st) => {
+                  if (st.userId === userState.id) {
+                    return {
+                      ...st,
+                      isViewed: true,
+                      viewedAt: st.viewedAt || nowIso,
+                      isHandled: nextHandled,
+                      handledAt: nextHandled ? nowIso : undefined,
+                      handledByUserId: nextHandled ? userState.id : undefined,
+                      handledByUserName: nextHandled ? userState.name : undefined,
+                      status: nextHandled ? ('handled' as const) : ('read' as const),
+                    };
+                  }
+                  return st;
+                });
+
+                // 全員が対応完了しているかチェック
+                const allHandled = nextRecipientStatuses.length > 0 && nextRecipientStatuses.every((s) => s.isHandled);
+                const nextOverallStatus = allHandled ? ('handled' as const) : ('read' as const);
+
+                return {
+                  ...m,
+                  status: nextOverallStatus,
+                  recipientStatuses: nextRecipientStatuses,
+                };
+              }
+              return m;
+            });
+            handleUpdateMemos(updated);
+            
+            // ポップアップ側の状態も更新
+            const updatedMemo = updated.find(m => m.id === memoId);
+            if (updatedMemo) {
+              setGlobalSelectedMemo(updatedMemo);
+            }
+          }}
+        />
+      )}
+
+      {/* グローバル日報・週報詳細モーダル */}
+      {globalSelectedReport && (
+        <GlobalReportDetailModal
+          report={globalSelectedReport}
+          currentUser={userState}
+          allUsers={usersList}
+          onClose={() => setGlobalSelectedReport(null)}
+          onReviewReport={async (id, comment) => {
+            await handleReviewReport(id, comment);
+            setGlobalSelectedReport(prev => prev && prev.id === id ? { ...prev, status: 'reviewed', feedbackComment: comment, reviewedAt: new Date().toISOString() } : prev);
+          }}
+          onNavigateToEdit={(reportId) => {
+            setActiveTab('daily_report');
+            setTargetReportId(reportId);
+          }}
+          onOpenFullTab={(reportId) => {
+            setActiveTab('daily_report');
+            setTargetReportId(reportId);
+          }}
+        />
+      )}
+
+      {/* グローバルワークフロー申請詳細モーダル */}
+      {globalSelectedApplication && (
+        <GlobalWorkflowDetailModal
+          isOpen={!!globalSelectedApplication}
+          application={globalSelectedApplication}
+          currentUser={userState}
+          allUsers={usersList}
+          offices={offices}
+          onClose={() => setGlobalSelectedApplication(null)}
+          onWorkflowAction={async (id, status, comment) => {
+            await handleWorkflowAction(id, status, comment);
+            const updated = applications.find(a => a.id === id);
+            if (updated) {
+              setGlobalSelectedApplication(updated);
+            }
+          }}
+          onUpdateApplication={async (app) => {
+            await handleUpdateApplication(app);
+            setGlobalSelectedApplication(app);
+          }}
+          onNavigateToWorkflow={(appId) => {
+            setGlobalSelectedApplication(null);
+            setActiveTab('workflow');
+            setTargetApplicationId(appId);
+          }}
+          onOpenEditModal={(app) => {
+            setGlobalSelectedApplication(null);
+            setActiveTab('workflow');
+            setTargetApplicationId(app.id);
+          }}
+        />
+      )}
+
+      {/* 社員明細ポップアップモーダル */}
+      {globalSelectedUser && (
+        <UserDetailModal
+          isOpen={!!globalSelectedUser}
+          user={globalSelectedUser}
+          onClose={() => setGlobalSelectedUser(null)}
+          onSendMemo={handleSendMemoFromModal}
+          onViewSchedule={handleViewScheduleFromModal}
+          onOpenChat={handleOpenChatFromModal}
+          currentUser={userState}
+        />
+      )}
+
+      {/* 日程調整アシスタントモーダル */}
+      {showSchedulePollModal && userState && (
+        <SchedulePollModal
+          isOpen={showSchedulePollModal}
+          onClose={() => {
+            setShowSchedulePollModal(false);
+            setInitialSchedulePollId(null);
+          }}
+          currentUser={userState}
+          users={usersList}
+          offices={offices}
+          divisions={divisions}
+          onEventCreated={refetchEvents}
+          initialPollId={initialSchedulePollId}
+          onPollChange={refetchSchedulePolls}
+        />
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,401 @@
+import { useState, useCallback } from 'react';
+import { API_BASE_URL } from '../config/api';
+import { fetchWithRetry } from '../utils/fetchWithRetry';
+import { Memo, User, MemoComment } from '../types';
+
+export interface UseMemoManagementOptions {
+  currentUser: User | null;
+  usersList: User[];
+  onRecordError?: (source: string, msg: string) => void;
+  onClearError?: (source: string) => void;
+}
+
+export function useMemoManagement({
+  currentUser,
+  usersList,
+  onRecordError,
+  onClearError,
+}: UseMemoManagementOptions) {
+  const [memos, setMemos] = useState<Memo[]>([]);
+
+  const refetchMemos = useCallback(async (
+    currentUsers = usersList,
+    options?: { limit?: number; offset?: number; all?: boolean }
+  ) => {
+    try {
+      const params = new URLSearchParams();
+      if (options?.all) {
+        params.set('all', 'true');
+      } else {
+        params.set('limit', String(options?.limit || 300));
+        if (options?.offset) params.set('offset', String(options.offset));
+      }
+      const queryStr = params.toString();
+      const response = await fetchWithRetry(`${API_BASE_URL}/memos${queryStr ? `?${queryStr}` : ''}`, {
+        headers: { 'Accept': 'application/json' }
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP status ${response.status}`);
+      }
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        let deletedMemoIds: string[] = [];
+        try {
+          const stored = localStorage.getItem('deleted_memo_ids');
+          if (stored) deletedMemoIds = JSON.parse(stored);
+        } catch (_) {}
+        const deletedSet = new Set(deletedMemoIds.map(String));
+
+        const activeUsers = currentUsers;
+        const userMap = new Map<string, User>();
+        for (let i = 0; i < activeUsers.length; i++) {
+          const u = activeUsers[i];
+          if (u && u.id) userMap.set(String(u.id), u);
+        }
+        const fallbackUser = activeUsers[0];
+
+        const mapped = data
+          .filter((m: any) => !deletedSet.has(String(m.id)))
+          .map((m: any) => {
+            let detailsObj: any = {};
+            if (m.details) {
+              if (typeof m.details === 'object') {
+                detailsObj = m.details;
+              } else if (typeof m.details === 'string') {
+                try { detailsObj = JSON.parse(m.details); } catch (_) {}
+              }
+            }
+            if (m.content && typeof m.content === 'string' && m.content.startsWith('{')) {
+              try { detailsObj = { ...detailsObj, ...JSON.parse(m.content) }; } catch (_) {}
+            }
+            const targetUserId = m.receiverId || m.toUserId;
+            const targetUser = (targetUserId ? userMap.get(String(targetUserId)) : undefined) || fallbackUser;
+
+            // Determine overall status
+            const isHandledStatus = m.status === 'handled' || (detailsObj && detailsObj.status === 'handled');
+            const isReadStatus = isHandledStatus || m.status === 'read' || (detailsObj && detailsObj.status === 'read') || m.isRead === 1 || m.isRead === true;
+
+            const defaultRecipientStatus = [{
+              userId: targetUser?.id || 'u1',
+              userName: targetUser?.name || '担当者',
+              avatarUrl: targetUser?.avatarUrl || '',
+              department: targetUser?.department || '',
+              office: targetUser?.office || '',
+              division: targetUser?.division || '',
+              isViewed: isReadStatus,
+              isHandled: isHandledStatus
+            }];
+
+            // Parse recipientStatusesJson / recipient_statuses_json / recipientStatuses
+            let parsedRecipientStatuses: any[] | null = null;
+            const repJson = m.recipientStatusesJson || m.recipient_statuses_json || m.recipientStatuses || (detailsObj && (detailsObj.recipientStatuses || detailsObj.recipientStatusesJson || detailsObj.recipient_statuses_json));
+            if (repJson) {
+              try {
+                const parsed = typeof repJson === 'string' ? JSON.parse(repJson) : repJson;
+                if (Array.isArray(parsed)) {
+                  parsedRecipientStatuses = parsed;
+                } else if (parsed && typeof parsed === 'object') {
+                  // DB stores as { "u3": { "isRead": false, "readAt": null } }
+                  parsedRecipientStatuses = Object.entries(parsed).map(([uid, val]: [string, any]) => {
+                    const uObj = userMap.get(String(uid));
+                    return {
+                      userId: uid,
+                      userName: uObj?.name || '担当者',
+                      avatarUrl: uObj?.avatarUrl || '',
+                      department: uObj?.department || '',
+                      office: uObj?.office || '',
+                      division: uObj?.division || '',
+                      isViewed: val.isRead || val.isViewed || false,
+                      viewedAt: val.readAt || val.viewedAt || undefined,
+                      isHandled: val.isHandled !== undefined ? !!val.isHandled : false,
+                      handledAt: val.handledAt || undefined,
+                    };
+                  });
+                }
+              } catch (_) {}
+            }
+
+            const mergedRecipientStatuses = (parsedRecipientStatuses && parsedRecipientStatuses.length > 0)
+              ? parsedRecipientStatuses
+              : defaultRecipientStatus;
+
+            const mergedTargetOffices = (Array.isArray(m.targetOffices) && m.targetOffices.length > 0)
+              ? m.targetOffices
+              : (detailsObj && Array.isArray(detailsObj.targetOffices) ? detailsObj.targetOffices : []);
+
+            const mergedTargetDivisions = (Array.isArray(m.targetDivisions) && m.targetDivisions.length > 0)
+              ? m.targetDivisions
+              : (detailsObj && Array.isArray(detailsObj.targetDivisions) ? detailsObj.targetDivisions : []);
+
+            let parsedToUsers: any[] | null = null;
+            const toUsersJsonStr = m.toUsersJson || m.to_users_json;
+            if (toUsersJsonStr) {
+              try {
+                const parsed = typeof toUsersJsonStr === 'string' ? JSON.parse(toUsersJsonStr) : toUsersJsonStr;
+                if (Array.isArray(parsed)) {
+                  parsedToUsers = parsed.map((uid: string) => userMap.get(String(uid))).filter(Boolean);
+                }
+              } catch (_) {}
+            }
+
+            const mergedToUsers = parsedToUsers || (Array.isArray(m.toUsers) ? m.toUsers : (detailsObj && Array.isArray(detailsObj.toUsers) ? detailsObj.toUsers : (targetUser ? [targetUser] : [])));
+
+            let parsedComments: MemoComment[] = [];
+            const commSource = m.comments || m.commentsJson || (detailsObj && (detailsObj.comments || detailsObj.commentsJson));
+            if (commSource) {
+              if (Array.isArray(commSource)) {
+                parsedComments = commSource;
+              } else if (typeof commSource === 'string') {
+                try { parsedComments = JSON.parse(commSource); } catch (_) {}
+              }
+            }
+
+            const senderUserId = m.senderId || (detailsObj && detailsObj.senderId);
+            return {
+              id: String(m.id),
+              fromName: m.fromName || (detailsObj && detailsObj.fromName) || '不詳',
+              fromCompany: m.fromCompany || (detailsObj && detailsObj.fromCompany) || '',
+              fromPhone: m.fromPhone || (detailsObj && detailsObj.fromPhone) || '',
+              content: m.content || (detailsObj && detailsObj.content) || '',
+              createdAt: m.createdAt || (detailsObj && detailsObj.createdAt) || new Date().toISOString(),
+              ...detailsObj,
+              ...m,
+              targetOffices: mergedTargetOffices,
+              targetDivisions: mergedTargetDivisions,
+              recipientStatuses: mergedRecipientStatuses,
+              toUsers: mergedToUsers,
+              toUser: targetUser,
+              createdByUser: senderUserId ? userMap.get(String(senderUserId)) : undefined,
+              status: m.status ? m.status : ((detailsObj && detailsObj.status) ? detailsObj.status : (isHandledStatus ? 'handled' : (isReadStatus ? 'read' : 'unread'))),
+              comments: parsedComments,
+            };
+          });
+
+        setMemos(mapped);
+        onClearError?.('memos');
+      }
+    } catch (err: any) {
+      console.warn('Failed to load memos from API:', err);
+      onRecordError?.('memos', `伝言メモ取得エラー: ${err?.message || '接続エラー'}`);
+    }
+  }, [usersList, onClearError, onRecordError]);
+
+  const handleDeleteMemo = useCallback(async (memoId: string) => {
+    try {
+      let deletedIds: string[] = [];
+      const stored = localStorage.getItem('deleted_memo_ids');
+      if (stored) deletedIds = JSON.parse(stored);
+      if (!deletedIds.includes(memoId)) {
+        deletedIds.push(memoId);
+        localStorage.setItem('deleted_memo_ids', JSON.stringify(deletedIds));
+      }
+    } catch (_) {}
+
+    setMemos(prevMemos => prevMemos.filter(memo => memo.id !== memoId));
+    try {
+      const res = await fetch(`${API_BASE_URL}/memos/${memoId}`, {
+        method: 'DELETE'
+      });
+      if (!res.ok) {
+        await refetchMemos();
+      }
+    } catch (err) {
+      console.error('Failed to delete memo via API:', err);
+      await refetchMemos();
+    }
+  }, [refetchMemos]);
+
+  const handleUpdateMemos = useCallback(async (updatedMemos: any[]) => {
+    // 1. 楽観的UIアップデート
+    setMemos(updatedMemos);
+    window.dispatchEvent(new CustomEvent('notifications_updated'));
+
+    try {
+      const origMap = new Map<string, Memo>();
+      for (let i = 0; i < memos.length; i++) {
+        origMap.set(String(memos[i].id), memos[i]);
+      }
+
+      const changedMemos = updatedMemos.filter(updatedMemo => {
+        const originalMemo = origMap.get(String(updatedMemo.id));
+        if (!originalMemo) return true; // 新規メモ
+
+        const isStatusChanged = originalMemo.status !== updatedMemo.status;
+        const isRecipientStatusesChanged = JSON.stringify(originalMemo.recipientStatuses) !== JSON.stringify(updatedMemo.recipientStatuses);
+        
+        return isStatusChanged || isRecipientStatusesChanged;
+      });
+
+      if (changedMemos.length === 0) {
+        return;
+      }
+
+      let hasCreatedNewMemo = false;
+
+      await Promise.all(
+        changedMemos.map(async (memo) => {
+          const recipientStatusesJsonStr = JSON.stringify(memo.recipientStatuses);
+          if (!origMap.has(String(memo.id))) {
+            hasCreatedNewMemo = true;
+            // 新規メモ作成
+            await fetch(`${API_BASE_URL}/memos`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: memo.id,
+                senderId: currentUser?.id || 'u1',
+                receiverId: memo.toUserId || memo.toUser?.id || 'u1',
+                fromName: memo.fromName,
+                fromCompany: memo.fromCompany,
+                fromPhone: memo.fromPhone,
+                content: memo.content,
+                requirementType: memo.requirementType || 'phone_called',
+                requirementText: memo.requirementText || '',
+                recipientStatusesJson: recipientStatusesJsonStr,
+                recipient_statuses_json: recipientStatusesJsonStr,
+                recipientStatuses: recipientStatusesJsonStr,
+                details: {
+                  requirementType: memo.requirementType,
+                  requirementText: memo.requirementText,
+                  targetOffices: memo.targetOffices,
+                  targetDivisions: memo.targetDivisions,
+                  recipientStatuses: memo.recipientStatuses,
+                },
+                isRead: (memo.status === 'handled' || memo.status === 'read') ? 1 : 0,
+                status: memo.status,
+                createdAt: memo.createdAt || new Date().toISOString()
+              })
+            });
+          } else {
+            // 既存メモの更新
+            try {
+              const res = await fetch(`${API_BASE_URL}/memos/${memo.id}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  isRead: (memo.status === 'handled' || memo.status === 'read') ? 1 : 0,
+                  status: memo.status,
+                  recipientStatuses: memo.recipientStatuses,
+                  recipientStatusesJson: recipientStatusesJsonStr,
+                  recipient_statuses_json: recipientStatusesJsonStr,
+                  details: {
+                    requirementType: memo.requirementType,
+                    requirementText: memo.requirementText,
+                    targetOffices: memo.targetOffices,
+                    targetDivisions: memo.targetDivisions,
+                    recipientStatuses: memo.recipientStatuses,
+                    status: memo.status
+                  }
+                })
+              });
+              if (!res.ok && res.status === 404) {
+                // 古いサーバー用フォールバック (/memos/:id/read)
+                await fetch(`${API_BASE_URL}/memos/${memo.id}/read`, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    userId: currentUser?.id,
+                    isHandled: memo.status === 'handled'
+                  })
+                }).catch(() => {});
+              }
+            } catch (putErr) {
+              console.warn('PUT /memos error:', putErr);
+            }
+          }
+        })
+      );
+
+      // 新規作成時のみサーバーID同期のため再取得（既存メモの既読・対応済変更時は楽観的UI状態を維持し全件再取得を省略）
+      if (hasCreatedNewMemo) {
+        await refetchMemos();
+      }
+    } catch (err) {
+      console.warn('Failed to sync memos via API:', err);
+      await refetchMemos();
+    } finally {
+      window.dispatchEvent(new CustomEvent('notifications_updated'));
+    }
+  }, [currentUser?.id, memos, refetchMemos]);
+
+  // 伝言メモコメント追加（公開・非公開[宛先担当者本人のみ閲覧]対応）
+  const handleAddMemoComment = useCallback(async (memoId: string, content: string, isPrivate: boolean) => {
+    if (!currentUser || !content.trim()) return;
+    const newComment: MemoComment = {
+      id: `mcomm-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      memoId,
+      author: currentUser,
+      content: content.trim(),
+      isPrivate,
+      createdAt: new Date().toISOString()
+    };
+
+    // 楽観的UI更新
+    setMemos(prev => prev.map(m => {
+      if (m.id === memoId) {
+        const comments = Array.isArray(m.comments) ? [...m.comments, newComment] : [newComment];
+        return { ...m, comments };
+      }
+      return m;
+    }));
+
+    try {
+      const res = await fetchWithRetry(`${API_BASE_URL}/memos/${memoId}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: content.trim(),
+          isPrivate,
+          author: currentUser
+        })
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP status ${res.status}`);
+      }
+    } catch (err) {
+      console.warn('Failed to add memo comment:', err);
+      refetchMemos();
+    }
+  }, [currentUser, refetchMemos]);
+
+  // 伝言メモコメント削除
+  const handleDeleteMemoComment = useCallback(async (memoId: string, commentId: string) => {
+    if (!currentUser) return;
+
+    // 楽観的UI更新
+    setMemos(prev => prev.map(m => {
+      if (m.id === memoId && Array.isArray(m.comments)) {
+        return { ...m, comments: m.comments.filter(c => c.id !== commentId) };
+      }
+      return m;
+    }));
+
+    try {
+      const res = await fetchWithRetry(`${API_BASE_URL}/memos/${memoId}/comments/${commentId}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: currentUser.id,
+          role: currentUser.role
+        })
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP status ${res.status}`);
+      }
+    } catch (err) {
+      console.warn('Failed to delete memo comment:', err);
+      refetchMemos();
+    }
+  }, [currentUser, refetchMemos]);
+
+  return {
+    memos,
+    setMemos,
+    refetchMemos,
+    handleDeleteMemo,
+    handleUpdateMemos,
+    handleAddMemoComment,
+    handleDeleteMemoComment,
+  };
+}

@@ -1,0 +1,880 @@
+import * as XLSX from 'xlsx';
+import ExcelJS from 'exceljs';
+import { User, CalendarEvent } from '../types';
+
+export type InspectionFaxStatus = 'none' | 'required' | 'sent' | 'confirmed';
+export type InspectionMailStatus = 'none' | 'required' | 'sent' | 'confirmed';
+export type InspectionTelStatus = 'none' | 'required' | 'confirmed';
+export type InspectionPosterType = 'none' | 'direct' | 'mail' | 'fax' | 'post' | 'postal';
+export type InspectionWorkNoticeType = 'none' | 'mail' | 'fax';
+export type InspectionWebEntryType = 'none' | 'required';
+
+export interface InspectionMetaA {
+  remarks?: string;                         // 備考
+  faxStatus?: InspectionFaxStatus;          // Fax (なし/必要/送付済/確定済)
+  mailStatus?: InspectionMailStatus;        // Mail (なし/必要/送付済/確定済)
+  telStatus?: InspectionTelStatus;          // Tel (なし/必要/確認済)
+  posterType?: InspectionPosterType;        // 貼紙 (なし/直接/Mail/Fax/郵送)
+  posterDone?: boolean;                     // 貼紙 済フラグ (false: 未済/赤, true: 済/濃い緑)
+  workNoticeType?: InspectionWorkNoticeType;// 作業届 (なし/Mail/Fax)
+  workNoticeDone?: boolean;                 // 作業届 済フラグ (false: 未済/赤, true: 済/濃い緑)
+  webEntryType?: InspectionWebEntryType;    // WEB入力 (なし/必要)
+  webEntryDone?: boolean;                   // WEB入力 済フラグ (false: 未済/赤, true: 済/濃い緑)
+}
+
+export interface SiteInspectionMasterEntry {
+  jobNo: string;
+  siteCode?: string;
+  siteName?: string;
+  metaA?: InspectionMetaA;
+  lastPlacedStartTime?: string; // 例: '09:00'
+  lastPlacedEndTime?: string;   // 例: '10:00'
+  updatedAt: string;
+}
+
+const MASTER_STORAGE_KEY = 'inspection_site_master_cache';
+
+/** 全現場の最新メタデータ＆仮配置時間マスターキャッシュを取得 */
+export function getAllSiteMasters(): Record<string, SiteInspectionMasterEntry> {
+  try {
+    const raw = localStorage.getItem(MASTER_STORAGE_KEY);
+    if (raw) {
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.warn('Failed to load site master cache:', err);
+  }
+  return {};
+}
+
+/** 現場ごとの最新メタデータ＆仮配置時間マスターを保存・更新する */
+export function saveSiteMasterEntry(
+  jobNo: string,
+  data: {
+    siteCode?: string;
+    siteName?: string;
+    metaA?: InspectionMetaA;
+    lastPlacedStartTime?: string;
+    lastPlacedEndTime?: string;
+  }
+) {
+  if (!jobNo) return;
+  try {
+    const masters = getAllSiteMasters();
+    const existing = masters[jobNo] || { jobNo, updatedAt: new Date().toISOString() };
+
+    const mergedMetaA = data.metaA ? { ...(existing.metaA || {}), ...data.metaA } : existing.metaA;
+
+    masters[jobNo] = {
+      ...existing,
+      siteCode: data.siteCode || existing.siteCode,
+      siteName: data.siteName || existing.siteName,
+      metaA: mergedMetaA,
+      lastPlacedStartTime: data.lastPlacedStartTime !== undefined ? data.lastPlacedStartTime : existing.lastPlacedStartTime,
+      lastPlacedEndTime: data.lastPlacedEndTime !== undefined ? data.lastPlacedEndTime : existing.lastPlacedEndTime,
+      updatedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(MASTER_STORAGE_KEY, JSON.stringify(masters));
+  } catch (err) {
+    console.warn('Failed to save site master entry:', err);
+  }
+}
+
+/**
+ * 過去マスターから新月度アイテムへメタデータ（A）と仮配置時間を引き継ぐ
+ * 【重要ルール】
+ * - 「済」のステータスはコピー時に元に戻り（未済・必要に戻る）、済のままコピーされるケースは絶対にない。
+ * - 備考・貼紙区分・作業届区分・WEB入力区分・仮配置時間はそのまま引き継ぐ。
+ */
+export function applyMasterToItem(item: InspectionItem, master?: SiteInspectionMasterEntry): InspectionItem {
+  const masterEntry = master || (item.jobNo ? getAllSiteMasters()[item.jobNo] : null) || (item.siteCode ? getAllSiteMasters()[item.siteCode] : null);
+  if (!masterEntry) return item;
+
+  const mMeta = masterEntry.metaA;
+  let newMetaA: InspectionMetaA = { ...(item.metaA || {}) };
+
+  if (mMeta) {
+    // 備考はそのまま引き継ぐ
+    if (mMeta.remarks !== undefined && !newMetaA.remarks) {
+      newMetaA.remarks = mMeta.remarks;
+    }
+
+    // Fax: 'sent' or 'confirmed' -> 'required' (赤), 'none' -> 'none'
+    if (mMeta.faxStatus && mMeta.faxStatus !== 'none') {
+      newMetaA.faxStatus = 'required';
+    } else if (mMeta.faxStatus === 'none') {
+      newMetaA.faxStatus = 'none';
+    }
+
+    // Mail: 'sent' or 'confirmed' -> 'required' (赤), 'none' -> 'none'
+    if (mMeta.mailStatus && mMeta.mailStatus !== 'none') {
+      newMetaA.mailStatus = 'required';
+    } else if (mMeta.mailStatus === 'none') {
+      newMetaA.mailStatus = 'none';
+    }
+
+    // Tel: 'confirmed' -> 'required' (赤), 'none' -> 'none'
+    if (mMeta.telStatus && mMeta.telStatus !== 'none') {
+      newMetaA.telStatus = 'required';
+    } else if (mMeta.telStatus === 'none') {
+      newMetaA.telStatus = 'none';
+    }
+
+    // 貼紙区分: 区分はそのまま引き継ぐが、済フラグは常に未済 (false / 赤) に戻す
+    if (mMeta.posterType) {
+      newMetaA.posterType = mMeta.posterType;
+      newMetaA.posterDone = false;
+    }
+
+    // 作業届区分: 区分はそのまま引き継ぐが、済フラグは常に未済 (false / 赤) に戻す
+    if (mMeta.workNoticeType) {
+      newMetaA.workNoticeType = mMeta.workNoticeType;
+      newMetaA.workNoticeDone = false;
+    }
+
+    // WEB入力: 区分はそのまま引き継ぐが、済フラグは常に未済 (false / 赤) に戻す
+    if (mMeta.webEntryType) {
+      newMetaA.webEntryType = mMeta.webEntryType;
+      newMetaA.webEntryDone = false;
+    }
+  }
+
+  // 仮配置時の時間枠を引き継ぐ（未設定の場合）
+  const assignedStartTime = item.assignedStartTime || masterEntry.lastPlacedStartTime;
+  const assignedEndTime = item.assignedEndTime || masterEntry.lastPlacedEndTime;
+
+  return {
+    ...item,
+    metaA: newMetaA,
+    assignedStartTime,
+    assignedEndTime,
+  };
+}
+
+/** アイテム配列全体にマスターを適用する */
+export function batchApplyMasterToItems(items: InspectionItem[]): InspectionItem[] {
+  const masters = getAllSiteMasters();
+  return items.map((item) => applyMasterToItem(item, masters[item.jobNo] || (item.siteCode ? masters[item.siteCode] : undefined)));
+}
+
+/**
+ * 現場アイテムを複製（コピー）するヘルパー
+ * - 単一アイテムの別日への複製、または他月への複製に対応
+ * - 「済」フラグは全て未済（赤）にリセット
+ * - Fax/Mail/Telは 'none' でなければ 'required' (赤) にリセット
+ * - 変更済み時間（マスター登録時間）があればその時間を引き継ぎ、未変更（デフォルト9:00）ならデフォルト時間
+ */
+export function duplicateInspectionItem(
+  sourceItem: InspectionItem,
+  options?: {
+    targetYearMonth?: string;
+    newDate?: string;
+    status?: 'pending' | 'placed';
+  }
+): InspectionItem {
+  const ym = options?.targetYearMonth || sourceItem.targetYearMonth;
+  const masters = getAllSiteMasters();
+  const masterEntry = (sourceItem.jobNo ? masters[sourceItem.jobNo] : null) || (sourceItem.siteCode ? masters[sourceItem.siteCode] : null);
+
+  // メタデータ構築
+  const srcMeta = sourceItem.metaA || {};
+  const masterMeta = masterEntry?.metaA || {};
+
+  const remarks = srcMeta.remarks !== undefined ? srcMeta.remarks : masterMeta.remarks;
+  const posterType = srcMeta.posterType || masterMeta.posterType || 'none';
+  const workNoticeType = srcMeta.workNoticeType || masterMeta.workNoticeType || 'none';
+  const webEntryType = srcMeta.webEntryType || masterMeta.webEntryType || 'none';
+
+  let faxStatus: InspectionFaxStatus = 'none';
+  const rawFax = srcMeta.faxStatus || masterMeta.faxStatus;
+  if (rawFax && rawFax !== 'none') faxStatus = 'required';
+
+  let mailStatus: InspectionMailStatus = 'none';
+  const rawMail = srcMeta.mailStatus || masterMeta.mailStatus;
+  if (rawMail && rawMail !== 'none') mailStatus = 'required';
+
+  let telStatus: InspectionTelStatus = 'none';
+  const rawTel = srcMeta.telStatus || masterMeta.telStatus;
+  if (rawTel && rawTel !== 'none') telStatus = 'required';
+
+  const newMetaA: InspectionMetaA = {
+    remarks,
+    faxStatus,
+    mailStatus,
+    telStatus,
+    posterType,
+    posterDone: false, // 済フラグは常に未済にリセット
+    workNoticeType,
+    workNoticeDone: false,
+    webEntryType,
+    webEntryDone: false,
+  };
+
+  // 時間引き継ぎ:
+  // マスターに記録されたカスタム時間があるか、または元アイテムで時間がカスタマイズされていた場合はそれを引き継ぐ
+  const assignedStartTime = masterEntry?.lastPlacedStartTime || (sourceItem.assignedStartTime && sourceItem.assignedStartTime !== '09:00' ? sourceItem.assignedStartTime : undefined) || '09:00';
+  const assignedEndTime = masterEntry?.lastPlacedEndTime || (sourceItem.assignedEndTime && sourceItem.assignedEndTime !== '10:00' ? sourceItem.assignedEndTime : undefined) || '10:00';
+
+  const newStatus = options?.status !== undefined ? options.status : (options?.newDate ? 'placed' : sourceItem.status);
+
+  return {
+    ...sourceItem,
+    id: `insp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    targetYearMonth: ym,
+    assignedDate: options?.newDate !== undefined ? options.newDate : (options?.targetYearMonth ? undefined : sourceItem.assignedDate),
+    assignedStartTime,
+    assignedEndTime,
+    status: newStatus,
+    metaA: newMetaA,
+    isConfirmed: false,
+    eventId: undefined,
+  };
+}
+
+/**
+ * 過去月・他月の全点検データを新月へ一括コピーする
+ * @param sourceItems コピー元の点検アイテムリスト
+ * @param targetYearMonth コピー先の年月 (例: '2026-09')
+ * @param mode 'unassigned' (全て未配置リストとしてコピー) | 'same_day' (同日付けで仮配置してコピー)
+ */
+export function copyMonthInspectionSchedule(
+  sourceItems: InspectionItem[],
+  targetYearMonth: string,
+  mode: 'unassigned' | 'same_day' = 'unassigned'
+): InspectionItem[] {
+  const [targetYear, targetMonth] = targetYearMonth.split('-').map(Number);
+  const daysInTargetMonth = new Date(targetYear, targetMonth, 0).getDate();
+
+  return sourceItems
+    .filter(item => item.status !== 'hidden')
+    .map(item => {
+      let targetDate: string | undefined = undefined;
+
+      if (mode === 'same_day' && item.assignedDate) {
+        // 同じ「日」をコピー先年月にマップ (例: 2026-07-15 -> 2026-08-15)
+        const dayPart = parseInt(item.assignedDate.split('-')[2], 10) || 1;
+        const clampedDay = Math.min(dayPart, daysInTargetMonth);
+        targetDate = `${targetYear}-${String(targetMonth).padStart(2, '0')}-${String(clampedDay).padStart(2, '0')}`;
+      }
+
+      return duplicateInspectionItem(item, {
+        targetYearMonth,
+        newDate: targetDate,
+        status: targetDate ? 'placed' : 'pending',
+      });
+    });
+}
+
+export interface InspectionItem {
+  id: string;
+  targetYearMonth: string; // YYYY-MM (e.g., '2026-08')
+
+  // 基本情報 (Step 2 マッピング項目)
+  jobNo: string;           // 作業No
+  siteName: string;        // 現場名 -> スケジュールタイトル
+  address: string;         // 住所 -> 場所
+  quantity: string | number; // 台数
+  customerRules: string;   // 客先規則
+
+  // 実エクセル詳細項目
+  initialDate?: string;    // エクセル内の「点検日」 (YYYY-MM-DD)
+  workCategory?: string;   // 作業区分 (1, 2など)
+  workName?: string;       // 作業名 (自動ドア、スポットなど)
+  contractNo?: string;     // 契約No
+  siteCode?: string;       // 現場コード
+  area?: string;           // 地区 (岐阜県岐阜市など)
+  department?: string;     // 部門 (名古屋支店など)
+  office?: string;         // 担当拠点
+  officeId?: string;       // 担当拠点マスターID
+  excelPersonName?: string; // エクセル内の「担当者名」 (鶴見茂樹など)
+  conditions?: string;     // 指定条件・警告内容など
+
+  // 専用データ (A)
+  metaA?: InspectionMetaA;
+
+  status: 'pending' | 'placed' | 'carried_over' | 'hidden' | 'registered';
+  carriedOverFrom?: string; // 繰越元年月 (例: '2026-07')
+  draftSavedAt?: string;    // 下書き保存日時 (ISO string)
+
+  // 日付・時刻配置 (Step 3 & 4)
+  assignedDate?: string;      // YYYY-MM-DD
+  assignedStartTime?: string; // HH:mm
+  assignedEndTime?: string;   // HH:mm
+
+  // 担当メンバー割り当て (Step 5)
+  assignedUsers?: User[];
+  isConfirmed?: boolean;
+  eventId?: string;
+}
+
+/** C1 セルまたは任意のセルから「YYYY-MM」形式の対象年月を推測する (例: 2026/08 -> 2026-08) */
+export function extractTargetYearMonth(sheet: XLSX.WorkSheet): string {
+  try {
+    const candidateCells = ['C1', 'B1', 'A1', 'D1', 'C2', 'B2'];
+    for (const cellKey of candidateCells) {
+      const cell = sheet[cellKey];
+      if (!cell) continue;
+
+      const val = cell.v !== undefined ? cell.v : (cell.w || String(cell));
+      if (typeof val === 'number') {
+        // Excel日付シリアル値の場合
+        const dateObj = XLSX.SSF.parse_date_code(val);
+        if (dateObj && dateObj.y && dateObj.m) {
+          return `${dateObj.y}-${String(dateObj.m).padStart(2, '0')}`;
+        }
+      }
+      const strVal = String(val);
+      // '2026/08' や '2026-08' や '2026年8月' を正規表現で抽出
+      const match = strVal.match(/(\d{4})[年/.-]\s*(\d{1,2})/);
+      if (match) {
+        const year = match[1];
+        const month = String(parseInt(match[2], 10)).padStart(2, '0');
+        return `${year}-${month}`;
+      }
+    }
+  } catch (err) {
+    console.warn('Failed to parse C1 date:', err);
+  }
+
+  // デフォルトは 2026-08 または当月
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  return `${year}-${month}`;
+}
+
+/** Excel日付シリアル値または文字列を YYYY-MM-DD 形式に変換するヘルパー */
+function formatExcelDate(cellVal: any): string | undefined {
+  if (!cellVal) return undefined;
+  if (typeof cellVal === 'number') {
+    const dateObj = XLSX.SSF.parse_date_code(cellVal);
+    if (dateObj && dateObj.y && dateObj.m && dateObj.d) {
+      return `${dateObj.y}-${String(dateObj.m).padStart(2, '0')}-${String(dateObj.d).padStart(2, '0')}`;
+    }
+  }
+  const str = String(cellVal).trim();
+  const match = str.match(/(\d{4})[年/.-]\s*(\d{1,2})[月/.-]\s*(\d{1,2})/);
+  if (match) {
+    return `${match[1]}-${String(parseInt(match[2], 10)).padStart(2, '0')}-${String(parseInt(match[3], 10)).padStart(2, '0')}`;
+  }
+  return undefined;
+}
+
+/** 作業区分に基づいて作業名を確定する（1: 点検, 2: スポット, 3: 修理） */
+export function resolveWorkName(workCategory?: string | number, rawWorkName?: string): string {
+  const cat = String(workCategory ?? '').trim();
+  if (cat === '1' || cat.startsWith('1')) return '点検';
+  if (cat === '2' || cat.startsWith('2')) return 'スポット';
+  if (cat === '3' || cat.startsWith('3')) return '修理';
+
+  if (rawWorkName) {
+    const raw = rawWorkName.trim();
+    if (raw === '1' || raw.startsWith('1') || raw === '点検' || raw.includes('点検') || raw === '自動ドア') return '点検';
+    if (raw === '2' || raw.startsWith('2') || raw === 'スポット' || raw.includes('スポット')) return 'スポット';
+    if (raw === '3' || raw.startsWith('3') || raw === '修理' || raw.includes('修理')) return '修理';
+    return raw;
+  }
+  return '点検';
+}
+
+/** Excelファイルを読み込んで InspectionItem 配列を生成する */
+export function parseInspectionExcel(
+  fileBuffer: ArrayBuffer,
+  allUsers: User[] = []
+): {
+  targetYearMonth: string;
+  items: InspectionItem[];
+  error?: string;
+} {
+  try {
+    const workbook = XLSX.read(fileBuffer, { type: 'array', cellDates: true, cellStyles: true });
+    const firstSheetName = workbook.SheetNames[0];
+    if (!firstSheetName) {
+      return { targetYearMonth: '', items: [], error: 'Excelファイル内にシートが見つかりません。' };
+    }
+
+    const sheet = workbook.Sheets[firstSheetName];
+    const targetYearMonth = extractTargetYearMonth(sheet);
+
+    // シートデータを全行配列に変換
+    const rawData = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1, defval: '' });
+    if (!rawData || rawData.length === 0) {
+      return { targetYearMonth, items: [], error: 'シートにデータが存在しません。' };
+    }
+
+    // ヘッダー行を探す（「現場名」または「作業No」が含まれる行を探す）
+    let headerRowIndex = -1;
+    for (let i = 0; i < Math.min(15, rawData.length); i++) {
+      const row = rawData[i];
+      if (Array.isArray(row) && row.some((cell) => {
+        const s = String(cell).trim();
+        return s === '現場名' || s === '作業No' || s === '現場コード';
+      })) {
+        headerRowIndex = i;
+        break;
+      }
+    }
+
+    if (headerRowIndex === -1) {
+      headerRowIndex = rawData.length > 4 ? 4 : 0;
+    }
+
+    const headers = (rawData[headerRowIndex] as any[]).map((h) => String(h || '').trim());
+    
+    // 各項目の列インデックスを特定 (完全一致優先、次に部分一致)
+    const findCol = (exactKeywords: string[], includeKeywords: string[] = []): number => {
+      // 1. 完全一致
+      const exactIndex = headers.findIndex((h) => exactKeywords.some((kw) => h === kw));
+      if (exactIndex !== -1) return exactIndex;
+      // 2. 部分一致 (厳密なキーワードのみ)
+      if (includeKeywords.length > 0) {
+        return headers.findIndex((h) => includeKeywords.some((kw) => h.includes(kw)));
+      }
+      return -1;
+    };
+
+    const jobNoCol = findCol(['作業No', '作業番号', '作業NO', '作業№', '作業コード'], ['作業No', '作業番号', '作業NO']);
+    const dateCol = findCol(['点検日', '作業日', '予定日', '実施日'], ['点検日']);
+    const workCatCol = findCol(['作業区分', '区分'], ['作業区分']);
+    const workNameCol = findCol(['作業名', '作業種別', '作業内容'], ['作業名']);
+    const contractNoCol = findCol(['契約No', '契約番号', '契約NO', '契約CD'], ['契約No', '契約番号']);
+    const siteCodeCol = findCol(['現場コード', '現場CD', '現場番号'], ['現場コード', '現場CD']);
+    const siteCol = findCol(['現場名', '現場名称', '物件名', '現場名/物件名'], ['現場名', '現場名称', '物件名']); // '現場' 単体での部分一致は現場コードと誤認するため除外
+    const areaCol = findCol(['地区', 'エリア', '地域'], ['地区']);
+    const addrCol = findCol(['住所', '所在地', '現場住所'], ['住所', '所在地']);
+    const qtyCol = findCol(['台数', '数量', '台数等'], ['台数', '数量']);
+    const rulesCol = findCol(['客先規則', '規則', '注意事項'], ['客先規則', '規則']);
+    const cond1Col = findCol(['指定条件1', '条件1'], ['指定条件1']);
+    const cond2Col = findCol(['指定条件2', '条件2'], ['指定条件2']);
+    const warnCol = findCol(['警告内容', '警告'], ['警告内容']);
+    const deptCol = findCol(['部門', '部門名', '部署'], ['部門名', '部門']);
+    const personCol = findCol(['担当者名', '担当者'], ['担当者名', '担当者']);
+
+    const items: InspectionItem[] = [];
+
+    // データ行を順次パース
+    for (let r = headerRowIndex + 1; r < rawData.length; r++) {
+      const row = rawData[r] as any[];
+      if (!row || row.length === 0) continue;
+
+      const jobNo = jobNoCol !== -1 && row[jobNoCol] !== undefined ? String(row[jobNoCol]).trim() : '';
+      const rawSiteName = siteCol !== -1 && row[siteCol] !== undefined ? String(row[siteCol]).trim() : '';
+      const rawSiteCode = siteCodeCol !== -1 && row[siteCodeCol] !== undefined ? String(row[siteCodeCol]).trim() : '';
+      const address = addrCol !== -1 && row[addrCol] !== undefined ? String(row[addrCol]).trim() : '';
+      const quantity = qtyCol !== -1 && row[qtyCol] !== undefined ? String(row[qtyCol]).trim() : '1';
+      const customerRules = rulesCol !== -1 && row[rulesCol] !== undefined ? String(row[rulesCol]).trim() : '';
+
+      // 空行スキップ（現場名も作業Noもない行）
+      if (!rawSiteName && !rawSiteCode && !jobNo) continue;
+
+      const initialDate = dateCol !== -1 ? formatExcelDate(row[dateCol]) : undefined;
+      const workCategory = workCatCol !== -1 && row[workCatCol] !== undefined ? String(row[workCatCol]).trim() : undefined;
+      const rawWorkName = workNameCol !== -1 && row[workNameCol] !== undefined ? String(row[workNameCol]).trim() : undefined;
+      const workName = resolveWorkName(workCategory, rawWorkName);
+
+      const contractNo = contractNoCol !== -1 && row[contractNoCol] !== undefined ? String(row[contractNoCol]).trim() : undefined;
+      const siteCode = rawSiteCode || undefined;
+      const siteName = rawSiteName || (rawSiteCode ? `現場(${rawSiteCode})` : `現場 ${r}`);
+      const area = areaCol !== -1 && row[areaCol] !== undefined ? String(row[areaCol]).trim() : undefined;
+      const department = deptCol !== -1 && row[deptCol] !== undefined ? String(row[deptCol]).trim() : undefined;
+      const excelPersonName = personCol !== -1 && row[personCol] !== undefined ? String(row[personCol]).trim() : undefined;
+
+      const condList = [
+        cond1Col !== -1 && row[cond1Col] ? `指定1:${row[cond1Col]}` : '',
+        cond2Col !== -1 && row[cond2Col] ? `指定2:${row[cond2Col]}` : '',
+        warnCol !== -1 && row[warnCol] ? `警告:${row[warnCol]}` : '',
+      ].filter(Boolean).join(' / ');
+
+      // エクセル内の担当者名（例: 鶴見茂樹）とユーザーリストを自動マッチング
+      let assignedUsers: User[] | undefined = undefined;
+      if (excelPersonName && excelPersonName !== '.' && allUsers.length > 0) {
+        const cleanName = excelPersonName.replace(/\s+/g, '');
+        const matched = allUsers.filter((u) => {
+          const uClean = u.name.replace(/\s+/g, '');
+          return uClean === cleanName || uClean.includes(cleanName) || cleanName.includes(uClean);
+        });
+        if (matched.length > 0) {
+          assignedUsers = matched;
+        }
+      }
+
+      items.push({
+        id: `insp_${Date.now()}_${r}_${Math.random().toString(36).substring(2, 7)}`,
+        targetYearMonth,
+        siteName,
+        address: address || '住所未設定',
+        jobNo: jobNo || `W-${1000 + r}`,
+        quantity: quantity || 1,
+        customerRules: customerRules || 'なし',
+        workCategory,
+        workName,
+        contractNo,
+        siteCode,
+        area,
+        department,
+        excelPersonName: excelPersonName !== '.' ? excelPersonName : undefined,
+        conditions: condList || undefined,
+        initialDate,
+        assignedUsers,
+        status: 'pending',
+      });
+    }
+
+    // 過去同一現場コードからの最新メタデータ（A）および仮配置時間の自動引き継ぎ適用
+    const finalItems = batchApplyMasterToItems(items);
+
+    return { targetYearMonth, items: finalItems };
+  } catch (err: any) {
+    console.error('Failed to parse Excel file:', err);
+    return { targetYearMonth: '', items: [], error: 'Excelファイルの読み込みに失敗しました: ' + (err.message || '') };
+  }
+}
+
+/** 実データと同じ26列フォーマットのサンプルExcelファイルを生成・ダウンロードする */
+export function generateSampleInspectionExcel(targetYearMonth: string = '2026-08') {
+  const [yearStr, monthStr] = targetYearMonth.split('-');
+  const displayYearMonth = `${yearStr}/${monthStr.padStart(2, '0')}`;
+
+  const headers = [
+    '作業No', '点検日', '開始時間', '終了時間', '作業区分', '作業名', '契約No', '現場コード', '現場名',
+    '地区', '住所', '台数', '客先規則', '指定条件1', '指定条件2', '警告内容', '調整内容',
+    '確定', '複数人現場', '部門コード', '部門', '協力会社コード', '協力会社', '担当者コード', '担当者名', 'その他担当者'
+  ];
+
+  const wsData: any[][] = [
+    ['', '点検月', displayYearMonth], // Row 1: B1: 点検月, C1: 2026/08
+    [],
+    [],
+    [],
+    headers, // Row 5: 26列ヘッダー
+    ['01287504', '2026/08/01', '', '', '2', 'スポット', '00001505', '015150', '●ボヌール六条南', '岐阜県岐阜市', '岐阜県岐阜市六条南1丁目8-11', '1', 'スポット 点検先(いつも21,000円)', '', '', '', '', '確定', '', 'T0701', '名古屋支店', '', '', '00308', '.', ''],
+    ['01287504', '', '', '', '1', '自動ドア', '00001505', '015150', '●ボヌール六条南', '岐阜県岐阜市', '岐阜県岐阜市六条南1丁目8-11', '1', 'スポット 点検先(いつも21,000円)', '', '', '', '', '', '', 'T0701', '名古屋支店', '', '', '00246', '鶴見茂樹', ''],
+    ['01287505', '2026/08/01', '', '', '1', '自動ドア', '00000971', '013925', 'サンプレミアム', '岐阜県岐阜市', '岐阜県岐阜市吉野町4丁目21番地', '1', 'かんぜん委託(今月行って下さい)', '', '', '', '', '確定', '', 'T0701', '名古屋支店', '', '', '00246', '鶴見茂樹', ''],
+    ['01287508', '2026/08/01', '', '', '1', '自動ドア', '00001262', '112211', '岐阜スカイウイング３７', '岐阜県岐阜市', '岐阜県岐阜市吉野町6丁目31', '3', '作業届2か所に送る(現地・ハイ)', '', '', '', '', '確定', '', 'T0701', '名古屋支店', '', '', '00308', '.', ''],
+    ['01287506', '2026/08/01', '', '', '1', '自動ドア', '00001174', '112211', '岐阜スカイウイング３７', '岐阜県岐阜市', '岐阜県岐阜市吉野町6丁目31', '4', '貼紙FAX', '', '', '', '', '確定', '', 'T0701', '名古屋支店', '', '', '00246', '鶴見茂樹', ''],
+    ['01287510', '2026/08/02', '', '', '1', '自動ドア', '00001880', '016520', '名駅セントラルタワー', '愛知県名古屋市', '愛知県名古屋市中村区名駅1-1-4', '12', 'ヘルメット着用、17時撤収厳守', '', '', '', '', '確定', '', 'T0701', '名古屋支店', '', '', '00101', '山田太郎', ''],
+    ['01287512', '2026/08/03', '', '', '1', '自動ドア', '00002100', '017830', '栄スクエアモール', '愛知県名古屋市', '愛知県名古屋市中区栄3-5-1', '8', '入館時防災センターにて手続き', '', '', '', '', '確定', '', 'T0701', '名古屋支店', '', '', '00102', '鈴木一郎', ''],
+    ['01287515', '2026/08/04', '', '', '2', 'スポット', '00002340', '018900', '伏見ファーストプラザ', '愛知県名古屋市', '愛知県名古屋市中区錦2-12-8', '5', 'エレベーター使用時養生必須', '', '', '', '', '', '', 'T0701', '名古屋支店', '', '', '00246', '鶴見茂樹', ''],
+  ];
+
+  const ws = XLSX.utils.aoa_to_sheet(wsData);
+
+  ws['!cols'] = [
+    { wch: 12 }, // 作業No
+    { wch: 12 }, // 点検日
+    { wch: 10 }, // 開始時間
+    { wch: 10 }, // 終了時間
+    { wch: 10 }, // 作業区分
+    { wch: 12 }, // 作業名
+    { wch: 12 }, // 契約No
+    { wch: 12 }, // 現場コード
+    { wch: 26 }, // 現場名
+    { wch: 16 }, // 地区
+    { wch: 36 }, // 住所
+    { wch: 6 },  // 台数
+    { wch: 34 }, // 客先規則
+    { wch: 12 }, // 指定条件1
+    { wch: 12 }, // 指定条件2
+    { wch: 12 }, // 警告内容
+    { wch: 12 }, // 調整内容
+    { wch: 8 },  // 確定
+    { wch: 12 }, // 複数人現場
+    { wch: 10 }, // 部門コード
+    { wch: 14 }, // 部門
+    { wch: 14 }, // 協力会社コード
+    { wch: 14 }, // 協力会社
+    { wch: 12 }, // 担当者コード
+    { wch: 14 }, // 担当者名
+    { wch: 14 }, // その他担当者
+  ];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '点検予定リスト');
+  XLSX.writeFile(wb, `点検月_${targetYearMonth.replace('-', '_')}.xlsx`);
+}
+
+/** 実画像通りのデモデータを生成する */
+export function generateDemoInspectionItems(targetYearMonth: string = '2026-08', allUsers: User[] = []): InspectionItem[] {
+  const sampleRows = [
+    { jobNo: '01287504', siteName: '●ボヌール六条南', siteCode: '015150', contractNo: '00001505', workCategory: '2', workName: 'スポット', area: '岐阜県岐阜市', address: '岐阜県岐阜市六条南1丁目8-11', quantity: '1', customerRules: 'スポット 点検先(いつも21,000円)', department: '名古屋支店', excelPersonName: '鶴見茂樹' },
+    { jobNo: '01287505', siteName: 'サンプレミアム', siteCode: '013925', contractNo: '00000971', workCategory: '1', workName: '点検', area: '岐阜県岐阜市', address: '岐阜県岐阜市吉野町4丁目21番地', quantity: '1', customerRules: 'かんぜん委託(今月行って下さい)', department: '名古屋支店', excelPersonName: '鶴見茂樹' },
+    { jobNo: '01287508', siteName: '岐阜スカイウイング３７', siteCode: '112211', contractNo: '00001262', workCategory: '1', workName: '点検', area: '岐阜県岐阜市', address: '岐阜県岐阜市吉野町6丁目31', quantity: '3', customerRules: '作業届2か所に送る(現地・ハイ)', department: '名古屋支店', excelPersonName: '鶴見茂樹' },
+    { jobNo: '01287506', siteName: '岐阜スカイウイング３７', siteCode: '112211', contractNo: '00001174', workCategory: '1', workName: '点検', area: '岐阜県岐阜市', address: '岐阜県岐阜市吉野町6丁目31', quantity: '4', customerRules: '貼紙FAX', department: '名古屋支店', excelPersonName: '鶴見茂樹' },
+    { jobNo: '01287510', siteName: '名駅セントラルタワー', siteCode: '016520', contractNo: '00001880', workCategory: '1', workName: '点検', area: '愛知県名古屋市', address: '愛知県名古屋市中村区名駅1-1-4', quantity: '12', customerRules: 'ヘルメット着用、17時撤収厳守', department: '名古屋支店', excelPersonName: '山田太郎' },
+    { jobNo: '01287512', siteName: '栄スクエアモール', siteCode: '017830', contractNo: '00002100', workCategory: '1', workName: '点検', area: '愛知県名古屋市', address: '愛知県名古屋市中区栄3-5-1', quantity: '8', customerRules: '入館時防災センターにて手続き必要', department: '名古屋支店', excelPersonName: '鈴木一郎' },
+    { jobNo: '01287515', siteName: '伏見ファーストプラザ', siteCode: '018900', contractNo: '00002340', workCategory: '2', workName: 'スポット', area: '愛知県名古屋市', address: '愛知県名古屋市中区錦2-12-8', quantity: '5', customerRules: 'エレベーター使用時養生必須', department: '名古屋支店', excelPersonName: '鶴見茂樹' },
+    { jobNo: '01287518', siteName: '千種ガーデンハイツ', siteCode: '019440', contractNo: '00002560', workCategory: '3', workName: '修理', area: '愛知県名古屋市', address: '愛知県名古屋市千種区葵3-15-22', quantity: '16', customerRules: '住人に事前チラシ配布済み', department: '名古屋支店', excelPersonName: '山田太郎' },
+  ];
+
+  return sampleRows.map((item, idx) => {
+    let assignedUsers: User[] | undefined = undefined;
+    if (item.excelPersonName && allUsers.length > 0) {
+      const matched = allUsers.filter((u) => u.name.includes(item.excelPersonName));
+      if (matched.length > 0) assignedUsers = matched;
+    }
+
+    // デモ用サンプルメタデータ (A)
+    let sampleMeta: InspectionMetaA | undefined = undefined;
+    if (idx === 0) {
+      sampleMeta = {
+        remarks: '管理人室で鍵受取。作業完了後にサイン必須。',
+        faxStatus: 'sent',
+        posterType: 'direct',
+      };
+    } else if (idx === 1) {
+      sampleMeta = {
+        remarks: '今月中に必ず点検実施のこと。',
+        telStatus: 'required',
+        workNoticeType: 'mail',
+      };
+    } else if (idx === 2) {
+      sampleMeta = {
+        remarks: '作業届2箇所へ送付（現地・ハイ）。',
+        mailStatus: 'required',
+        workNoticeType: 'fax',
+        webEntryType: 'required',
+      };
+    } else if (idx === 3) {
+      sampleMeta = {
+        remarks: '貼紙FAX送付済み。',
+        faxStatus: 'confirmed',
+        posterType: 'fax',
+      };
+    }
+
+    return {
+      id: `demo_${Date.now()}_${idx}`,
+      targetYearMonth,
+      siteName: item.siteName,
+      address: item.address,
+      jobNo: item.jobNo,
+      quantity: item.quantity,
+      customerRules: item.customerRules,
+      workCategory: item.workCategory,
+      workName: item.workName,
+      contractNo: item.contractNo,
+      siteCode: item.siteCode,
+      area: item.area,
+      department: item.department,
+      excelPersonName: item.excelPersonName,
+      metaA: sampleMeta,
+      assignedUsers,
+      status: 'pending',
+    };
+  });
+}
+
+/**
+ * 添付画像（点検予定表）と全く同じ書式・レイアウトのExcel（マトリクスカレンダー形式）を出力する
+ */
+export async function exportInspectionCalendarMatrixToExcel(
+  items: InspectionItem[],
+  targetYearMonth: string // 例: '2026-10'
+): Promise<void> {
+  const [yearStr, monthStr] = targetYearMonth.split('-');
+  const year = parseInt(yearStr, 10);
+  const month = parseInt(monthStr, 10); // 1-12
+
+  // 対象月の日数を取得
+  const daysInMonth = new Date(year, month, 0).getDate();
+
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = '寺岡オートドアSNS';
+  workbook.created = new Date();
+
+  const worksheet = workbook.addWorksheet('点検予定表', {
+    views: [{ showGridLines: true, state: 'frozen', xSplit: 2, ySplit: 1 }]
+  });
+
+  // 列定義 (A: 日付, B: 曜日, C〜: 各案件)
+  worksheet.columns = [
+    { header: '日付', key: 'date', width: 14 },
+    { header: '曜日', key: 'dayOfWeek', width: 6 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 },
+    { width: 34 }
+  ];
+
+  // ヘッダー行のスタイリング (Row 1)
+  const headerRow = worksheet.getRow(1);
+  headerRow.height = 24;
+  headerRow.font = { name: 'Meiryo', size: 10, bold: true, color: { argb: 'FF000000' } };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+  
+  headerRow.getCell(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+  headerRow.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+  
+  for (let c = 1; c <= 20; c++) {
+    const cell = headerRow.getCell(c);
+    cell.border = {
+      top: { style: 'thin', color: { argb: 'FF000000' } },
+      bottom: { style: 'double', color: { argb: 'FF000000' } },
+      left: { style: 'thin', color: { argb: 'FFD9D9D9' } },
+      right: { style: 'thin', color: { argb: 'FFD9D9D9' } }
+    };
+  }
+
+  const DAY_NAMES = ['日', '月', '火', '水', '木', '金', '土'];
+
+  // 日付ごとの行を生成 (1日〜末日)
+  for (let d = 1; d <= daysInMonth; d++) {
+    const dateObj = new Date(year, month - 1, d);
+    const dayOfWeekIdx = dateObj.getDay();
+    const dayOfWeekStr = DAY_NAMES[dayOfWeekIdx];
+
+    const dayPad = String(d).padStart(2, '0');
+    const monthPad = String(month).padStart(2, '0');
+    const ymd = `${year}-${monthPad}-${dayPad}`;
+    const dateDisplay = `${year}/${month}/${d}`;
+
+    const row = worksheet.addRow([]);
+    row.height = 70; // 案件が改行で入るため十分な高さを確保
+
+    const cellDate = row.getCell(1);
+    const cellDay = row.getCell(2);
+
+    cellDate.value = dateDisplay;
+    cellDate.font = { name: 'Meiryo', size: 9, bold: true };
+    cellDate.alignment = { vertical: 'middle', horizontal: 'center' };
+
+    cellDay.value = dayOfWeekStr;
+    cellDay.font = { name: 'Meiryo', size: 9, bold: true };
+    cellDay.alignment = { vertical: 'middle', horizontal: 'center' };
+
+    // 土日祝日の背景色・フォント色
+    if (dayOfWeekIdx === 6) {
+      // 土曜日（薄い青/水色）
+      cellDate.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE6F0FA' } };
+      cellDay.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE6F0FA' } };
+      cellDay.font = { name: 'Meiryo', size: 9, bold: true, color: { argb: 'FF002060' } };
+    } else if (dayOfWeekIdx === 0) {
+      // 日曜日（薄いピンク）
+      cellDate.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE4D6' } };
+      cellDay.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFCE4D6' } };
+      cellDay.font = { name: 'Meiryo', size: 9, bold: true, color: { argb: 'FFC00000' } };
+    } else {
+      // 平日
+      cellDate.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+      cellDay.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+    }
+
+    cellDate.border = {
+      top: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+      bottom: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+      left: { style: 'medium', color: { argb: 'FF002060' } },
+      right: { style: 'thin', color: { argb: 'FFBFBFBF' } }
+    };
+    cellDay.border = {
+      top: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+      bottom: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+      left: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+      right: { style: 'medium', color: { argb: 'FF002060' } }
+    };
+
+    // この日の点検案件を抽出・ソート (assignedDate または initialDate が一致するもの)
+    const dayItems = items.filter(it => {
+      const dVal = it.assignedDate || it.initialDate;
+      return dVal === ymd || dVal === `${year}/${monthPad}/${dayPad}` || dVal === `${year}/${month}/${d}`;
+    });
+    dayItems.sort((a, b) => (a.assignedStartTime || '99:99').localeCompare(b.assignedStartTime || '99:99'));
+
+    // 各案件をセルに書き込む
+    dayItems.forEach((item, idx) => {
+      const colIdx = 3 + idx;
+      const cell = row.getCell(colIdx);
+
+      // テキスト行の構築
+      const lines: string[] = [];
+
+      // 1行目: 物件名 + 開始時間 + 台数 + 地区
+      const timeStr = item.assignedStartTime ? (item.assignedEndTime ? `${item.assignedStartTime}〜${item.assignedEndTime}` : item.assignedStartTime) : '';
+      const qtyStr = item.quantity ? `${item.quantity}台` : '';
+      const areaStr = item.area ? `${item.area}` : '';
+      const line1 = [item.siteName, timeStr, qtyStr, areaStr].filter(Boolean).join(' ');
+      lines.push(line1);
+
+      // 2行目: 貼紙ステータス
+      if (item.metaA?.posterType && item.metaA.posterType !== 'none') {
+        const typeLabel = item.metaA.posterType === 'direct' ? '行く' :
+                          item.metaA.posterType === 'mail' ? '郵送' :
+                          item.metaA.posterType === 'fax' ? 'FAX' :
+                          item.metaA.posterType === 'postal' || item.metaA.posterType === 'post' ? '郵送' : item.metaA.posterType;
+        const doneLabel = item.metaA.posterDone ? '済' : '(未)';
+        lines.push(`貼紙${typeLabel}${doneLabel}`);
+      }
+
+      // 3行目: 作業届・WEB入力・連絡
+      const subNotes: string[] = [];
+      if (item.metaA?.webEntryType && item.metaA.webEntryType !== 'none') {
+        subNotes.push(`WEB入力${item.metaA.webEntryDone ? '済' : '(未)'}`);
+      }
+      if (item.metaA?.workNoticeType && item.metaA.workNoticeType !== 'none') {
+        const wnLabel = item.metaA.workNoticeType === 'mail' ? 'メール' : 'FAX';
+        subNotes.push(`作業届${wnLabel}${item.metaA.workNoticeDone ? '済' : '(未)'}`);
+      }
+      if (item.metaA?.mailStatus && item.metaA.mailStatus !== 'none') {
+        subNotes.push(`日程メール${item.metaA.mailStatus === 'sent' || item.metaA.mailStatus === 'confirmed' ? '済' : ''}`);
+      }
+      if (item.metaA?.faxStatus && item.metaA.faxStatus !== 'none') {
+        subNotes.push(`日程FAX${item.metaA.faxStatus === 'sent' || item.metaA.faxStatus === 'confirmed' ? '済' : ''}`);
+      }
+      if (subNotes.length > 0) {
+        lines.push(subNotes.join(' '));
+      }
+
+      // 4行目: 備考・客先規則・特記事項
+      if (item.metaA?.remarks) {
+        lines.push(item.metaA.remarks);
+      } else if (item.customerRules) {
+        lines.push(item.customerRules);
+      }
+
+      cell.value = lines.join('\n');
+      cell.font = { name: 'Meiryo', size: 9 };
+      cell.alignment = { vertical: 'top', horizontal: 'left', wrapText: true };
+
+      // 背景色の判定
+      // 「土曜希望」「要確認」「注意」など、特記事項がある案件はオレンジ・黄色背景
+      const isHighlighted = (item.customerRules && (item.customerRules.includes('土曜') || item.customerRules.includes('希望') || item.customerRules.includes('確認'))) ||
+                            (item.metaA?.remarks && (item.metaA.remarks.includes('土曜') || item.metaA.remarks.includes('希望') || item.metaA.remarks.includes('注意') || item.metaA.remarks.includes('確認')));
+
+      if (isHighlighted) {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFC000' } }; // 明るいオレンジ/黄色
+        cell.font = { name: 'Meiryo', size: 9, bold: true, color: { argb: 'FF000000' } };
+      } else {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFFFFF' } };
+      }
+
+      cell.border = {
+        top: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+        bottom: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+        left: { style: 'thin', color: { argb: 'FFBFBFBF' } },
+        right: { style: 'thin', color: { argb: 'FFBFBFBF' } }
+      };
+    });
+  }
+
+  // ファイル生成・ダウンロード
+  const buffer = await workbook.xlsx.writeBuffer();
+  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `点検予定表_${targetYearMonth.replace('-', '_')}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  window.URL.revokeObjectURL(url);
+}

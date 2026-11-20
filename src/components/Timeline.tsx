@@ -1,0 +1,884 @@
+import React, { useState, useMemo } from 'react';
+import { Post, CalendarEvent, BoardTopic, OfficeMaster, DivisionMaster, User, AttachmentFile } from '../types';
+import { getAvatarUrl, handleAvatarError } from '../utils/avatar';
+import { AppTab } from './Sidebar';
+import { 
+  Calendar, 
+  Clock, 
+  MapPin, 
+  Users, 
+  Monitor, 
+  Eye, 
+  ArrowUpRight,
+  Sparkles,
+  Filter,
+  Check,
+  Building2,
+  Briefcase,
+  X,
+  Loader2,
+  AlertTriangle,
+  ChevronRight,
+  ChevronDown,
+  Share2,
+  UserCheck,
+  MessageSquare,
+  Paperclip,
+  Lock
+} from 'lucide-react';
+import { formatRelativeTime, formatEventScheduleBadge } from '../utils';
+import { API_BASE_URL } from '../config/api';
+import { renderContentWithLinks } from '../utils/renderContentWithLinks';
+import { buildAppUrl, copyTextToClipboard } from '../utils/urlParams';
+import { upsertBookmarkForUser } from '../utils/bookmarks';
+import { FilePreviewModal } from './FilePreviewModal';
+import { isPreviewable } from '../utils/fileUpload';
+import { isEventVisibleToUser } from '../utils/eventVisibility';
+
+interface TimelineProps {
+  posts?: Post[];
+  events?: CalendarEvent[];
+  topics?: BoardTopic[];
+  offices?: OfficeMaster[];
+  divisions?: DivisionMaster[];
+  searchQuery: string;
+  selectedTag: string | null;
+  onPost?: (content: string, tags: string[], nasLink?: string) => void;
+  onToggleLike?: (postId: string) => void;
+  onSelectTag: (tag: string | null) => void;
+  onChangeTab?: (tab: AppTab) => void;
+  isLoading?: boolean;
+  error?: string | null;
+  onRefetchPosts?: () => Promise<void>;
+  onDeletePost?: (postId: string) => void;
+  currentUser?: User;
+  onUpdateUser?: (updatedUser: User) => void;
+}
+
+type TimelineFeedItem = 
+  | { type: 'event'; id: string; date: string; data: CalendarEvent }
+  | { type: 'topic'; id: string; date: string; data: BoardTopic };
+
+export const Timeline = React.memo(function Timeline({
+  events = [],
+  topics = [],
+  offices = [],
+  divisions = [],
+  searchQuery,
+  selectedTag,
+  onSelectTag,
+  onChangeTab,
+  isLoading = false,
+  error = null,
+  currentUser,
+  onUpdateUser,
+}: TimelineProps) {
+  // 表示コンテンツ種別フィルター (スケジュール / 掲示板)
+  const [showEvents, setShowEvents] = useState<boolean>(true);
+  const [showTopics, setShowTopics] = useState<boolean>(true);
+
+  // 拠点・部門フィルター
+  const [selectedOffice, setSelectedOffice] = useState<string>('all');
+  const [selectedDivision, setSelectedDivision] = useState<string>('all');
+
+  // 段階的DOM描画件数（フィルタ・検索変更時に30件へリセット）
+  const [visibleFeedCount, setVisibleFeedCount] = useState<number>(30);
+  React.useEffect(() => {
+    setVisibleFeedCount(30);
+  }, [showEvents, showTopics, selectedOffice, selectedDivision, selectedTag, searchQuery]);
+
+  // 選択詳細アイテム
+  const [selectedDetailItem, setSelectedDetailItem] = useState<TimelineFeedItem | null>(null);
+  const [copiedDetailLink, setCopiedDetailLink] = useState(false);
+  const [previewFile, setPreviewFile] = useState<AttachmentFile | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+
+  // 拠点オプション一覧
+  const officeOptions = useMemo(() => {
+    const list = offices.map((o) => o.name);
+    return Array.from(new Set(list));
+  }, [offices]);
+
+  // 部門オプション一覧
+  const divisionOptions = useMemo(() => {
+    const list = divisions.map((d) => d.name);
+    return Array.from(new Set(list));
+  }, [divisions]);
+
+  // アクティブなフィルタ件数
+  const activeFilterCount = useMemo(() => {
+    let count = 0;
+    if (selectedOffice !== 'all') count++;
+    if (selectedDivision !== 'all') count++;
+    if (!showEvents) count++;
+    if (!showTopics) count++;
+    return count;
+  }, [selectedOffice, selectedDivision, showEvents, showTopics]);
+
+  // リセット
+  const handleResetFilters = () => {
+    setSelectedOffice('all');
+    setSelectedDivision('all');
+    setShowEvents(true);
+    setShowTopics(true);
+  };
+
+  const combinedFeed = useMemo(() => {
+    const items: TimelineFeedItem[] = [];
+
+    // 1. スケジュールイベント（登録日時・更新日時順で表示）
+    if (showEvents && events && Array.isArray(events)) {
+      events.forEach((e) => {
+        // 「他人から隠す」(isPrivate または isSecret) の非公開予定は、作成者または参加者以外には表示しない
+        if (!isEventVisibleToUser(e, currentUser)) {
+          return;
+        }
+
+        // イベントの登録・更新日時を正確に判定
+        const raw = e as any;
+        let registeredDate = raw.updatedAt || raw.createdAt || raw.draftSavedAt;
+        
+        // IDにタイムスタンプが含まれる場合の抽出 (例: evt_insp_1724050000000_abc)
+        if (!registeredDate && e.id) {
+          const match = e.id.match(/(\d{13})/);
+          if (match && match[1]) {
+            const t = parseInt(match[1], 10);
+            if (!isNaN(t) && t > 1600000000000 && t < 2500000000000) {
+              registeredDate = new Date(t).toISOString();
+            }
+          }
+        }
+
+        // 過去の予定で登録日時がない場合は開始日時、未来の予定の場合は登録時（または現在）
+        if (!registeredDate) {
+          const startT = new Date(e.start).getTime();
+          if (!isNaN(startT) && startT <= Date.now()) {
+            registeredDate = e.start;
+          } else {
+            registeredDate = new Date().toISOString();
+          }
+        }
+
+        items.push({
+          type: 'event',
+          id: `event-${e.id}`,
+          date: registeredDate,
+          data: e,
+        });
+      });
+    }
+
+    // 2. 掲示板トピック
+    if (showTopics && topics && Array.isArray(topics)) {
+      topics.forEach((t) => {
+        items.push({
+          type: 'topic',
+          id: `topic-${t.id}`,
+          date: t.createdAt,
+          data: t,
+        });
+      });
+    }
+
+    // 降順ソート (登録日時・更新日時の最新順)
+    const getItemTimestamp = (item: TimelineFeedItem) => {
+      const data = item.data as any;
+      const timeStr = item.date || data.updatedAt || data.createdAt;
+      const t = new Date(timeStr).getTime();
+      return isNaN(t) ? 0 : t;
+    };
+
+    items.sort((a, b) => getItemTimestamp(b) - getItemTimestamp(a));
+
+    // フィルタリング処理
+    return items.filter((item) => {
+      // --- A. 拠点フィルタ ---
+      if (selectedOffice !== 'all') {
+        if (item.type === 'event') {
+          const matchOffice = item.data.attendees ? item.data.attendees.some((a: any) => !a.office || a.office === selectedOffice) : true;
+          if (!matchOffice) return false;
+        } else if (item.type === 'topic') {
+          const matchOffice = !item.data.office || item.data.office === '全社' || item.data.office === selectedOffice;
+          if (!matchOffice) return false;
+        }
+      }
+
+      // --- B. 部門フィルタ ---
+      if (selectedDivision !== 'all') {
+        if (item.type === 'event') {
+          const matchDivision = item.data.attendees ? item.data.attendees.some((a: any) => !a.division || a.division === selectedDivision) : true;
+          if (!matchDivision) return false;
+        } else if (item.type === 'topic') {
+          const matchDivision = !item.data.division || item.data.division === '全部署' || item.data.division === selectedDivision;
+          if (!matchDivision) return false;
+        }
+      }
+
+      // --- C. ハッシュタグフィルタ ---
+      if (selectedTag) {
+        if (item.type === 'topic') {
+          if (!item.data.tags?.includes(selectedTag)) return false;
+        } else {
+          return false;
+        }
+      }
+
+      // --- D. キーワード検索フィルタ ---
+      if (searchQuery && searchQuery.trim()) {
+        const query = searchQuery.toLowerCase();
+        if (item.type === 'event') {
+          const titleMatch = (item.data.title || '').toLowerCase().includes(query);
+          const memoMatch = (item.data.memo || '').toLowerCase().includes(query);
+          const locMatch = (item.data.location || '').toLowerCase().includes(query);
+          const attMatch = (item.data.attendees || []).some((a: any) => (a.name || '').toLowerCase().includes(query));
+          if (!titleMatch && !memoMatch && !locMatch && !attMatch) return false;
+        } else if (item.type === 'topic') {
+          const titleMatch = (item.data.title || '').toLowerCase().includes(query);
+          const contentMatch = (item.data.content || '').toLowerCase().includes(query);
+          const authorMatch = (item.data.author?.name || '').toLowerCase().includes(query);
+          const tagMatch = (item.data.tags || []).some((t) => t.toLowerCase().includes(query));
+          if (!titleMatch && !contentMatch && !authorMatch && !tagMatch) return false;
+        }
+      }
+
+      return true;
+    });
+  }, [events, topics, showEvents, showTopics, selectedOffice, selectedDivision, selectedTag, searchQuery, currentUser]);
+
+  return (
+    <div className="flex-1 space-y-3 sm:space-y-6 min-w-0">
+
+      {/* タイムライン表示・絞り込みフィルターコントロール */}
+      {/* --- DESKTOP FILTER PANEL (hidden sm:block) --- */}
+      <div className="hidden sm:block bg-white rounded-2xl border border-slate-200/90 p-4 shadow-2xs space-y-3.5">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2">
+            <div className="p-1.5 bg-indigo-50 text-indigo-700 rounded-lg">
+              <Filter className="w-4 h-4" />
+            </div>
+            <h2 className="text-xs font-bold text-slate-800">タイムライン絞り込み</h2>
+            {activeFilterCount > 0 && (
+              <span className="px-2 py-0.5 bg-indigo-600 text-white text-[10px] font-black rounded-full">
+                {activeFilterCount} 件の絞り込み適用中
+              </span>
+            )}
+          </div>
+
+          {activeFilterCount > 0 && (
+            <button
+              onClick={handleResetFilters}
+              className="text-[11px] font-bold text-slate-500 hover:text-slate-800 flex items-center gap-1 transition-colors cursor-pointer"
+            >
+              <X className="w-3.5 h-3.5" />
+              フィルター解除
+            </button>
+          )}
+        </div>
+
+        {/* 1. コンテンツ種別トグルボタン */}
+        <div className="flex items-center gap-2 flex-wrap text-xs">
+          <span className="text-[11px] font-bold text-slate-400 mr-1">表示種別:</span>
+
+          <button
+            type="button"
+            onClick={() => setShowEvents(!showEvents)}
+            className={`px-3 py-1.5 rounded-xl border text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              showEvents
+                ? 'bg-amber-500 text-white border-amber-500 shadow-2xs'
+                : 'bg-slate-50 text-slate-400 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            <Calendar className="w-3.5 h-3.5" />
+            スケジュール
+            {showEvents && <Check className="w-3.5 h-3.5 text-amber-200" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowTopics(!showTopics)}
+            className={`px-3 py-1.5 rounded-xl border text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+              showTopics
+                ? 'bg-indigo-600 text-white border-indigo-600 shadow-2xs'
+                : 'bg-slate-50 text-slate-400 border-slate-200 hover:bg-slate-100'
+            }`}
+          >
+            <Monitor className="w-3.5 h-3.5" />
+            掲示板
+            {showTopics && <Check className="w-3.5 h-3.5 text-indigo-200" />}
+          </button>
+        </div>
+
+        {/* 2. 拠点・部門ドロップダウン選択 */}
+        <div className="grid grid-cols-2 gap-2.5 pt-2 border-t border-slate-100">
+          <div className="flex items-center gap-2">
+            <Building2 className="w-4 h-4 text-slate-400 shrink-0" />
+            <span className="text-xs font-bold text-slate-600 shrink-0">拠点:</span>
+            <select
+              value={selectedOffice}
+              onChange={(e) => setSelectedOffice(e.target.value)}
+              className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+            >
+              <option value="all">すべての拠点</option>
+              {officeOptions.map((off) => (
+                <option key={off} value={off}>
+                  {off}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Briefcase className="w-4 h-4 text-slate-400 shrink-0" />
+            <span className="text-xs font-bold text-slate-600 shrink-0">部門:</span>
+            <select
+              value={selectedDivision}
+              onChange={(e) => setSelectedDivision(e.target.value)}
+              className="w-full px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+            >
+              <option value="all">すべての部門</option>
+              {divisionOptions.map((div) => (
+                <option key={div} value={div}>
+                  {div}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {/* --- MOBILE COMPACT TOOLBAR (block sm:hidden) --- */}
+      <div className="block sm:hidden bg-white rounded-xl border border-slate-200 p-2.5 shadow-2xs space-y-2">
+        {/* Row 1: Type Segmented Toggle + Item Count */}
+        <div className="flex items-center justify-between gap-1.5">
+          {/* Segmented Control */}
+          <div className="flex items-center bg-slate-100/90 rounded-lg p-0.5 text-xs font-bold shrink-0">
+            <button
+              type="button"
+              onClick={() => { setShowEvents(true); setShowTopics(true); }}
+              className={`px-2.5 py-1 rounded-md transition-all ${
+                showEvents && showTopics
+                  ? 'bg-white text-slate-800 shadow-2xs font-extrabold'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              すべて
+            </button>
+            <button
+              type="button"
+              onClick={() => { setShowEvents(true); setShowTopics(false); }}
+              className={`px-2 py-1 rounded-md transition-all flex items-center gap-1 ${
+                showEvents && !showTopics
+                  ? 'bg-amber-500 text-white shadow-2xs font-extrabold'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              <Calendar className="w-3 h-3" />
+              <span>予定</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => { setShowEvents(false); setShowTopics(true); }}
+              className={`px-2 py-1 rounded-md transition-all flex items-center gap-1 ${
+                !showEvents && showTopics
+                  ? 'bg-indigo-600 text-white shadow-2xs font-extrabold'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              <Monitor className="w-3 h-3" />
+              <span>掲示板</span>
+            </button>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            {activeFilterCount > 0 && (
+              <button
+                type="button"
+                onClick={handleResetFilters}
+                className="p-1 text-slate-400 hover:text-slate-700 text-[10px] font-bold flex items-center gap-0.5 bg-slate-100 rounded"
+                title="フィルター解除"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            )}
+            <span className="text-[11px] font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full shrink-0">
+              {combinedFeed.length}件
+            </span>
+          </div>
+        </div>
+
+        {/* Row 2: Office & Division Selects (2 Columns, Clean) */}
+        <div className="grid grid-cols-2 gap-1.5">
+          <select
+            value={selectedOffice}
+            onChange={(e) => setSelectedOffice(e.target.value)}
+            className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-slate-800 focus:outline-none cursor-pointer truncate"
+          >
+            <option value="all">全拠点</option>
+            {officeOptions.map((off) => (
+              <option key={off} value={off}>{off}</option>
+            ))}
+          </select>
+
+          <select
+            value={selectedDivision}
+            onChange={(e) => setSelectedDivision(e.target.value)}
+            className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-bold text-slate-800 focus:outline-none cursor-pointer truncate"
+          >
+            <option value="all">全部門</option>
+            {divisionOptions.map((div) => (
+              <option key={div} value={div}>{div}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      {/* Desktop Timeline Header */}
+      <div className="hidden sm:flex items-center justify-between text-sm text-slate-500 font-medium px-1">
+        <span className="flex items-center gap-1.5 font-bold text-slate-700">
+          <Sparkles className="w-4 h-4 text-indigo-500" />
+          {selectedTag ? `#${selectedTag} の投稿` : '統合アクティビティ・タイムライン'}
+          {searchQuery && ` 「${searchQuery}」の検索結果`}
+        </span>
+        <span className="text-xs bg-slate-100 font-bold px-2.5 py-1 rounded-full text-slate-600">
+          {combinedFeed.length} 件
+        </span>
+      </div>
+
+      {/* Feed Stream */}
+      <div className="space-y-4">
+        {isLoading && (
+          <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center shadow-2xs">
+            <Loader2 className="w-8 h-8 animate-spin text-indigo-600 mx-auto mb-3" />
+            <p className="text-sm font-semibold text-slate-600">タイムラインのデータを取得しています...</p>
+          </div>
+        )}
+
+        {error && (
+          <div className="bg-amber-50 rounded-2xl border border-amber-200 p-4 shadow-2xs flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <h4 className="text-xs font-bold text-amber-800 font-mono">データ連携エラー</h4>
+              <p className="text-xs text-amber-700 leading-relaxed font-medium">{error}</p>
+            </div>
+          </div>
+        )}
+
+        {combinedFeed.length > 0 ? (
+          <div className="space-y-2">
+            {combinedFeed.slice(0, visibleFeedCount).map((item) => {
+              if (item.type === 'event') {
+                const event = item.data;
+                const isInspectionEvent = !!(event.createdViaInspection || (event.createdBy && event.createdBy.name === '点検登録') || (event.type === 'inspection' && event.targetYearMonth));
+                const eventUser = (event as any).createdBy || (event.attendees && event.attendees.length > 0 ? event.attendees[0] : null);
+                const displayUserName = isInspectionEvent ? '点検登録' : (eventUser?.name || '不明');
+
+                return (
+                  <div
+                    key={item.id}
+                    onClick={() => setSelectedDetailItem(item)}
+                    className="bg-white rounded-xl border border-amber-200/90 hover:border-amber-300 p-3 shadow-2xs hover:shadow-xs transition-all flex flex-col gap-1.5 cursor-pointer group"
+                  >
+                    {/* 1行目: 種別バッジ + 作成・担当者 + 登録日時 (相対時間) */}
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className="px-2 py-0.5 bg-amber-50 text-amber-700 font-extrabold text-[11px] rounded shrink-0 flex items-center gap-1 border border-amber-200">
+                          <Calendar className="w-3 h-3 text-amber-600" />
+                          予定
+                        </span>
+                        {(event.isPrivate || (event as any).isSecret) && (
+                          <span className="px-1.5 py-0.5 bg-rose-50 text-rose-700 font-bold text-[10px] rounded shrink-0 flex items-center gap-0.5 border border-rose-200" title="他人から隠す（非公開設定）">
+                            <Lock className="w-2.5 h-2.5 text-rose-600" />
+                            非公開
+                          </span>
+                        )}
+                        {(eventUser || isInspectionEvent) && (
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            {isInspectionEvent ? (
+                              <div className="w-5 h-5 rounded-full bg-emerald-500 text-white flex items-center justify-center font-bold text-[10px] shrink-0 border border-emerald-600 shadow-2xs">
+                                点
+                              </div>
+                            ) : (
+                              <img
+                                src={getAvatarUrl(eventUser?.id === currentUser?.id ? (currentUser?.avatarUrl || eventUser?.avatarUrl) : eventUser?.avatarUrl)}
+                                onError={handleAvatarError}
+                                alt={displayUserName}
+                                className="w-5 h-5 rounded-full object-cover border border-slate-100 bg-slate-100 shrink-0"
+                              />
+                            )}
+                            <span className="font-bold text-xs text-slate-800 truncate">
+                              {displayUserName}
+                            </span>
+                            {event.attendees && event.attendees.length > 1 && (
+                              <span className="text-[10px] text-slate-500 font-medium shrink-0">
+                                他{event.attendees.length - 1}名
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="text-[11px] text-slate-400 font-medium whitespace-nowrap" title="登録・更新日時">
+                          {formatRelativeTime(item.date)}
+                        </span>
+                        <ChevronRight className="w-4 h-4 text-slate-300 group-hover:text-amber-600 group-hover:translate-x-0.5 transition-all shrink-0" />
+                      </div>
+                    </div>
+
+                    {/* 2行目: 予定の日付・時刻バッジ + タイトル + 場所 */}
+                    <div className="flex items-center justify-between gap-3 text-xs pl-0.5 mt-0.5">
+                      <div className="flex items-center gap-2 min-w-0 flex-1 flex-wrap sm:flex-nowrap">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-100 text-amber-900 font-bold text-[11px] shrink-0 border border-amber-300/70">
+                          <Clock className="w-3 h-3 text-amber-700" />
+                          {formatEventScheduleBadge(event.start, event.end, event.isAllDay)}
+                        </span>
+                        <span className="font-semibold text-slate-900 truncate min-w-0">
+                          {event.title}
+                        </span>
+                        {event.location && (
+                          <span className="text-[11px] text-slate-500 font-medium truncate shrink-0 hidden sm:inline-block">
+                            📍 {event.location}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
+              if (item.type === 'topic') {
+                const topic = item.data;
+                return (
+                  <div
+                    key={item.id}
+                    onClick={() => setSelectedDetailItem(item)}
+                    className="bg-white rounded-xl border border-indigo-200/90 hover:border-indigo-300 p-3 shadow-2xs hover:shadow-xs transition-all flex items-center justify-between gap-3 cursor-pointer group"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                      <span className="px-2 py-0.5 bg-indigo-50 text-indigo-700 font-extrabold text-[11px] rounded shrink-0 flex items-center gap-1 border border-indigo-200">
+                        <Monitor className="w-3 h-3 text-indigo-600" />
+                        掲示板
+                      </span>
+                      <img
+                        src={getAvatarUrl(topic.author?.id === currentUser?.id ? (currentUser?.avatarUrl || topic.author?.avatarUrl) : topic.author?.avatarUrl)}
+                        onError={handleAvatarError}
+                        alt={topic.author?.name || '匿名'}
+                        className="w-6 h-6 rounded-full object-cover border border-slate-100 bg-slate-100 shrink-0"
+                      />
+                      <span className="font-bold text-xs text-slate-900 truncate min-w-0">
+                        {topic.title}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-[11px] text-slate-400 font-medium whitespace-nowrap">
+                        {formatRelativeTime(topic.createdAt)}
+                      </span>
+                      <ChevronRight className="w-4 h-4 text-slate-300 group-hover:text-indigo-600 group-hover:translate-x-0.5 transition-all" />
+                    </div>
+                  </div>
+                );
+              }
+
+              return null;
+            })}
+            {combinedFeed.length > visibleFeedCount && (
+              <div className="pt-2 flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => setVisibleFeedCount((prev) => prev + 30)}
+                  className="px-5 py-2.5 bg-white hover:bg-slate-50 text-slate-700 font-bold text-xs sm:text-sm rounded-xl border border-slate-200 shadow-2xs transition-all flex items-center gap-2 cursor-pointer"
+                >
+                  <ChevronDown className="w-4 h-4 text-slate-400" />
+                  <span>さらに表示する（残り {combinedFeed.length - visibleFeedCount} 件）</span>
+                </button>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="text-center py-12 bg-white rounded-2xl border border-slate-200 p-5 shadow-sm ring-1 ring-slate-900/5">
+            <div className="w-16 h-16 bg-slate-50 rounded-full flex items-center justify-center mx-auto mb-4">
+              <span className="text-2xl">🔍</span>
+            </div>
+            <h3 className="text-slate-900 font-medium mb-1">表示できる投稿が見つかりません</h3>
+            <p className="text-slate-500 text-sm">
+              検索・フィルタ条件を変えるか、新しい投稿・スケジュール・掲示板トピックを作成してください。
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* 詳細ダイアログ (モーダル) */}
+      {selectedDetailItem && (
+        <div
+          className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4"
+          onClick={() => setSelectedDetailItem(null)}
+        >
+          <div
+            className="bg-white rounded-2xl border border-slate-200 max-w-lg w-full shadow-2xl overflow-hidden flex flex-col max-h-[90vh] animate-in fade-in zoom-in duration-150"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex items-center justify-between px-5 py-4 border-b border-slate-100 bg-slate-50/50 shrink-0">
+              <div className="flex items-center gap-2">
+                {selectedDetailItem.type === 'event' && (
+                  <span className="px-2.5 py-1 bg-amber-500 text-white font-extrabold text-xs rounded-md flex items-center gap-1">
+                    <Calendar className="w-3.5 h-3.5" /> スケジュール詳細
+                  </span>
+                )}
+                {selectedDetailItem.type === 'topic' && (
+                  <span className="px-2.5 py-1 bg-indigo-600 text-white font-extrabold text-xs rounded-md flex items-center gap-1">
+                    <Monitor className="w-3.5 h-3.5" /> 掲示板詳細
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={() => setSelectedDetailItem(null)}
+                className="p-1.5 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto space-y-4 text-sm text-slate-700">
+              {selectedDetailItem.type === 'event' && (() => {
+                const event = selectedDetailItem.data;
+                const isInspectionEvent = !!(event.createdViaInspection || (event.createdBy && event.createdBy.name === '点検登録') || (event.type === 'inspection' && event.targetYearMonth));
+                const creatorName = isInspectionEvent ? '点検登録' : event.createdBy?.name;
+
+                return (
+                  <div className="space-y-4">
+                    <div>
+                      <h3 className="font-bold text-slate-900 text-lg">{event.title}</h3>
+                      <div className="flex items-center gap-2 mt-1 flex-wrap">
+                        <span className="text-xs text-slate-400">
+                          登録: {formatRelativeTime(selectedDetailItem.date)}
+                        </span>
+                        {creatorName && (
+                          <span className={`px-2 py-0.5 text-[10px] font-bold rounded flex items-center gap-1 ${
+                            isInspectionEvent ? 'bg-emerald-100 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-700'
+                          }`}>
+                            <UserCheck className="w-3 h-3" />
+                            登録者: {creatorName}
+                          </span>
+                        )}
+                        {event.targetYearMonth && (
+                          <span className="px-1.5 py-0.5 bg-slate-100 text-slate-600 text-[10px] font-bold rounded">
+                            {event.targetYearMonth}度
+                          </span>
+                        )}
+                        {(event.isPrivate || (event as any).isSecret) && (
+                          <span className="px-2 py-0.5 text-[10px] font-bold rounded flex items-center gap-1 bg-rose-50 text-rose-700 border border-rose-200">
+                            <Lock className="w-3 h-3 text-rose-600" />
+                            他人から隠す（非公開）
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="bg-amber-50/60 rounded-xl p-4 border border-amber-100 space-y-2.5 text-xs">
+                      <div className="flex items-center gap-2 font-bold text-amber-950 bg-amber-100/70 px-2.5 py-1.5 rounded-lg border border-amber-200/80">
+                        <Clock className="w-4 h-4 text-amber-700 shrink-0" />
+                        <span>予定日時: {formatEventScheduleBadge(event.start, event.end, event.isAllDay)}</span>
+                      </div>
+                      {event.location && (
+                        <div className="flex items-center gap-2 text-slate-700">
+                          <MapPin className="w-4 h-4 text-amber-600 shrink-0" />
+                          <span>場所: {event.location}</span>
+                        </div>
+                      )}
+                      {event.memo && (
+                        <div className="text-slate-700 pt-2 border-t border-amber-100 whitespace-pre-wrap leading-relaxed">
+                          {renderContentWithLinks(event.memo)}
+                        </div>
+                      )}
+                      {event.attendees && event.attendees.length > 0 && (
+                        <div className="pt-2 border-t border-amber-100">
+                          <span className="font-bold text-slate-700 mb-1.5 block">参加メンバー ({event.attendees.length}名):</span>
+                          <div className="flex flex-wrap gap-2">
+                            {event.attendees.map(a => (
+                              <div key={a.id} className="flex items-center gap-1.5 bg-white border border-amber-200 px-2 py-1 rounded-md">
+                                <img src={getAvatarUrl(a.id === currentUser?.id ? (currentUser?.avatarUrl || a.avatarUrl) : a.avatarUrl)} onError={handleAvatarError} alt={a.name} className="w-4 h-4 rounded-full object-cover" />
+                                <span className="font-bold text-[11px] text-slate-800">{a.name}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {event.attachments && event.attachments.length > 0 && (
+                        <div className="pt-2 border-t border-amber-100 space-y-1.5">
+                          <span className="font-bold text-slate-700 flex items-center gap-1.5">
+                            <Paperclip className="w-3.5 h-3.5 text-indigo-500" />
+                            添付ファイル ({event.attachments.length})
+                          </span>
+                          <div className="grid grid-cols-1 gap-1.5">
+                            {event.attachments.map(att => (
+                              <div
+                                key={att.id}
+                                className="flex items-center justify-between p-2 bg-white border border-amber-200/80 rounded-lg"
+                              >
+                                <div className="flex items-center gap-1.5 min-w-0 pr-2">
+                                  <Paperclip className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                  <div className="min-w-0">
+                                    <div className="text-xs font-bold text-slate-800 truncate">{att.name}</div>
+                                    <div className="text-[10px] text-slate-400">{att.size}</div>
+                                  </div>
+                                </div>
+                                <div className="flex items-center gap-1.5 shrink-0">
+                                  {isPreviewable(att.name, att.type) && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setPreviewFile(att);
+                                        setIsPreviewOpen(true);
+                                      }}
+                                      className="px-2 py-0.5 text-[10px] font-bold text-emerald-600 hover:bg-emerald-50 rounded border border-emerald-200 transition-colors flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <Eye className="w-3 h-3" />
+                                      プレビュー
+                                    </button>
+                                  )}
+                                  <a
+                                    href={att.url || '#'}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    download={att.name}
+                                    className="px-2 py-0.5 text-[10px] font-bold text-indigo-600 hover:bg-indigo-50 rounded transition-colors"
+                                  >
+                                    ダウンロード
+                                  </a>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {onChangeTab && (
+                      <div className="pt-2 flex justify-end">
+                        <button
+                          onClick={() => {
+                            setSelectedDetailItem(null);
+                            onChangeTab('calendar');
+                          }}
+                          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 shadow-xs transition-colors"
+                        >
+                          カレンダーで確認 <ArrowUpRight className="w-4 h-4" />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {selectedDetailItem.type === 'topic' && (() => {
+                const topic = selectedDetailItem.data;
+                return (
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-3">
+                      <img
+                        src={getAvatarUrl(topic.author?.id === currentUser?.id ? (currentUser?.avatarUrl || topic.author?.avatarUrl) : topic.author?.avatarUrl)}
+                        onError={handleAvatarError}
+                        alt={topic.author?.name || '匿名'}
+                        className="w-10 h-10 rounded-full object-cover border border-slate-100 bg-slate-100"
+                      />
+                      <div>
+                        <div className="font-bold text-slate-900 text-sm">{topic.author?.name || '匿名'}</div>
+                        <div className="text-xs text-slate-400">{topic.office || '全社'} / {topic.division || '全部署'}</div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <h3 className="font-bold text-slate-900 text-base mb-2">{topic.title}</h3>
+                      <div className="text-slate-800 leading-relaxed whitespace-pre-wrap bg-slate-50/60 p-4 rounded-xl border border-slate-100">
+                        {renderContentWithLinks(topic.content)}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs pt-3 border-t border-slate-100">
+                      <div className="flex items-center gap-3 text-slate-500">
+                        <span className="flex items-center gap-1">
+                          <MessageSquare className="w-3.5 h-3.5 text-slate-400" />
+                          {topic.commentsCount || 0} 件のコメント
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <Eye className="w-3.5 h-3.5 text-slate-400" />
+                          {topic.views || 0} 回閲覧
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const url = buildAppUrl({ tab: 'board', topicId: topic.id });
+                            const ok = await copyTextToClipboard(url);
+                            if (ok) {
+                              setCopiedDetailLink(true);
+                              setTimeout(() => setCopiedDetailLink(false), 2500);
+                            }
+                            if (currentUser && onUpdateUser) {
+                              const subtitleParts = [
+                                topic.author?.name,
+                                topic.office && topic.office !== '全社' ? topic.office : undefined,
+                              ].filter(Boolean);
+                              const { updatedUser } = upsertBookmarkForUser(currentUser, {
+                                category: 'board',
+                                title: topic.title || '掲示板トピック',
+                                subtitle: subtitleParts.join(' ・ ') || undefined,
+                                params: { tab: 'board', topicId: topic.id },
+                              });
+                              onUpdateUser(updatedUser);
+                            }
+                          }}
+                          className={`px-3 py-2 rounded-xl text-xs font-bold border transition-colors flex items-center gap-1.5 cursor-pointer ${
+                            copiedDetailLink
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-300 ring-2 ring-emerald-200'
+                              : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200 hover:text-indigo-600'
+                          }`}
+                          title="この掲示板トピックへの共有リンクをコピー"
+                        >
+                          {copiedDetailLink ? (
+                            <>
+                              <Check className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>URLコピー完了!</span>
+                            </>
+                          ) : (
+                            <>
+                              <Share2 className="w-3.5 h-3.5 text-slate-500" />
+                              <span>共有リンク</span>
+                            </>
+                          )}
+                        </button>
+                        {onChangeTab && (
+                          <button
+                            onClick={() => {
+                              setSelectedDetailItem(null);
+                              onChangeTab('board');
+                            }}
+                            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 shadow-xs transition-colors"
+                          >
+                            掲示板で確認 <ArrowUpRight className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <FilePreviewModal
+        isOpen={isPreviewOpen}
+        onClose={() => setIsPreviewOpen(false)}
+        file={previewFile}
+      />
+    </div>
+  );
+});
+
+

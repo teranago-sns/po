@@ -1,0 +1,1095 @@
+import type { AppQueryParams } from '../utils/urlParams';
+
+export interface CategoryEmailNotificationOption {
+  pc: boolean;      // PCメール (email) 送信
+  mobile: boolean;  // 携帯メール (mobileEmail) 送信
+}
+
+export interface EmailNotificationSettings {
+  schedule?: CategoryEmailNotificationOption;   // スケジュール (登録・変更・参加)
+  bulletin?: CategoryEmailNotificationOption;   // 掲示板 (新規投稿・閲覧依頼)
+  memo?: CategoryEmailNotificationOption;       // 伝言メモ (新規伝言・宛先指定)
+  workflow?: CategoryEmailNotificationOption;   // ワークフロー (承認依頼・判定結果)
+  post?: CategoryEmailNotificationOption;       // 社内SNS (返信・メンション)
+  inspection?: CategoryEmailNotificationOption; // 点検・報告書 (提出・レビュー依頼)
+  project?: CategoryEmailNotificationOption;    // プロジェクト・Todo (担当アサイン・コメント)
+}
+
+export interface CalendarPreset {
+  id: string;
+  name: string;
+  createdAt: string;
+  mode: 'personal' | 'team';
+  view: 'month' | 'week' | 'day' | 'list';
+  officeId?: string;
+  office?: string;
+  divisionId?: string;
+  division?: string;
+  typeFilter?: string;
+  groupId?: string; // マイグループID
+  targetUserId?: string;   // 個人カレンダー表示対象メンバーID
+  targetUserName?: string; // 個人カレンダー表示対象メンバー名スナップショット
+}
+
+export interface MyPageSectionCounts {
+  events?: number;   // スケジュール (0 = 全件, デフォルト: 5)
+  topics?: number;   // 掲示板 (デフォルト: 5)
+  memos?: number;    // 伝言メモ (デフォルト: 5)
+  projects?: number; // プロジェクト・マイタスク (デフォルト: 5)
+  workflow?: number; // ワークフロー (デフォルト: 5)
+  chats?: number;    // チャットルーム (デフォルト: 8)
+  reports?: number;  // 日報・週報 (デフォルト: 8)
+}
+
+export interface MyPageEnvSettings {
+  displayCounts?: MyPageSectionCounts;
+  density?: 'standard' | 'compact';        // カード内表示密度 (標準 / コンパクト)
+  showActivePolls?: boolean;               // 進行中日程調整の表示（デフォルト: true）
+  [key: string]: any;                      // 将来の環境設定拡張用
+}
+
+export interface CalendarViewSettings {
+  hideWeekends?: boolean;               // 平日のみ表示 (土日非表示 / 5日表示)
+  workStartHour?: number;               // 表示開始時刻 (例: 8)
+  workEndHour?: number;                 // 表示終了時刻 (例: 19)
+  isTimeFilterActive?: boolean;         // 時間帯絞り込みを有効にするか
+  density?: 'standard' | 'compact';     // 表示密度 (標準 / コンパクト)
+}
+
+export interface CalendarMemberGroup {
+  id: string;
+  name: string;
+  memberIds: string[];
+  createdAt?: string;
+}
+
+export type UserBookmarkCategory =
+  | 'calendar'
+  | 'board'
+  | 'chat'
+  | 'timeline'
+  | 'workflow'
+  | 'memo'
+  | 'daily_report'
+  | 'site'
+  | 'assets'
+  | 'projects'
+  | 'other';
+
+export interface UserBookmarkItem {
+  id: string;                 // 重複判定用一意キー (例: 'board:t-123', 'chat:room-1')
+  category: UserBookmarkCategory;
+  title: string;              // 一覧表示用タイトル
+  subtitle?: string;          // 補足情報 (例: 投稿者、拠点/部署、日付)
+  params: AppQueryParams;     // 遷移＆URL再生成用パラメータ
+  isPinned?: boolean;         // ピン留めフラグ（trueの項目を一覧先頭に固定）
+  pinnedAt?: string;          // ピン留め日時 (ISO string)
+  createdAt: string;          // 初回登録日時 (ISO string)
+  updatedAt?: string;         // 最終ストック日時 (ISO string)
+}
+
+export interface AssetSortConfig {
+  key: string;
+  dir: 'asc' | 'desc';
+}
+
+export interface AssetViewSettings {
+  rememberSortByCategory?: Record<string, boolean>;
+  sortsByCategory?: Record<string, AssetSortConfig>;
+  columnWidths?: Record<string, Record<string, number>>;
+}
+
+export type ToggleableMenuKey =
+  | 'projects'
+  | 'daily_report'
+  | 'inspection_report'
+  | 'site_management'
+  | 'assets';
+
+export interface MenuVisibilitySettings {
+  projects?: boolean;          // プロジェクト（デフォルト: true / ON、マイページ連動）
+  daily_report?: boolean;      // 週報・保守日報（デフォルト: true / ON、マイページ連動）
+  inspection_report?: boolean; // 点検報告書（デフォルト: true / ON）
+  site_management?: boolean;   // 現場管理（デフォルト: true / ON）
+  assets?: boolean;            // 資産管理（デフォルト: true / ON）
+}
+
+export interface UserPreferences {
+  mypageSectionOrder?: string[];
+  mypageSectionCounts?: MyPageSectionCounts; // マイページ各セクションの表示件数
+  mypageSettings?: MyPageEnvSettings;       // マイページ環境設定（将来拡張対応）
+  isSidebarCollapsed?: boolean;
+  isUtilityOpen?: boolean; // ユーティリティメニューの開閉状態（記憶用）
+  emailNotifications?: EmailNotificationSettings;
+  allowedTabs?: string[];
+  menuVisibility?: MenuVisibilitySettings; // 個別メニュー表示ON/OFF設定（デフォルト: すべてON）
+  showInspectionScheduler?: boolean; // 点検予定管理メニューの表示（デフォルト: false / OFF）
+  showSharedFiles?: boolean;         // 共有ファイルメニューの表示（デフォルト: false / OFF）
+  showSafetyConfirmation?: boolean;  // 安否確認発動メニューの表示（デフォルト: false / OFF）
+  hideInspectionScheduler?: boolean; // 互換用
+  hideSharedFiles?: boolean;         // 互換用
+  hideSafetyConfirmation?: boolean;  // 互換用
+  calendarPresets?: CalendarPreset[]; // カレンダー表示設定のお気に入り一覧
+  defaultCalendarPresetId?: string;  // カレンダー起動時の初期表示プリセットID
+  calendarViewSettings?: CalendarViewSettings; // カレンダー表示設定 (平日のみ/時間帯/密度)
+  calendarMemberGroups?: CalendarMemberGroup[]; // カレンダー用マイグループ一覧
+  favoriteTopicIds?: string[];       // 掲示板のお気に入りトピックID一覧
+  bookmarks?: UserBookmarkItem[];    // 共有リンク等から自動ストックされる個人ブックマーク一覧
+  assetViewSettings?: AssetViewSettings; // 資産管理（種類ごとの並び替え記憶・列幅設定）
+  colorTheme?: string;               // 選択カラーテーマ (soft, sage, terracotta等)
+  fontSize?: 'small' | 'standard' | 'medium' | 'large'; // 選択フォントサイズ (小/標準/中/大)
+  notificationWindowSize?: 'small' | 'medium' | 'large'; // 通知ウィンドウの大きさ (小/中/大)
+  [key: string]: any;
+}
+
+export interface User {
+  id: string;
+  loginId?: string;
+  password?: string;
+  name: string;
+  kanaName?: string;     // 名前（フリガナ）
+  department: string;    // 表示用（例: 名古屋 営業）
+  officeId?: string;     // 所属拠点マスターID（例: off-1）
+  office?: string;       // 所属拠点表示名スナップショット（例: 名古屋）
+  divisionId?: string;   // 所属部署マスターID（例: div-1）
+  division?: string;     // 所属部署表示名スナップショット（例: 総務）
+  positionId?: string;   // 役職マスターID（例: pos-1）
+  position?: string;     // 役職表示名スナップショット（例: 課長補佐）
+  avatarUrl: string;
+  isAdmin?: boolean;
+  role?: 'admin' | 'user';
+  email?: string;          // メールアドレス（会社PC）
+  mobileEmail?: string;    // 携帯メールアドレス（会社携帯など）
+  personalEmailEncrypted?: string; // 暗号化された個人メールアドレス (enc:v1:...)
+  personalEmailMasked?: string;    // 表示用マスク済み個人メール (例: p***l@example.com)
+  personalEmail?: string;          // 登録・更新時の入力値用
+  phone?: string;          // 旧互換用
+  phoneOutside?: string;   // 電話番号（外線）
+  phoneExtension?: string; // 電話番号（内線）
+  mobilePhone?: string;    // 電話番号（携帯）
+  icalUrl?: string;        // 外部iCal(ICS) URL連携
+  supervisorId?: string;   // 上長（承認者）ユーザーID
+  sortOrder?: number | null; // ユーザー表示順（ソート順序 / 昇順）
+  preferences?: UserPreferences; // マイページ並び順・各種個人設定 (JSON)
+  mustChangePassword?: boolean; // 初回ログイン時・管理者指定時のパスワード変更強制フラグ
+  isPasswordDefault?: boolean;  // 初期パスワード(test)または未設定状態フラグ
+  resetPasswordToken?: string; // パスワード再設定用トークン
+  resetPasswordExpires?: string; // パスワード再設定トークンの有効期限
+  invitedAt?: string; // 招待受諾日時
+}
+
+export interface UserInvitation {
+  id: string;
+  email: string;
+  token: string;
+  role?: 'admin' | 'user';
+  officeId?: string;
+  office?: string;
+  divisionId?: string;
+  division?: string;
+  positionId?: string;
+  position?: string;
+  department?: string;
+  expiresAt: string;
+  status: 'pending' | 'accepted' | 'expired' | 'revoked';
+  createdAt: string;
+  createdByName?: string;
+  acceptedAt?: string;
+  acceptedUserId?: string;
+}
+
+export type OfficeType = 'headquarter' | 'branch' | 'sales_office' | 'other';
+
+export interface OfficeMaster {
+  id: string;
+  name: string; // 名古屋, 浜松, 静岡, 本社など
+  type: OfficeType;
+  code: string;
+  location?: string;
+  phone?: string;
+  fax?: string;
+  officeManagerId?: string;
+  officeManagerName?: string;
+  safeDrivingManagerId?: string;
+  safeDrivingManagerName?: string;
+  accountingManagerId?: string;
+  accountingManagerName?: string;
+  dispatchManagerId?: string;
+  dispatchManagerName?: string;
+}
+
+export interface DivisionMaster {
+  id: string;
+  name: string; // 管理, 営業, 設計, 工務, 保守, 保守営業, 総務など
+  code: string;
+  description?: string;
+}
+
+export interface PositionMaster {
+  id: string;
+  name: string; // 代表取締役, 部長, 課長, 課長補佐, 主任など（未選択時は役職なし/空欄）
+  code: string;
+  level?: number; // 権限レベル（80: 支店長・役員級, 50: 課長級, 30: 主任・係長級, 10: 一般）
+  description?: string;
+}
+
+export interface Post {
+  id: string;
+  author: User;
+  content: string;
+  tags: string[];
+  createdAt: string;
+  likes: number;
+  isLiked: boolean;
+  nasLink?: string;
+}
+
+export type EventType = 'personal' | 'construction' | 'inspection' | 'replacement' | 'repair' | 'visitor' | 'business_trip' | 'meeting';
+
+export type RecurrenceFrequency = 'none' | 'daily' | 'weekly' | 'monthly' | 'yearly';
+export type RecurrenceMonthlyType = 'same_day' | 'day_of_week'; // 同日 (例: 毎月15日) または 第X曜日 (例: 毎月第2火曜日)
+
+export interface RecurrenceRule {
+  frequency: RecurrenceFrequency;     // 'daily' | 'weekly' | 'monthly' | 'yearly'
+  interval?: number;                  // 1 (毎週, 毎月など)
+  daysOfWeek?: number[];              // 0: 日, 1: 月, 2: 火, 3: 水, 4: 木, 5: 金, 6: 土 (毎週で複数曜日選択可)
+  monthlyType?: RecurrenceMonthlyType; // 'same_day' | 'day_of_week'
+  monthDay?: number;                  // 毎月の特定日 (1~31)
+  weekOfMonth?: number;               // 毎月の第何週 (1~5)
+  dayOfWeek?: number;                 // 第何週の何曜日 (0~6)
+  
+  endType: 'never' | 'until_date' | 'count'; // 'never': 期限なし, 'until_date': 終了日指定, 'count': 回数指定
+  endDate?: string;                   // 終了日 (YYYY-MM-DD)
+  count?: number;                     // 繰り返し回数 (例: 10)
+}
+
+export interface CalendarEvent {
+  id: string;
+  title: string;
+  start: string; // ISO string
+  end?: string; // ISO string (optional)
+  isAllDay?: boolean; // 終日フラグ
+  isPrivate?: boolean; // 他人から隠す（非公開）フラグ
+  isSecret?: boolean;  // 互換用非公開フラグ
+  type: EventType;
+  officeId?: string;  // 対象拠点マスターID (例: off-1)
+  office?: string;    // 対象拠点表示名スナップショット (例: 全社, 名古屋支店, 本社)
+  divisionId?: string;// 対象部署マスターID (例: div-1)
+  division?: string;  // 対象部署表示名スナップショット (例: 全部署, 営業, 設計)
+  location?: string;
+  url?: string;
+  attendees: User[];
+  createdBy?: User;
+  createdById?: string;
+  attachments?: AttachmentFile[];
+  memo?: string;
+  isGoogleSynced: boolean;
+  isIcal?: boolean; // iCal連携イベントフラグ
+
+  // スケジュール・点検管理ステータス
+  status?: 'pending' | 'draft' | 'published' | 'carried_over' | 'hidden';
+  targetYearMonth?: string; // 点検対象年月 (例: '2026-08')
+  createdViaInspection?: boolean; // 点検管理からの登録フラグ
+  draftSavedAt?: string;    // 下書き・自動保存日時 (ISO string)
+
+  // 作成・更新日時
+  createdAt?: string; // 登録日時 (ISO string)
+  updatedAt?: string; // 更新日時 (ISO string)
+
+  // 繰り返し設定
+  recurrence?: RecurrenceRule;
+  recurrenceParentId?: string;     // 繰り返しシリーズの親イベントID（個別変更インスタンスの場合）
+  recurrenceOriginalDate?: string; // 個別変更された元のインスタンス日付 (YYYY-MM-DD)
+  recurrenceExceptions?: string[]; // 除外されたインスタンスの日付一覧 (YYYY-MM-DD[])
+  instanceDate?: string;           // 展開されたインスタンスの日付 (YYYY-MM-DD)
+
+  // 現場管理連携プロパティ
+  siteId?: string;           // 紐づく現場ID
+  siteCode?: string;         // 現場コード (例: NHQ136A)
+  siteName?: string;         // 現場名
+  constructionPhase?: 'new' | 'remaining' | 'shukko'; // 工事乗り込み種別: 'new' (新規), 'remaining' (残), 'shukko' (出庫有)
+
+  // 日程調整連携
+  isSchedulePoll?: boolean;
+  pollId?: string;
+  isPollOrganizer?: boolean;
+  isPollAllAnswered?: boolean;
+  hasMyPollAnswer?: boolean;
+  pollAnsweredCount?: number;
+  pollTotalTargetCount?: number;
+
+  // 資産管理・点検予定自動プロット連携
+  isAssetInspection?: boolean;
+  assetId?: string;
+  assetLogId?: string;
+  assetDueConfirmation?: boolean;
+  assetCategoryName?: string;
+}
+
+export type ConstructionPhase = 'new' | 'remaining' | 'shukko';
+
+
+export type ApplicationType = 'purchase_order' | 'purchase_request' | 'inventory_issue' | 'business_trip' | 'gold_silver_daily_report' | 'other';
+export type ApplicationStatus = 'pending' | 'approved' | 'rejected' | 'draft';
+
+export type OfficeRoleApproverType =
+  | 'office_manager'
+  | 'dispatch_manager'
+  | 'accounting_manager'
+  | 'safe_driving_manager';
+
+export type ApproverType =
+  | 'supervisor_1'
+  | 'supervisor_2'
+  | 'supervisor_n'
+  | 'specific_user'
+  | 'supervisor'
+  | OfficeRoleApproverType;
+
+export interface ApprovalApproverCandidate {
+  approverType: ApproverType;
+  supervisorLevel?: number; // N段階目の上長階層 (1: 直属上長, 2: 二次上長, ...)
+  specificUserId?: string; // 個人指定の場合のユーザーID
+  targetOfficeId?: string; // 拠点ロール時の参照拠点ID（未指定/空=申請対象拠点、指定時はその固定拠点）
+}
+
+export interface ApprovalStepConfig {
+  stepNumber: number; // 1, 2, 3, ... N段階
+  approverType: ApproverType;
+  supervisorLevel?: number; // N段階目の上長階層 (1: 直属上長, 2: 二次上長, 3: 三次上長...)
+  specificUserId?: string; // 個人指定の場合のユーザーID
+  targetOfficeId?: string; // 拠点ロール時の参照拠点ID（未指定/空=申請対象拠点（自拠点/フォーム選択拠点）、指定時はその固定拠点）
+  manualApproverId?: string; // 拠点ロール・上長未設定時や手動上書き時に申請者が指定した承認者ID
+  resolvedApproverId?: string; // 申請確定時に解決された承認者IDスナップショット（通知・未読判定の整合性用）
+  stepName?: string; // 表示用ステップ名
+  // フェーズ2（OR承認）フィールド：いずれか1名が承認すればステップ完了
+  approvalMode?: 'single' | 'or';
+  orApprovers?: ApprovalApproverCandidate[]; // 主条件に追加するOR承認候補ルール（上長・拠点ロール・個人指定すべて対応）
+  orApproverUserIds?: string[]; // 申請確定時に解決されたOR承認候補ユーザーIDスナップショット
+}
+
+export interface ApprovalFlowRule {
+  id: string;
+  name: string;
+  description?: string;
+  targetApplicationType?: ApplicationType | 'all';
+  targetOfficeIds?: string[]; // 対象拠点マスターID一覧（空/未指定 = 全拠点共通）
+  priority?: number; // 同一条件が複数ある場合の優先度（数値が大きいほど優先）
+  steps: ApprovalStepConfig[];
+  isDefault?: boolean;
+}
+
+export interface ApprovalHistoryRecord {
+  stepNumber: number;
+  approver: User;
+  status: 'approved' | 'rejected';
+  actionAt: string; // ISO string
+  comment?: string;
+  // フェーズ2（代理承認・OR承認）向け監査証跡フィールド
+  actedAsProxy?: boolean;
+  originalApprover?: User;
+  proxyReason?: string;
+}
+
+export interface PurchaseOrderItem {
+  id?: string;
+  itemCode?: string;    // 品番・品名コード
+  itemName: string;     // 品名
+  quantity: number;     // 数量
+  unitPrice: number;    // 単価
+  amount: number;       // 小計 (quantity * unitPrice)
+  note?: string;        // 備考
+}
+
+export interface ItemMaster {
+  id: string;
+  name: string;         // 品名
+  category?: string;    // 分類・カテゴリ
+  defaultUnitPrice?: number; // 標準単価
+  unitPrice?: number;   // 単価（後方互換・DBカラム差異吸収用）
+  unit?: string;        // 単位（個、式、本など）
+  code?: string;        // 品名コード
+  description?: string; // 備考・説明
+  spec?: string;        // 仕様・規格
+  minStock?: number;    // 最小在庫
+  currentStock?: number;// 現在在庫
+}
+
+export interface WorkflowApplication {
+  id: string;
+  type: ApplicationType;
+  title: string;
+  description: string;
+  applicant: User;
+  approver: User; // 現在の承認者
+  status: ApplicationStatus;
+  amount?: number;
+  quantity?: number;
+  startDate?: string; // ISO string
+  endDate?: string; // ISO string
+  createdAt: string; // ISO string
+
+  // 購入申請・発注申請用明細・拡張情報
+  purchasePurpose?: string; // 購入目的
+  purchaseTiming?: 'urgent' | 'by_date'; // 購入時期 ('urgent': 至急, 'by_date': ◯までに必要)
+  purchaseDueDate?: string; // 期日指定時の必要期日 (YYYY-MM-DD)
+  purchaseVendor?: string; // 購入元 (例: Amazon, アスクル, モノタロウ, 〇〇商事など)
+  purchaseMethod?: 'self' | 'delegate'; // 購入方法 ('self': 自分で購入, 'delegate': ◯さんに購入を依頼)
+  purchaserDelegateUserId?: string; // 購入依頼先ユーザーID
+  purchaserDelegateUser?: User; // 購入依頼先ユーザー情報
+  constructionDate?: string; // 工事予定日 (YYYY-MM-DD)
+  purchaseItems?: PurchaseOrderItem[];
+  purchaseOrderNumber?: string; // 発注No (承認ルート/管理で付与)
+  linkedInventoryIssueId?: string; // 移行作成された出庫依頼のID
+
+  // 金銀日報用拡張情報
+  previousBalance?: number; // 前回残高
+  currentBalance?: number;  // 今回残高
+  location?: string;        // 拠点
+  officeId?: string;        // 拠点マスターID (名称変更耐性)
+
+  // 承認フロー拡張
+  flowId?: string;
+  flowName?: string;
+  currentStepIndex?: number; // 1: 一次承認中, 2: 二次承認中
+  totalSteps?: number;      // 1 または 2
+  stepsConfig?: ApprovalStepConfig[];
+  history?: ApprovalHistoryRecord[];
+  rejectReason?: string;
+
+  // 案件・報告書連携拡張プロパティ
+  jobNo?: string;
+  inspectionReportId?: string;
+  dailyReportId?: string;
+  attachments?: AttachmentFile[];
+}
+
+export type BoardCategory = 'all' | 'general' | 'hr' | 'it';
+
+export interface BoardComment {
+  id: string;
+  author: User;
+  content: string;
+  createdAt: string;
+  attachments?: AttachmentFile[];
+}
+
+export interface BoardViewer {
+  id?: string;
+  user: User;
+  viewedAt: string;
+}
+
+export interface AttachmentFile {
+  id: string;
+  name: string;
+  size: string;
+  url?: string;
+  type?: string;
+}
+
+export interface BoardPollOption {
+  id: string;
+  text: string;
+  requireComment?: boolean; // この選択肢を選んだ場合は理由コメント必須
+}
+
+export interface BoardPollVote {
+  id: string;
+  userId: string;
+  userName: string;
+  userAvatarUrl?: string;
+  selectedOptionIds: string[]; // 選択された選択肢ID
+  comment?: string; // 理由コメント
+  votedAt: string; // ISO string (JST)
+}
+
+export interface BoardPoll {
+  id: string;
+  title?: string;
+  options: BoardPollOption[];
+  allowMultiple?: boolean; // 複数選択可否 (デフォルト false)
+  isAnonymous?: boolean;   // 匿名投票か (デフォルト false)
+  deadline?: string | null; // 回答期限 (YYYY-MM-DD または ISO string)
+  autoPinUntilDeadline?: boolean; // 回答期限までは自動ピン留め (デフォルト true)
+  isClosed?: boolean;      // 途中で締め切られたか（早期締め切りフラグ）
+  closedAt?: string;       // 締め切り日時 (ISO string)
+  votes: BoardPollVote[];
+}
+
+export interface BoardTopic {
+  id: string;
+  category?: BoardCategory;
+  title: string;
+  content: string;
+  author: User;
+  createdAt: string; // ISO string
+  views: number;
+  likes?: number;
+  commentsCount: number;
+  
+  // 拡張項目
+  officeId?: string;  // 公開範囲マスターID（拠点: off-1など、全社時は未設定または'all'）
+  office?: string;    // 公開範囲表示名（拠点: 全社、本社、名古屋支店など）
+  divisionId?: string;// 公開範囲マスターID（部署: div-1など、全部署時は未設定または'all'）
+  division?: string;  // 公開範囲表示名（部署: 全部署、営業、設計など）
+  scope?: string;     // 公開範囲のスコープ（'全社' | 'members' 等）
+  isStrictScope?: boolean; // 公開範囲のみ表示フラグ（指定拠点・部署・メンバー以外のユーザーには限定非表示）
+  targetUserIds?: string[]; // 対象メンバーIDスナップショット（マイグループ・指定メンバー公開時）
+  targetGroupName?: string; // 公開範囲表示用グループ名ラベル（例: 営業プロジェクトチーム）
+  tags: string[];     // タグ配列
+  attachments?: AttachmentFile[];
+  hasPeriod?: boolean;  // 公開期間設定（デフォルト: false）
+  startDate?: string;   // YYYY-MM-DD
+  endDate?: string;     // YYYY-MM-DD
+  isPinned?: boolean;   // ピン留め設定
+  pinnedUntil?: string | null; // ピン留め有効期限（ISO文字列、nullまたは空文字は無期限）
+  pinnedDuration?: '1week' | '1month' | 'forever'; // 選択されたピン留め期間種別
+  poll?: BoardPoll;     // アンケート・投票データ
+  comments?: BoardComment[];
+  viewers?: BoardViewer[];
+}
+
+export interface ChatMessage {
+  id: string;
+  sender: User;
+  content: string;
+  createdAt: string; // ISO string
+  type?: 'text' | 'stamp' | 'image' | 'file' | 'quiz';
+  imageUrl?: string;
+  thumbnailUrl?: string; // 軽量サムネイルURL (チャットタイムライン爆速表示用)
+  images?: Array<{ url: string; thumbnailUrl?: string }>; // 複数写真アルバム（最大10枚）
+  stampId?: string;
+  stampText?: string;
+  stampCategory?: string;
+  attachments?: AttachmentFile[];
+  viewers?: BoardViewer[];
+  quizId?: string;
+  quiz?: import('./chatQuiz').ChatQuizData;
+}
+
+export interface ChatRoom {
+  id: string;
+  name?: string;
+  avatarUrl?: string | null;
+  type: 'dm' | 'group';
+  participants: User[];
+  messages: ChatMessage[];
+  lastUpdated: string;
+  readStatus?: Record<string, string>;
+  adminIds?: string[];
+  totalMessagesCount?: number;
+  hasMoreMessages?: boolean;
+}
+
+export type RequirementType = 
+  | 'phone_called'       // 電話がありました
+  | 'has_message'        // 伝言があります
+  | 'call_again'         // 再度電話します（折り返し不要）
+  | 'please_call_back'   // 折り返し連絡下さい
+  | 'custom';            // 自由記入
+
+export interface MemoUserRecipientStatus {
+  userId: string;
+  userName: string;
+  avatarUrl?: string;
+  department?: string;
+  office?: string;
+  division?: string;
+  isViewed: boolean;
+  viewedAt?: string;    // 閲覧日時 (ISO string)
+  isHandled: boolean;
+  handledAt?: string;   // 対応日時 (ISO string)
+  handledByUserId?: string;
+  handledByUserName?: string;
+  status?: string;
+}
+
+export interface Memo {
+  id: string;
+  // 依頼者情報
+  fromName: string;            // 依頼者名
+  fromCompany?: string;        // 依頼者会社・組織名
+  fromPhone?: string;          // 依頼者連絡先（電話番号）
+  fromEmail?: string;          // 依頼者メールアドレス
+  
+  // 通知先
+  notificationEmail?: string;       // 通知先メールアドレス
+  notificationMobileEmail?: string; // 通知先携帯メールアドレス
+
+  // 宛先指定 (拠点、部署、個人の複数指定可能)
+  targetOffices?: string[];    // 指定拠点 (例: ["名古屋", "浜松"])
+  targetDivisions?: string[];  // 指定部署 (例: ["営業", "総務"])
+  toUsers: User[];             // 指定個人ユーザー配列
+  toUser?: User;               // 旧互換用
+
+  // 要件・本文
+  requirementType: RequirementType;
+  requirementText?: string;    // 要件テキスト
+  content: string;             // 本文内容
+
+  // 全体ステータス・作成情報
+  status: 'unread' | 'read' | 'handled'; // 全体ステータス
+  createdAt: string;           // 作成日時 ISO string
+  createdByUser?: User;        // 伝言受付作成者
+  senderId?: string;           // 作成者ID (DB互換)
+
+  // 各対象者の閲覧・対応状況
+  recipientStatuses: MemoUserRecipientStatus[];
+
+  // 伝言メモ対応コメント（公開・非公開[自分のみ閲覧]対応）
+  comments?: MemoComment[];
+  commentsJson?: string;
+}
+
+export interface MemoComment {
+  id: string;
+  memoId: string;
+  author: User;
+  content: string;
+  isPrivate: boolean; // true = 宛先担当者（自分）のみ閲覧可能, false = 全員に公開
+  createdAt: string; // ISO string
+}
+
+export interface AppNotification {
+  id: string;
+  user_id: string;
+  sender_id?: string;
+  type: string;
+  title: string;
+  contents?: string;
+  target_id?: string;
+  is_read: boolean | number;
+  created_at: string;
+  // UI / Frontend compatibility aliases
+  userId?: string;
+  senderId?: string;
+  senderName?: string;
+  senderAvatar?: string;
+  content?: string;
+  targetId?: string;
+  isRead?: boolean;
+  createdAt?: string;
+}
+
+export type WorkReportType = 'daily' | 'weekly' | 'maintenance_daily' | 'construction_daily' | 'sales_daily' | 'driving_log';
+export type WorkReportStatus = 'draft' | 'submitted' | 'reviewed';
+
+export interface DrivingLogRow {
+  date: string;                         // YYYY-MM-DD (JST)
+  monthDayLabel: string;                // e.g. '10月26日'
+  alcoholPresence: '無' | '有' | '';    // 酒気帯びの有無
+  alcoholValue: string;                 // e.g. '0.00'
+  driverName: string;                   // 運転者氏名
+  departureTime: string;                // 出発時刻 e.g. '08:30'
+  departureMeter: number | '';          // 出発時メーター (Km)
+  destination: string;                  // 訪問先
+  arrivalTime: string;                  // 帰着時刻 e.g. '17:30'
+  arrivalMeter: number | '';            // 帰着時メーター (Km)
+  distanceKm: number | '';              // 走行距離 (Km)
+  fuelLiters: number | '';              // ガソリン給油 (㍑)
+  fuelAmount: number | '';              // 給油金額 (円)
+}
+
+export interface DrivingLogInspectionItem {
+  key: string;       // 例: 'ky_declaration'
+  label: string;     // 例: 'ＫＹ宣言の実施'
+  method: string;    // 例: '発声'
+  enabled?: boolean; // 有効/無効フラグ (標準 true)
+}
+
+export interface DrivingLogStampLabels {
+  slot1: string; // 例: '担当者'
+  slot2: string; // 例: '所属長'
+  slot3: string; // 例: '拠点長'
+  slot4: string; // 例: '安全運転管理者'
+}
+
+export interface DrivingLogDefaultSettings {
+  closingDay: number;                   // 月度締日 (標準: 25 -> 前月26日〜当月25日)
+  defaultAlcoholPresence: '無' | '有' | ''; // クイック入力時の標準酒気帯び判定
+  defaultAlcoholValue: string;          // クイック入力時の標準検知機数値 (例: '0.00')
+  defaultDepartureTime: string;         // クイック入力時の標準出発時刻 (例: '08:30')
+  autoCheckAllInspectionOnNew: boolean; // 新規月度作成時に点検項目を標準で一括ONにするか
+  showLegalNotesOnPrint: boolean;       // A4帳票下部のアルコール検知義務注記を表示するか
+  legalNotesText?: string;              // 注記テキスト
+  footerTotalNoticeText?: string;       // 合計欄注記テキスト
+}
+
+export interface DrivingLogOfficeConfig {
+  id: string;                      // 例: 'drv-cfg-office-off-1'
+  officeId?: string;               // 拠点マスターID
+  officeName: string;              // 拠点表示名スナップショット
+  inspectionItems: DrivingLogInspectionItem[]; // 日常点検チェックリスト項目
+  kyDeclarationTitle: string;      // KY宣言欄の見出し (標準: 'K Y 宣 言')
+  kyDeclarationLines: string[];    // KY宣言文言リスト
+  stampLabels: DrivingLogStampLabels; // 承認印4枠の名称
+  defaultSettings: DrivingLogDefaultSettings; // 初期値・締日・印刷オプション
+  updatedAt?: string;
+}
+
+export interface DrivingLogData {
+  targetYear: number;                   // 対象年度 (例: 2026)
+  targetMonth: number;                  // 対象月度 (例: 11 -> 10月26日〜11月25日)
+  periodStart: string;                  // YYYY-MM-DD (例: '2026-10-26')
+  periodEnd: string;                    // YYYY-MM-DD (例: '2026-11-25')
+  reportDate: string;                   // 報告日 YYYY-MM-DD
+  vehicleAssetId?: string;              // 資産管理の車両ID
+  officeId?: string;                    // 適用拠点マスターID
+  officeName?: string;                  // 適用拠点名
+  officeAndDepartment: string;          // 拠点・部署名 (例: '名古屋支店 工務課')
+  driverAssigneeName: string;           // 車両担当者 (例: '安藤 浩靖')
+  vehicleModel: string;                 // 車種 (例: 'レジアスエース')
+  registrationNumber: string;           // 登録番号 (例: '名古屋401ま8977')
+  inspectionChecks: Record<string, boolean>; // 日常点検項目の実施チェック
+  inspectionItemsSnapshot?: DrivingLogInspectionItem[]; // 保存時の点検項目構成スナップショット
+  kyDeclarationTitleSnapshot?: string;  // 保存時のKY宣言見出し
+  kyDeclarationLinesSnapshot?: string[]; // 保存時のKY宣言文言
+  rows: DrivingLogRow[];                // 期間内の日別記録 (最大31行)
+  cashTollAmount?: number | '';         // 現金払い: 通行料
+  cashFuelAmount?: number | '';         // 現金払い: 給油代
+  totalDistanceKm?: number;             // 走行距離合計 (Km)
+  totalFuelLiters?: number;             // 給油量合計 (㍑)
+  totalFuelAmount?: number;             // 給油金額合計 (円)
+  driverStamp?: { name: string; date: string }; // 担当者印
+}
+
+export interface MaintenanceWorkRow {
+  id: string;
+  directGo?: boolean;      // 直行
+  directReturn?: boolean;  // 直帰
+  siteName: string;        // 現場名
+  workDescription: string; // 作業内容
+  district: string;        // 地区
+  peopleCount: number;     // 人数
+  coworkers: string;       // 同行者
+  startTime: string;       // 作業時間 開始 (e.g. "07:00")
+  endTime: string;         // 作業時間 終了 (e.g. "09:00")
+  contentType: string;     // 内容 (EG取替, 見積, 修理, 単体取替, 点検等)
+  inspectionCount: number; // 点検台数
+  inspectionValue: number; // 点検数値
+  oncallAmount: number;    // オンコール金額
+  oncallValue: number;     // オンコール数値
+  replacementCount: number;// 取替台数
+  replacementAmount: number; // 取替金額
+  replacementValue: number;  // 取替数値
+  buildingMaterialValue: number; // 建材数値 (※手入力 - 緑色)
+  workHours?: string;      // 算出作業時間 (e.g. "2:00")
+  jobNo?: string;          // 作業No / 受付番号 (スケジュール・点検報告書連動用)
+  eventId?: string;        // カレンダー予定ID
+}
+
+export interface MaintenanceOfficeWorkRow {
+  id: string;
+  destination: string;     // 見積提出先
+  content: string;         // 内容
+  amount: number;          // 金額
+  targetMonth: string;     // 決定予定月
+  timeMinutes: number;     // 時間(分)
+  remarks: string;         // 備考
+}
+
+export interface MaintenanceDailyReportData {
+  date: string; // YYYY-MM-DD
+  userName?: string;
+  mainWorkRows: MaintenanceWorkRow[];
+  officeWorkRows: MaintenanceOfficeWorkRow[];
+  otherOfficeWork?: string;
+  
+  // 工事・集計サマリー
+  constructionType?: string;    // 工事内容 (例: 両引き２)
+  constructionCount?: number;   // 台数 (例: 2)
+  constructionPeople?: number;  // 人数 (例: 2)
+  constructionValue?: number;   // 工事数値 (※手入力 - 緑色)
+  distanceValue?: number;       // 距離数値 (※手入力 - 緑色)
+  
+  // 時間集計
+  workHours?: string;           // 作業時間
+  officeHours?: string;         // 事務時間
+  travelHours?: string;         // 移動時間
+  breakHours?: string;          // 休憩時間
+  overtimeHours?: string;       // 残業時間 (※手入力 - 緑色)
+  totalHours?: string;          // 合計時間
+  estimateSurveyHours?: string; // 見積、現調、貼紙
+
+  // 集計値
+  dailyTotalValue?: number;     // 当日数値合計 (自動計算)
+  monthlyTotalValue?: number;   // 当月数値合計 (自動計算/累計)
+
+  // 多段階承認・差し戻し・提出情報
+  approvalHistory?: ReportApprovalRecord[];
+  submittedAt?: string;
+  isRemanded?: boolean;
+  remandedAt?: string;
+  remandedBy?: string;
+  feedbackComment?: string;
+}
+
+// 保守日報 多段階承認履歴レコード
+export interface ReportApprovalRecord {
+  step: number;
+  approverId: string;
+  approverName: string;
+  approverPositionId?: string;
+  approverPosition?: string;
+  comment?: string;
+  action: 'forwarded' | 'final_approved' | 'remanded' | 'submitted';
+  approvedAt: string; // ISO string
+}
+
+// 保守日報 拠点別カスタム様式（列の表示/非表示・様式A）
+export interface MaintenanceReportVisibleColumns {
+  directGoReturn: boolean;          // 直行・直帰
+  district: boolean;                // 地区
+  peopleCoworkers: boolean;         // 人数・同行者
+  inspection: boolean;              // 点検台数/数値
+  oncall: boolean;                  // オンコール金額/数値
+  replacement: boolean;             // 取替台数/金額/数値
+  buildingMaterial: boolean;        // 建材数値
+  photoReportLink: boolean;         // 業務アルバム写真リンク
+  showOfficeWorkTable: boolean;     // 事務作業表
+  showConstructionSummary: boolean; // 工事サマリー
+}
+
+// 保守日報 拠点別ポイント・金額初期設定
+export interface MaintenanceReportPointSettings {
+  inspectionPointPerUnit: number;   // 点検1台あたりポイント (例: 120)
+  replacementEgPoint: number;       // EG取替ポイント (例: 480)
+  replacementEgAmount: number;      // EG取替標準金額 (例: 291500)
+  replacementSinglePoint: number;   // 単体取替ポイント (例: 240)
+  replacementSingleAmount: number;  // 単体取替標準金額 (例: 150000)
+  oncallPoint: number;              // オンコール/修理ポイント (例: 115)
+  oncallAmount: number;             // オンコール/修理標準金額 (例: 34500)
+}
+
+// 保守日報 スケジュール情報転記マッピング設定
+export interface MaintenanceReportScheduleMapping {
+  siteNameSource: 'title' | 'location' | 'location_then_title';        // 現場名の転記元
+  workDescriptionSource: 'memo' | 'type' | 'memo_then_type' | 'title'; // 作業内容の転記元
+  districtSource: 'tag' | 'location' | 'default_office' | 'none';      // 地区の転記元
+  autoImportAttendees: boolean;     // 参加者から人数・同行者を自動取得するか
+  autoDetectDirectGoReturn: boolean; // メモ等から直行・直帰を自動判定するか
+  // 予定絞り込み・内容区分割り当てカスタム設定
+  onlyTargetKeywords?: boolean;      // 「点検・取替・修理」のみを取り込み対象にするか (標準: true)
+  importInspection?: boolean;        // 「点検」を自動取り込み対象にするか (標準: true)
+  importReplacement?: boolean;       // 「取替」を自動取り込み対象にするか (標準: true)
+  importRepair?: boolean;            // 「修理」を自動取り込み対象にするか (標準: true)
+  replacementDefaultCategory?: 'EG取替' | '単体取替'; // 「取替」時のデフォルト内容区分 (標準: 'EG取替')
+  inspectionDefaultCategory?: '点検';               // 「点検」時のデフォルト内容区分 (標準: '点検')
+  repairDefaultCategory?: '修理' | 'オンコール';     // 「修理」時のデフォルト内容区分 (標準: '修理')
+}
+
+// 保守日報 拠点別設定マスター
+export interface MaintenanceReportOfficeConfig {
+  id: string;                       // 例: 'cfg-office-off-1' または 'cfg-office-名古屋'
+  officeId?: string;                // 拠点マスターID (例: 'off-1')
+  officeName: string;               // 拠点表示名スナップショット (例: '名古屋')
+  visibleColumns: MaintenanceReportVisibleColumns;
+  pointSettings: MaintenanceReportPointSettings;
+  scheduleMapping: MaintenanceReportScheduleMapping;
+  defaultBreakHours: string;        // デフォルト休憩時間 (例: '1:00')
+  defaultOvertimeHours?: string;    // デフォルト残業時間 (例: '')
+  updatedAt?: string;
+}
+
+export interface DailyReport {
+  id: string;
+  author: User;
+  author_id?: string;
+  authorId?: string;
+  reportType?: WorkReportType; // 'daily' | 'weekly' | 'maintenance_daily'
+  date?: string; // ISO string or YYYY-MM-DD
+  week_start_date?: string; // e.g. '2026-08-17'
+  weekStartDate?: string; // e.g. '2026-08-17'
+  week_label?: string; // e.g. '2026年8月17日週'
+  weekLabel?: string; // e.g. '2026年8月17日週'
+  officeId?: string; // 拠点マスターID
+  divisionId?: string; // 部署マスターID
+  department?: string; // 部署表示名 (例: '営業', '工務', '保守', '汎用')
+  tasks: string; // 今週の業務内容 / 本日の業務内容
+  results?: string; // 成果・気づき (互換用)
+  achievements?: string; // 成果・気づき (新カラム)
+  issues?: string; // 課題・問題点
+  ongoingProjects?: string; // 継続案件 (互換用)
+  continued_items?: string; // 継続案件 (新カラム)
+  tomorrowPlan?: string; // 明日の予定 / 次週予定 (互換用)
+  next_week_plans?: string; // 次週予定 (新カラム)
+  supervisor_id?: string; // 提出先上長ユーザーID (新カラム)
+  supervisorId?: string; // 提出先上長ユーザーID
+  supervisor?: User; // 提出先上長
+  status?: WorkReportStatus; // 'draft' | 'submitted' | 'reviewed'
+  submittedAt?: string; // 提出日時
+  reviewed_at?: string; // 上長確認日時 (新カラム)
+  reviewedAt?: string; // 上長確認日時
+  feedbackComment?: string; // 上長コメント・フィードバック (互換用)
+  review_feedback?: string; // 上長コメント・フィードバック (新カラム)
+  isRemanded?: boolean; // 差し戻し状態フラグ
+  remandedAt?: string; // 差し戻し日時
+  remandedBy?: string; // 差し戻し実行者
+  approvalHistory?: ReportApprovalRecord[]; // 多段階承認履歴
+  maintenanceData?: MaintenanceDailyReportData; // 保守日報専用構造データ
+  drivingLogData?: DrivingLogData; // 運転記録簿専用構造データ
+  constructionData?: Record<string, any>; // 工務日報専用拡張データ (JSON)
+  salesData?: Record<string, any>; // 営業日報専用拡張データ (JSON)
+  createdAt: string; // ISO string
+  updated_at?: string; // 更新日時 (新カラム)
+  updatedAt?: string; // 更新日時
+}
+
+export type WorkReport = DailyReport;
+
+// ==========================================
+// 安否確認システム (Safety Confirmation) 型定義
+// ==========================================
+export type DisasterType = 'earthquake' | 'typhoon_rain' | 'fire' | 'blackout' | 'drill' | 'other';
+export type SafetyStatus = 'safe' | 'minor_injury' | 'severe_injury' | 'unknown';
+export type WorkAvailability = 'available' | 'remote' | 'standby' | 'unavailable';
+export type LocationStatus = 'home' | 'office' | 'traveling' | 'shelter' | 'other';
+
+export interface SafetyConfirmationTargetFilter {
+  allOffices?: boolean;
+  offices?: string[]; // 対象拠点 (例: ['名古屋', '浜松'])
+  allDivisions?: boolean;
+  divisions?: string[]; // 対象部署 (例: ['営業', '工務'])
+  officeIds?: string[]; // 対象拠点マスターID一覧
+  divisionIds?: string[]; // 対象部署マスターID一覧
+  targetUserIds?: string[]; // 対象ユーザーID一覧 (任意指定)
+}
+
+export interface SafetyConfirmationChannelOption {
+  webPush: boolean;       // Web Push 通知
+  companyEmail: boolean;  // 会社PCメール (email)
+  mobileEmail: boolean;   // 携帯メール (mobileEmail)
+  personalEmail: boolean; // 個人メール (暗号化保存された personalEmailEncrypted)
+}
+
+export interface SafetyConfirmationStats {
+  totalTargets: number;
+  respondedCount: number;
+  safeCount: number;
+  minorInjuryCount: number;
+  severeInjuryCount: number;
+  unknownCount: number;
+  availableCount: number;
+  remoteCount: number;
+  standbyCount: number;
+  unavailableCount: number;
+}
+
+export interface SafetyConfirmationEvent {
+  id: string;
+  title: string;              // タイトル (例: 【安否確認】愛知県西部 震度5強 地震発生)
+  disasterType: DisasterType; // 災害種別 (earthquake, typhoon_rain, etc.)
+  message: string;            // メッセージ・指示内容
+  severity?: 'normal' | 'urgent' | 'critical'; // 緊急度
+  status: 'active' | 'closed'; // 状況 (active: 回答受付中, closed: 終了・締め切り)
+  targetFilter: SafetyConfirmationTargetFilter; // 対象範囲
+  targetOfficeIds?: string[];
+  targetDivisionIds?: string[];
+  channels: SafetyConfirmationChannelOption; // 通知手段
+  createdById: string;
+  createdByName: string;
+  createdAt: string;          // 発動日時 (ISO)
+  closedAt?: string;          // 終了日時 (ISO)
+  stats?: SafetyConfirmationStats;
+}
+
+export interface SafetyConfirmationResponse {
+  id: string;
+  eventId: string;
+  userId: string;
+  userName: string;
+  office?: string;
+  officeId?: string;
+  division?: string;
+  divisionId?: string;
+  safetyStatus: SafetyStatus;         // 安否状況 (safe / minor_injury / severe_injury)
+  workAvailability: WorkAvailability; // 出社可否 (available / remote / standby / unavailable)
+  locationStatus: LocationStatus;     // 現在地 (home / office / traveling / shelter / other)
+  currentAddressOrNote?: string;      // 現在地詳細・避難所名等
+  message?: string;                   // 本人コメント・連絡事項
+  contactPhone?: string;              // 緊急時連絡先電話番号
+  respondedAt: string;                // 回答日時 (ISO)
+  updatedAt?: string;
+}
+
+// ==========================================
+// 文書管理・フォルダ機能 (Documents & Folders) 型定義
+// ==========================================
+export interface FolderPermission {
+  viewers: 'all' | string[]; // 閲覧許可ユーザーID配列（'all'で全員）
+  editors: 'all' | string[]; // 追加・編集・削除許可ユーザーID配列（'all'で全員）
+}
+
+export interface DocumentFolder {
+  id: string;
+  name: string;
+  description?: string;
+  parentId: string | null;   // null はルート階層
+  orderIndex?: number;
+  createdById: string;
+  createdByName: string;
+  createdAt: string;
+  updatedAt: string;
+  permission: FolderPermission;
+  // UI用補助フィールド
+  subfolderCount?: number;
+  documentCount?: number;
+  canView?: boolean;
+  canEdit?: boolean;
+}
+
+export interface DocumentAttachedFile {
+  fileId: string;
+  fileName: string;          // 元ファイル名
+  fileSize: number;          // バイト数
+  fileUrl: string;           // アクセスURL
+  fileType?: string;         // 拡張子 / MIME
+  storagePath?: string;      // サーバー内相対パス
+}
+
+export interface DocumentVersion {
+  versionNumber: number;     // 1, 2, 3...
+  uploadedAt: string;        // 添付日（アップロード日時）
+  uploadedById: string;      // アップロード者ID
+  uploadedByName: string;    // アップロード者名
+  changeNote?: string;       // 改定メモ・理由
+  files: DocumentAttachedFile[]; // 同梱添付ファイル群
+}
+
+export interface DocumentDownloadLog {
+  id: string;
+  documentId: string;
+  versionNumber: number;
+  fileId?: string;
+  fileName?: string;
+  userId: string;
+  userName: string;
+  userDepartment?: string;
+  downloadedAt: string;
+}
+
+export interface DocumentItem {
+  id: string;
+  folderId: string;
+  title: string;              // ドキュメントタイトル
+  description?: string;       // 概要・説明
+  createdById: string;
+  createdByName: string;
+  createdAt: string;          // 初回登録日
+  updatedById: string;        // 最終更新者ID
+  updatedByName: string;      // 最終更新者名
+  updatedAt: string;          // 添付日（最終更新日）
+  downloadCount: number;      // 累計ダウンロード数
+  versions: DocumentVersion[]; // バージョン履歴
+  latestVersionNumber: number;
+  latestFiles: DocumentAttachedFile[];
+}
+
+export * from './schedulePoll';
+export * from './photoReport';
+export * from './site';
+export * from './chatQuiz';
+export * from './asset';
+export * from './project';
+

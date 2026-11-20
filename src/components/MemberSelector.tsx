@@ -1,0 +1,439 @@
+import React, { useState, useMemo } from 'react';
+import { User, OfficeMaster, DivisionMaster } from '../types';
+import { 
+  Users, 
+  Check, 
+  X, 
+  Search, 
+  ChevronDown, 
+  ChevronUp, 
+  CheckSquare, 
+  Square,
+  Building2,
+  Briefcase,
+  Filter
+} from 'lucide-react';
+import { getAvatarUrl, handleAvatarError } from '../utils/avatar';
+import { sortUsersByDivision } from '../utils/userSort';
+import {
+  resolveOffice,
+  resolveOfficeId,
+  resolveOfficeName,
+  doesUserMatchOffice,
+  resolveDivision,
+  resolveDivisionId,
+  resolveDivisionName,
+  doesUserMatchDivision,
+} from '../utils/masterResolver';
+
+export interface MemberSelectorProps {
+  allUsers: User[];
+  selectedUserIds: string[];
+  onChangeSelectedUserIds: (ids: string[]) => void;
+  offices?: OfficeMaster[];
+  divisions?: DivisionMaster[];
+  disabled?: boolean;
+  label?: string;
+  placeholder?: string;
+  className?: string;
+  defaultExpanded?: boolean;
+}
+
+export const MemberSelector: React.FC<MemberSelectorProps> = ({
+  allUsers = [],
+  selectedUserIds = [],
+  onChangeSelectedUserIds,
+  offices = [],
+  divisions = [],
+  disabled = false,
+  label = 'メンバー選択',
+  className = '',
+  defaultExpanded = false
+}) => {
+  // 絞り込みフィルター状態（マスターIDまたは未登録文字列 / 'all'）
+  const [selectedOffice, setSelectedOffice] = useState<string>('all');
+  const [selectedDivision, setSelectedDivision] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  
+  // 全拠点以下のメンバー選択エリアのトグル状態
+  const [isExpanded, setIsExpanded] = useState<boolean>(defaultExpanded);
+
+  // 利用可能な拠点リストの抽出 (Master ID主軸＋未登録拠点フォールバック)
+  const officeOptions = useMemo(() => {
+    const map = new Map<string, string>();
+    offices.forEach(o => {
+      if (o.id && o.name) map.set(String(o.id), o.name);
+    });
+    allUsers.forEach(u => {
+      const resolved = resolveOffice(u.officeId || u.office || u.department?.split(/\s+/)[0], offices);
+      if (resolved) {
+        map.set(String(resolved.id), resolved.name);
+      } else {
+        const raw = u.office || (u.department ? u.department.split(/\s+/)[0] : '');
+        if (raw && raw !== '未設定' && !map.has(raw)) {
+          map.set(raw, raw);
+        }
+      }
+    });
+    return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
+  }, [offices, allUsers]);
+
+  // 利用可能な部署リストの抽出 (Master ID主軸＋未登録部署フォールバック)
+  const divisionOptions = useMemo(() => {
+    const map = new Map<string, string>();
+    divisions.forEach(d => {
+      if (d.id && d.name) map.set(String(d.id), d.name);
+    });
+    allUsers.forEach(u => {
+      const deptPart = u.department ? u.department.split(/\s+/)[1] : '';
+      const resolved = resolveDivision(u.divisionId || u.division || deptPart, divisions);
+      if (resolved) {
+        map.set(String(resolved.id), resolved.name);
+      } else {
+        const raw = u.division || deptPart || '';
+        if (raw && raw !== '未設定' && !map.has(raw)) {
+          map.set(raw, raw);
+        }
+      }
+    });
+    return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
+  }, [divisions, allUsers]);
+
+  // 条件によるユーザーの絞り込み（マスターID照合＋後方互換）
+  const filteredUsers = useMemo(() => {
+    const list = allUsers.filter(u => {
+      // 拠点での絞り込み（マスターID正規化照合）
+      if (selectedOffice !== 'all') {
+        if (!doesUserMatchOffice(u, selectedOffice, offices)) return false;
+      }
+
+      // 部署での絞り込み（マスターID正規化照合）
+      if (selectedDivision !== 'all') {
+        if (!doesUserMatchDivision(u, selectedDivision, divisions)) return false;
+      }
+
+      // 検索ワードでの絞り込み (名前、フリガナ、メール等)
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        const matchName = u.name?.toLowerCase().includes(q);
+        const matchKana = u.kanaName?.toLowerCase().includes(q);
+        const matchDepartment = u.department?.toLowerCase().includes(q);
+        const matchEmail = u.email?.toLowerCase().includes(q);
+        if (!matchName && !matchKana && !matchDepartment && !matchEmail) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+
+    return sortUsersByDivision(list, divisions);
+  }, [allUsers, offices, divisions, selectedOffice, selectedDivision, searchQuery]);
+
+  // 選択中ユーザーオブジェクト一覧
+  const selectedUsers = useMemo(() => {
+    return allUsers.filter(u => selectedUserIds.includes(u.id));
+  }, [allUsers, selectedUserIds]);
+
+  // 抽出メンバーが全員選択されているかチェック
+  const isAllFilteredSelected = useMemo(() => {
+    if (filteredUsers.length === 0) return false;
+    return filteredUsers.every(u => selectedUserIds.includes(u.id));
+  }, [filteredUsers, selectedUserIds]);
+
+  // 抽出メンバーの全選択/全解除切り替え
+  const handleToggleSelectAllFiltered = () => {
+    if (disabled) return;
+    if (isAllFilteredSelected) {
+      // 抽出されたメンバーの選択を解除（他の条件で選択中のメンバーは維持）
+      const filteredIds = new Set(filteredUsers.map(u => u.id));
+      const nextIds = selectedUserIds.filter(id => !filteredIds.has(id));
+      onChangeSelectedUserIds(nextIds);
+    } else {
+      // 抽出されたメンバーをすべて追加（重複なし）
+      const nextSet = new Set(selectedUserIds);
+      filteredUsers.forEach(u => nextSet.add(u.id));
+      onChangeSelectedUserIds(Array.from(nextSet));
+    }
+  };
+
+  // 個別ユーザーの選択トグル
+  const handleToggleUser = (userId: string) => {
+    if (disabled) return;
+    if (selectedUserIds.includes(userId)) {
+      onChangeSelectedUserIds(selectedUserIds.filter(id => id !== userId));
+    } else {
+      onChangeSelectedUserIds([...selectedUserIds, userId]);
+    }
+  };
+
+  // 選択中のメンバーを全てクリア
+  const handleClearAll = () => {
+    if (disabled) return;
+    onChangeSelectedUserIds([]);
+  };
+
+  // 絞り込み条件の表示用テキスト
+  const filterLabel = useMemo(() => {
+    const parts: string[] = [];
+    if (selectedOffice !== 'all') parts.push(`拠点「${resolveOfficeName(selectedOffice, offices)}」`);
+    if (selectedDivision !== 'all') parts.push(`部署「${resolveDivisionName(selectedDivision, divisions)}」`);
+    if (searchQuery) parts.push(`検索「${searchQuery}」`);
+    if (parts.length === 0) return '全員';
+    return parts.join(' / ');
+  }, [selectedOffice, selectedDivision, searchQuery, offices, divisions]);
+
+  return (
+    <div className={`space-y-3 bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs ${className}`}>
+      {/* ヘッダー & 選択中人数カウント */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2.5">
+        <div className="flex items-center gap-2">
+          <Users className="w-4 h-4 text-indigo-600 shrink-0" />
+          <span className="text-xs font-bold text-slate-800">{label}</span>
+          <span className="text-xs font-extrabold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 border border-indigo-200">
+            {selectedUserIds.length} 名選択中
+          </span>
+        </div>
+
+        {selectedUserIds.length > 0 && !disabled && (
+          <button
+            type="button"
+            onClick={handleClearAll}
+            className="text-[11px] font-semibold text-rose-600 hover:text-rose-700 hover:underline transition-colors cursor-pointer"
+          >
+            全選択解除
+          </button>
+        )}
+      </div>
+
+      {/* 選択済みメンバーのタグバッジ表示エリア */}
+      {selectedUsers.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto p-2 bg-indigo-50/50 rounded-lg border border-indigo-100/80 text-xs">
+          {selectedUsers.map(u => (
+            <span
+              key={u.id}
+              className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-white text-slate-800 border border-indigo-200 text-xs font-medium shadow-2xs group"
+            >
+              <img
+                src={getAvatarUrl(u.avatarUrl)}
+                alt={u.name}
+                onError={handleAvatarError}
+                className="w-4 h-4 rounded-full object-cover shrink-0"
+              />
+              <span className="truncate max-w-[120px]">{u.name}</span>
+              {!disabled && (
+                <button
+                  type="button"
+                  onClick={() => handleToggleUser(u.id)}
+                  className="text-slate-400 hover:text-rose-600 p-0.5 rounded-full hover:bg-rose-50 transition-colors cursor-pointer"
+                  title={`${u.name} を選択解除`}
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              )}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {/* 全拠点以下の展開・折りたたみトグルボタン */}
+      <div className="pt-0.5">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => setIsExpanded(!isExpanded)}
+          className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+            isExpanded
+              ? 'bg-indigo-50 text-indigo-700 border border-indigo-200 hover:bg-indigo-100'
+              : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 hover:text-slate-900 shadow-2xs'
+          } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+        >
+          <span className="flex items-center gap-1.5">
+            <Building2 className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+            <span>
+              {isExpanded
+                ? '全拠点・部署の選択リストを閉じる'
+                : '全拠点・部署からメンバーを選択・変更する'}
+            </span>
+            {!isExpanded && selectedUserIds.length > 0 && (
+              <span className="text-[11px] text-indigo-600 font-bold ml-1">
+                ({selectedUserIds.length}名設定中)
+              </span>
+            )}
+          </span>
+          <span className="flex items-center gap-1 text-[11px] text-slate-500 font-semibold shrink-0">
+            {isExpanded ? (
+              <>
+                <span>閉じる</span>
+                <ChevronUp className="w-3.5 h-3.5" />
+              </>
+            ) : (
+              <>
+                <span>展開</span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </>
+            )}
+          </span>
+        </button>
+      </div>
+
+      {/* トグル展開時: 全拠点・部署・検索・メンバー一覧 */}
+      {isExpanded && (
+        <div className="space-y-2 pt-2 border-t border-slate-100 animate-in fade-in-50 duration-200">
+          {/* 絞り込みコントロール (拠点、部署、キーワード) */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {/* 拠点絞り込み */}
+            <div className="relative">
+              <Building2 className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <select
+                value={selectedOffice}
+                onChange={e => setSelectedOffice(e.target.value)}
+                disabled={disabled}
+                className="w-full text-xs pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium text-slate-700"
+              >
+                <option value="all">全拠点</option>
+                {officeOptions.map(off => (
+                  <option key={off.id} value={off.id}>{off.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* 部署絞り込み */}
+            <div className="relative">
+              <Briefcase className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <select
+                value={selectedDivision}
+                onChange={e => setSelectedDivision(e.target.value)}
+                disabled={disabled}
+                className="w-full text-xs pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium text-slate-700"
+              >
+                <option value="all">全部署</option>
+                {divisionOptions.map(div => (
+                  <option key={div.id} value={div.id}>{div.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* メンバー検索 */}
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder="メンバー名で検索..."
+                disabled={disabled}
+                className="w-full text-xs pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium text-slate-700"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 「全員にチェック」全選択・全解除アクションボタン */}
+          <div className="flex items-center justify-between bg-slate-50/80 px-3 py-1.5 rounded-lg border border-slate-200">
+            <div className="text-xs text-slate-600 font-medium truncate max-w-[240px] sm:max-w-xs">
+              <span className="text-slate-500 font-normal">条件: </span>
+              <span className="font-bold text-slate-800">{filterLabel}</span>
+              <span className="ml-1 text-[11px] text-slate-500">({filteredUsers.length}名該当)</span>
+            </div>
+
+            <button
+              type="button"
+              disabled={disabled || filteredUsers.length === 0}
+              onClick={handleToggleSelectAllFiltered}
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-bold transition-all cursor-pointer ${
+                isAllFilteredSelected
+                  ? 'bg-amber-100 text-amber-800 border border-amber-300 hover:bg-amber-200'
+                  : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-2xs'
+              } disabled:opacity-40 disabled:cursor-not-allowed`}
+            >
+              {isAllFilteredSelected ? (
+                <>
+                  <CheckSquare className="w-3.5 h-3.5" />
+                  <span>抽出メンバーの選択を解除</span>
+                </>
+              ) : (
+                <>
+                  <Square className="w-3.5 h-3.5" />
+                  <span>全員にチェック</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* 抽出メンバー一覧 */}
+          <div className="max-h-48 overflow-y-auto p-2 border border-slate-200 rounded-lg bg-slate-50/50 space-y-1">
+            {filteredUsers.length === 0 ? (
+              <p className="text-xs text-slate-400 text-center py-4">
+                条件に該当するメンバーが見つかりませんでした。
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-1.5">
+                {filteredUsers.map(user => {
+                  const isSelected = selectedUserIds.includes(user.id);
+                  const userDept = user.department || `${user.office || ''} ${user.division || ''}`.trim();
+
+                  return (
+                    <button
+                      key={user.id}
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => handleToggleUser(user.id)}
+                      className={`flex items-center justify-between p-2 rounded-lg text-xs font-medium border transition-all text-left cursor-pointer ${
+                        isSelected
+                          ? 'bg-indigo-50 border-indigo-400 text-indigo-950 font-bold shadow-2xs'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-100 hover:border-slate-300'
+                      } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0 pr-1">
+                        <img
+                          src={getAvatarUrl(user.avatarUrl)}
+                          alt={user.name}
+                          onError={handleAvatarError}
+                          className="w-6 h-6 rounded-full object-cover shrink-0"
+                        />
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-semibold leading-tight">{user.name}</p>
+                          {userDept && (
+                            <p className="truncate text-[10px] text-slate-500 leading-tight mt-0.5">{userDept}</p>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className={`w-4 h-4 rounded flex items-center justify-center shrink-0 border ${
+                        isSelected 
+                          ? 'bg-indigo-600 border-indigo-600 text-white' 
+                          : 'border-slate-300 bg-white'
+                      }`}>
+                        {isSelected && <Check className="w-3 h-3 stroke-[3]" />}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          <div className="flex justify-end pt-1">
+            <button
+              type="button"
+              onClick={() => setIsExpanded(false)}
+              className="text-[11px] font-bold text-slate-500 hover:text-slate-800 hover:underline flex items-center gap-1 cursor-pointer py-0.5"
+            >
+              <ChevronUp className="w-3 h-3" />
+              <span>選択リストを閉じる</span>
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

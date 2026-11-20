@@ -1,0 +1,4264 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  ShieldAlert,
+  Send,
+  AlertTriangle,
+  AlertCircle,
+  Users,
+  CheckCircle2,
+  Clock,
+  RefreshCw,
+  Search,
+  Filter,
+  Lock,
+  Mail,
+  Smartphone,
+  Bell,
+  Building2,
+  Layers,
+  ChevronRight,
+  Download,
+  AlertOctagon,
+  HeartHandshake,
+  Home,
+  Check,
+  X,
+  Eye,
+  EyeOff,
+  Radio,
+  FileSpreadsheet,
+  Info,
+  UserCheck,
+  ShieldCheck,
+  PhoneCall,
+  UserX,
+  Sparkles,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  Trash2
+} from 'lucide-react';
+import { User, OfficeMaster, DivisionMaster, DisasterType } from '../types';
+import { API_BASE_URL } from '../config/api';
+import { getAvatarUrl } from '../utils/avatar';
+import { triggerOpenUserModal } from '../utils/userModal';
+import { markSafetyEventAsResponded } from '../utils/notifications';
+import { ConfirmModal, ConfirmModalState } from './ConfirmModal';
+import {
+  resolveOffice,
+  resolveDivision,
+  isSameOffice,
+  doesUserMatchOffice,
+  doesUserMatchDivision,
+} from '../utils/masterResolver';
+
+export interface SafetyConfirmationEvent {
+  id: string;
+  title: string;
+  disasterType: DisasterType;
+  level?: string;
+  message: string;
+  targetScope: 'all' | 'offices' | 'divisions' | 'custom';
+  targetOffices?: string[];
+  targetOfficeIds?: string[];
+  targetDivisions?: string[];
+  targetDivisionIds?: string[];
+  targetUserIds?: string[];
+  channels: {
+    webPush: boolean;
+    companyEmail: boolean;
+    personalEmail: boolean;
+  };
+  isTest: boolean;
+  status: 'active' | 'closed' | 'archived';
+  createdAt: string;
+  closedAt?: string;
+  createdById: string;
+  createdByName: string;
+  totalTargetsCount?: number;
+  responseCount?: number;
+  stats?: {
+    total: number;
+    responded: number;
+    safe: number;
+    minorInjured: number;
+    severeInjured: number;
+    needRescue: number;
+    canWork: number;
+    workFromHome: number;
+    cannotWork: number;
+  };
+}
+
+export interface SafetyConfirmationResponse {
+  id: string;
+  eventId: string;
+  userId: string;
+  userName: string;
+  office?: string;
+  officeId?: string;
+  division?: string;
+  divisionId?: string;
+  safetyStatus: 'safe' | 'minor_injury' | 'severe_injury' | 'need_rescue';
+  familyStatus?: 'all_safe' | 'injured' | 'unreachable' | 'none';
+  houseStatus?: 'no_damage' | 'partial_damage' | 'severe_damage' | 'evacuated';
+  workAvailability: 'available' | 'remote_only' | 'unavailable' | 'undecided';
+  locationStatus?: string;
+  message?: string;
+  respondedAt: string;
+  updatedAt?: string;
+}
+
+interface SafetyConfirmationProps {
+  currentUser: User;
+  allUsers: User[];
+  offices: OfficeMaster[];
+  divisions: DivisionMaster[];
+  initialEventId?: string;
+  initialTab?: 'dashboard' | 'targets' | 'trigger' | 'respond';
+  onOpenConfirmModal?: (options: {
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    cancelLabel?: string;
+    isDangerous?: boolean;
+    onConfirm: () => void;
+  }) => void;
+}
+
+export const SafetyConfirmation: React.FC<SafetyConfirmationProps> = ({
+  currentUser,
+  allUsers = [],
+  offices = [],
+  divisions = [],
+  initialEventId,
+  initialTab,
+  onOpenConfirmModal,
+}) => {
+  // 安否確認の管理権限（システム管理者 または 個別権限「安否確認」がONのユーザー）
+  const isAdmin = 
+    currentUser.role === 'admin' || 
+    currentUser.isAdmin === true || 
+    (currentUser as any).id === 'u1' ||
+    currentUser.preferences?.showSafetyConfirmation === true ||
+    (currentUser as any).showSafetyConfirmation === true ||
+    currentUser.preferences?.safetyConfirmationPermission === true;
+
+  // Tabs: 'dashboard' (発動中・集計), 'targets' (対象者一覧・登録状況), 'trigger' (安否確認発動), 'jma_auto' (気象庁連動)
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'targets' | 'trigger' | 'jma_auto'>(
+    initialTab && initialTab !== 'respond' ? (initialTab as any) : 'dashboard'
+  );
+  const [confirmModal, setConfirmModal] = useState<ConfirmModalState>({ isOpen: false, title: '', message: '' });
+
+  // JMA Auto-Trigger State
+  const [jmaSettings, setJmaSettings] = useState<{
+    enabled: boolean;
+    minIntensity: string;
+    targetScope: string;
+    targetOffices: string[];
+    notifyWebPush: boolean;
+    notifyCompanyEmail: boolean;
+    notifyPersonalEmail: boolean;
+    isDrillMode: boolean;
+    lastTriggeredQuakeId: string;
+    lastCheckedAt: string;
+    logs: any[];
+  }>({
+    enabled: true,
+    minIntensity: '5minus',
+    targetScope: 'all',
+    targetOffices: ['名古屋', '東京', '大阪', '静岡', '浜松', '本社'],
+    notifyWebPush: true,
+    notifyCompanyEmail: true,
+    notifyPersonalEmail: true,
+    isDrillMode: false,
+    lastTriggeredQuakeId: '',
+    lastCheckedAt: '',
+    logs: []
+  });
+  const [isLoadingJmaSettings, setIsLoadingJmaSettings] = useState(false);
+  const [isSavingJmaSettings, setIsSavingJmaSettings] = useState(false);
+  const [recentQuakes, setRecentQuakes] = useState<any[]>([]);
+  const [isLoadingQuakes, setIsLoadingQuakes] = useState(false);
+
+  // JMA Simulation state
+  const [simEpicenter, setSimEpicenter] = useState('愛知県西部');
+  const [simScale, setSimScale] = useState(50); // 50 = 震度5強
+  const [simMagnitude, setSimMagnitude] = useState(6.2);
+  const [isRunningSimulation, setIsRunningSimulation] = useState(false);
+
+  // Modals for Answer and Response Detail View
+  const [isMyAnswerModalOpen, setIsMyAnswerModalOpen] = useState(initialTab === 'respond' || !!initialEventId);
+  const [viewingResponseData, setViewingResponseData] = useState<{ user: User; response?: SafetyConfirmationResponse } | null>(null);
+
+  // Events & responses state
+  const [events, setEvents] = useState<SafetyConfirmationEvent[]>([]);
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(initialEventId || null);
+  const [responses, setResponses] = useState<SafetyConfirmationResponse[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const [isGettingLocation, setIsGettingLocation] = useState(false);
+  const [actionMessage, setActionMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Trigger Form State
+  const [disasterType, setDisasterType] = useState<DisasterType>('earthquake');
+  const [triggerTitle, setTriggerTitle] = useState('【安否確認】地震発生に伴う安否状況確認');
+  const [triggerLevel, setTriggerLevel] = useState('震度5強以上');
+  const [triggerMessage, setTriggerMessage] = useState(
+    '地震が発生しました。自身の安全を最優先に確保した上で、現在の安否状況・出社可否について回答をお願いします。'
+  );
+  const [targetScope, setTargetScope] = useState<'all' | 'offices' | 'divisions'>('all');
+  const [selectedOffices, setSelectedOffices] = useState<string[]>([]);
+  const [selectedDivisions, setSelectedDivisions] = useState<string[]>([]);
+  const [useWebPush, setUseWebPush] = useState(true);
+  const [useCompanyEmail, setUseCompanyEmail] = useState(true);
+  const [usePersonalEmail, setUsePersonalEmail] = useState(true);
+  const [isTestMode, setIsTestMode] = useState(false);
+  const [isForceSend, setIsForceSend] = useState(false);
+  const [cooldownInfo, setCooldownInfo] = useState<{ isCooldownActive: boolean; cooldownHours?: number; remainingMinutes?: number; lastEvent?: any } | null>(null);
+
+  // Response Form State (for current user)
+  const [mySafetyStatus, setMySafetyStatus] = useState<'safe' | 'minor_injury' | 'severe_injury' | 'need_rescue'>('safe');
+  const [myFamilyStatus, setMyFamilyStatus] = useState<'all_safe' | 'injured' | 'unreachable' | 'none'>('all_safe');
+  const [myHouseStatus, setMyHouseStatus] = useState<'no_damage' | 'partial_damage' | 'severe_damage' | 'evacuated'>('no_damage');
+  const [myWorkAvailability, setMyWorkAvailability] = useState<'available' | 'remote_only' | 'unavailable' | 'undecided'>('available');
+  const [myLocation, setMyLocation] = useState('自宅');
+  const [myComment, setMyComment] = useState('');
+  const [isSubmittingResponse, setIsSubmittingResponse] = useState(false);
+
+  // Test Email State in trigger
+  const [testingSend, setTestingSend] = useState(false);
+  const [testEmailDestination, setTestEmailDestination] = useState(currentUser?.email || currentUser?.mobileEmail || '');
+  const [showTestEmailInput, setShowTestEmailInput] = useState(false);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string; isSimulated?: boolean } | null>(null);
+
+  // Filter in Dashboard
+  const [statusFilter, setStatusFilter] = useState<'all' | 'safe' | 'unanswered' | 'danger'>('all');
+  const [searchKeyword, setSearchKeyword] = useState('');
+  const [selectedOfficeFilter, setSelectedOfficeFilter] = useState('all');
+
+  // Filter & Sort in Targets Roster (対象者一覧タブ)
+  const [targetSearchKeyword, setTargetSearchKeyword] = useState('');
+  const [targetOfficeFilter, setTargetOfficeFilter] = useState('all');
+  const [targetDivisionFilter, setTargetDivisionFilter] = useState('all');
+  const [targetRegistrationFilter, setTargetRegistrationFilter] = useState<'all' | 'both' | 'personalOnly' | 'mobileOnly' | 'none'>('all');
+  const [targetSortField, setTargetSortField] = useState<'name' | 'office' | 'division' | 'mobileEmail' | 'personalEmail' | 'status'>('name');
+  const [targetSortOrder, setTargetSortOrder] = useState<'asc' | 'desc'>('asc');
+
+  // 対象者選択 & 個人メール登録依頼 State
+  const [selectedTargetUserIds, setSelectedTargetUserIds] = useState<string[]>([]);
+  const [isRequestModalOpen, setIsRequestModalOpen] = useState(false);
+  const [requestCustomMessage, setRequestCustomMessage] = useState('');
+  const [requestSendCompany, setRequestSendCompany] = useState(true);
+  const [requestSendMobile, setRequestSendMobile] = useState(true);
+  const [isSendingRequest, setIsSendingRequest] = useState(false);
+  const [requestResultModal, setRequestResultModal] = useState<{ open: boolean; success: boolean; message: string; details?: any } | null>(null);
+
+  // Toggle sort handler
+  const handleToggleTargetSort = (field: 'name' | 'office' | 'division' | 'mobileEmail' | 'personalEmail' | 'status') => {
+    if (targetSortField === field) {
+      setTargetSortOrder(prev => prev === 'asc' ? 'desc' : 'asc');
+    } else {
+      setTargetSortField(field);
+      setTargetSortOrder('asc');
+    }
+  };
+
+  // Current logged in user response
+  const currentUserResponse = useMemo(() => {
+    return responses.find(r => r.userId === currentUser.id);
+  }, [responses, currentUser.id]);
+
+  const fetchCooldownStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/safety/cooldown-status`);
+      if (res.ok) {
+        const data = await res.json();
+        setCooldownInfo(data);
+      }
+    } catch (_) {}
+  };
+
+  // Load events on mount
+  useEffect(() => {
+    fetchEvents();
+    fetchJmaSettings();
+    fetchRecentQuakes();
+    fetchCooldownStatus();
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'trigger') {
+      fetchCooldownStatus();
+    }
+  }, [activeTab]);
+
+  // initialEventId が渡された場合、対象イベントを選択して回答モーダルをピンポイントで即座に展開
+  useEffect(() => {
+    if (initialEventId) {
+      setSelectedEventId(initialEventId);
+      setIsMyAnswerModalOpen(true);
+    }
+  }, [initialEventId]);
+
+  const fetchJmaSettings = async () => {
+    try {
+      setIsLoadingJmaSettings(true);
+      const res = await fetch(`${API_BASE_URL}/safety/auto-trigger-settings`);
+      if (res.ok) {
+        const data = await res.json();
+        setJmaSettings(prev => ({ ...prev, ...data }));
+      }
+    } catch (err) {
+      console.error('Failed to fetch JMA settings:', err);
+    } finally {
+      setIsLoadingJmaSettings(false);
+    }
+  };
+
+  const handleSaveJmaSettings = async () => {
+    try {
+      setIsSavingJmaSettings(true);
+      const res = await fetch(`${API_BASE_URL}/safety/auto-trigger-settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(jmaSettings)
+      });
+      if (res.ok) {
+        setActionMessage({ type: 'success', text: '気象庁連動・自動発動設定を正常に保存・反映しました。' });
+        setTimeout(() => setActionMessage(null), 5000);
+      } else {
+        setActionMessage({ type: 'error', text: '設定の保存に失敗しました。' });
+      }
+    } catch (err) {
+      setActionMessage({ type: 'error', text: '通信エラーが発生しました。' });
+    } finally {
+      setIsSavingJmaSettings(false);
+    }
+  };
+
+  const fetchRecentQuakes = async () => {
+    try {
+      setIsLoadingQuakes(true);
+      const res = await fetch(`${API_BASE_URL}/safety/latest-earthquakes`);
+      if (res.ok) {
+        const data = await res.json();
+        setRecentQuakes(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch earthquakes:', err);
+    } finally {
+      setIsLoadingQuakes(false);
+    }
+  };
+
+  const handleRunSimulation = async () => {
+    try {
+      setIsRunningSimulation(true);
+      const res = await fetch(`${API_BASE_URL}/safety/test-jma-trigger`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          epicenter: simEpicenter,
+          scale: Number(simScale),
+          magnitude: Number(simMagnitude)
+        })
+      });
+      const result = await res.json();
+      if (res.ok && result.success) {
+        setActionMessage({ type: 'success', text: result.message || '疑似地震テスト発動が完了しました！' });
+        setTimeout(() => setActionMessage(null), 6000);
+        fetchEvents();
+        fetchJmaSettings();
+      } else {
+        setActionMessage({ type: 'error', text: result.error || 'テスト発動に失敗しました。' });
+      }
+    } catch (err) {
+      setActionMessage({ type: 'error', text: 'テスト発動通信エラーが発生しました。' });
+    } finally {
+      setIsRunningSimulation(false);
+    }
+  };
+
+  // Quick 1-tap Answer Presets
+  const applyQuickPreset = (preset: 'safe' | 'remote' | 'injured' | 'rescue') => {
+    if (preset === 'safe') {
+      setMySafetyStatus('safe');
+      setMyFamilyStatus('all_safe');
+      setMyHouseStatus('no_damage');
+      setMyWorkAvailability('available');
+      setMyLocation(prev => prev && prev !== '自宅' ? prev : '自宅');
+      setMyComment('本人・家族ともに無事です。通常通り出社・業務可能です。');
+    } else if (preset === 'remote') {
+      setMySafetyStatus('safe');
+      setMyFamilyStatus('all_safe');
+      setMyHouseStatus('partial_damage');
+      setMyWorkAvailability('remote_only');
+      setMyLocation(prev => prev && prev !== '自宅' ? prev : '自宅');
+      setMyComment('本人は無事ですが、交通機関の乱れまたは周辺状況のため在宅勤務にて対応します。');
+    } else if (preset === 'injured') {
+      setMySafetyStatus('minor_injury');
+      setMyFamilyStatus('injured');
+      setMyHouseStatus('partial_damage');
+      setMyWorkAvailability('undecided');
+      setMyLocation(prev => prev && prev !== '自宅' ? prev : '自宅');
+      setMyComment('軽傷または家族の対応中です。状況が落ち着き次第再度連絡します。');
+    } else if (preset === 'rescue') {
+      setMySafetyStatus('need_rescue');
+      setMyFamilyStatus('injured');
+      setMyHouseStatus('severe_damage');
+      setMyWorkAvailability('unavailable');
+      setMyLocation('避難所');
+      setMyComment('被害が大きく出社できません。支援・救助が必要です。');
+    }
+  };
+
+  // GPS Location Handler
+  const handleGetLocation = () => {
+    if (!navigator.geolocation) {
+      alert('お使いのブラウザはGPS位置情報取得に対応していません。');
+      return;
+    }
+    setIsGettingLocation(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const { latitude, longitude } = pos.coords;
+        setMyLocation(`現在地 (GPS: 北緯${latitude.toFixed(4)}°, 東経${longitude.toFixed(4)}°)`);
+        setIsGettingLocation(false);
+      },
+      (err) => {
+        console.warn('GPS error:', err);
+        alert('位置情報を取得できませんでした。ブラウザの位置情報アクセスを許可してください。');
+        setIsGettingLocation(false);
+      },
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  };
+
+  // Close Event Handler
+  const handleCloseEvent = async (eventId: string) => {
+    const doClose = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/safety-events/${eventId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'closed' }),
+        });
+        if (res.ok) {
+          setActionMessage({ type: 'success', text: '安否確認イベントを終了（アーカイブ）しました。' });
+          await fetchEvents();
+        } else {
+          setActionMessage({ type: 'error', text: '終了処理に失敗しました。' });
+        }
+      } catch (e: any) {
+        setActionMessage({ type: 'error', text: 'エラー: ' + e.message });
+      }
+    };
+
+    if (onOpenConfirmModal) {
+      onOpenConfirmModal({
+        title: '安否確認の終了（アーカイブ）',
+        message: 'この安否確認イベントを終了（ステータス完了）にしますか？終了後も集計結果の閲覧やCSV出力は可能です。',
+        confirmLabel: '終了する',
+        cancelLabel: 'キャンセル',
+        isDangerous: false,
+        onConfirm: doClose,
+      });
+    } else {
+      setConfirmModal({
+        isOpen: true,
+        title: '安否確認の終了（アーカイブ）',
+        message: 'この安否確認イベントを終了（ステータス完了）にしますか？終了後も集計結果の閲覧やCSV出力は可能です。',
+        confirmText: '終了する',
+        cancelText: 'キャンセル',
+        type: 'info',
+        onConfirm: doClose,
+      });
+    }
+  };
+
+  // Delete Event Handler (安否確認イベントの個別削除)
+  const handleDeleteEvent = async (eventId: string) => {
+    const targetEv = events.find(e => e.id === eventId);
+    const evTitle = targetEv ? targetEv.title : 'この安否確認イベント';
+
+    const doDelete = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/safety-events/${eventId}`, {
+          method: 'DELETE',
+        });
+        if (res.ok) {
+          setActionMessage({ type: 'success', text: `安否確認イベント「${evTitle}」を削除しました。` });
+          const updatedEvents = events.filter(e => e.id !== eventId);
+          setEvents(updatedEvents);
+          if (updatedEvents.length > 0) {
+            setSelectedEventId(updatedEvents[0].id);
+          } else {
+            setSelectedEventId(null);
+          }
+        } else {
+          setActionMessage({ type: 'error', text: 'イベントの削除に失敗しました。' });
+        }
+      } catch (e: any) {
+        setActionMessage({ type: 'error', text: 'エラー: ' + e.message });
+      }
+    };
+
+    if (onOpenConfirmModal) {
+      onOpenConfirmModal({
+        title: '安否確認イベントの削除',
+        message: `安否確認イベント「${evTitle}」およびこれに紐づくすべての回答集計データを完全に削除しますか？\n（※この操作は取り消せません）`,
+        confirmLabel: '完全に削除する',
+        cancelLabel: 'キャンセル',
+        isDangerous: true,
+        onConfirm: doDelete,
+      });
+    } else {
+      setConfirmModal({
+        isOpen: true,
+        title: '安否確認イベントの削除',
+        message: `安否確認イベント「${evTitle}」およびすべての回答データを完全に削除しますか？`,
+        confirmText: '削除する',
+        cancelText: 'キャンセル',
+        type: 'danger',
+        onConfirm: doDelete,
+      });
+    }
+  };
+
+  // Delete Individual Response Handler (個別回答レコードの削除・未回答リセット)
+  const handleDeleteResponse = async (eventId: string, userId: string, userName: string) => {
+    const doDelete = async () => {
+      try {
+        const res = await fetch(`${API_BASE_URL}/safety-events/${eventId}/responses/${userId}`, {
+          method: 'DELETE',
+        });
+        if (res.ok) {
+          setActionMessage({ type: 'success', text: `${userName} さんの安否回答を削除（未回答にリセット）しました。` });
+          await fetchResponses(eventId);
+        } else {
+          setActionMessage({ type: 'error', text: '回答の削除に失敗しました。' });
+        }
+      } catch (e: any) {
+        setActionMessage({ type: 'error', text: 'エラー: ' + e.message });
+      }
+    };
+
+    if (onOpenConfirmModal) {
+      onOpenConfirmModal({
+        title: '安否回答の個別削除・取消',
+        message: `${userName} さんの安否回答データを削除し、未回答ステータスに戻しますか？`,
+        confirmLabel: '回答を削除する',
+        cancelLabel: 'キャンセル',
+        isDangerous: true,
+        onConfirm: doDelete,
+      });
+    } else {
+      setConfirmModal({
+        isOpen: true,
+        title: '安否回答の個別削除・取消',
+        message: `${userName} さんの安否回答データを削除しますか？`,
+        confirmText: '削除する',
+        cancelText: 'キャンセル',
+        type: 'danger',
+        onConfirm: doDelete,
+      });
+    }
+  };
+
+  // Update response form when selected event changes or user has already answered
+  const activeEvent = events.find(e => e.id === selectedEventId) || events.find(e => e.status === 'active') || events[0];
+
+  useEffect(() => {
+    if (activeEvent) {
+      fetchResponses(activeEvent.id);
+    }
+  }, [selectedEventId, activeEvent?.id]);
+
+  // Sync current user's form state whenever currentUserResponse changes or modal opens
+  useEffect(() => {
+    if (currentUserResponse) {
+      setMySafetyStatus(currentUserResponse.safetyStatus);
+      setMyFamilyStatus(currentUserResponse.familyStatus || 'all_safe');
+      setMyHouseStatus(currentUserResponse.houseStatus || 'no_damage');
+      setMyWorkAvailability(currentUserResponse.workAvailability);
+      setMyLocation(currentUserResponse.locationStatus || '自宅');
+      setMyComment(currentUserResponse.message || '');
+    } else {
+      setMySafetyStatus('safe');
+      setMyFamilyStatus('all_safe');
+      setMyHouseStatus('no_damage');
+      setMyWorkAvailability('available');
+      setMyLocation('自宅');
+      setMyComment('');
+    }
+  }, [currentUserResponse, isMyAnswerModalOpen]);
+
+  const fetchEvents = async () => {
+    setIsLoading(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/safety-events`);
+      if (res.ok) {
+        const data = await res.json();
+        setEvents(data);
+        if (data.length > 0 && !selectedEventId) {
+          setSelectedEventId(data[0].id);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch safety events:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchResponses = async (eventId: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/safety-events/${eventId}/responses`);
+      if (res.ok) {
+        const rawData = await res.json();
+        if (Array.isArray(rawData)) {
+          // Normalize responses so that any backend format (status/canWork vs safetyStatus/workAvailability) matches 100%
+          const normalized: SafetyConfirmationResponse[] = rawData.map((r: any) => ({
+            id: r.id || `resp_${r.userId}`,
+            eventId: r.eventId || eventId,
+            userId: String(r.userId),
+            userName: r.userName || '匿名',
+            office: r.office || r.userOffice || '',
+            division: r.division || r.userDivision || '',
+            safetyStatus: (r.safetyStatus || r.status || 'safe') as any,
+            familyStatus: r.familyStatus || 'all_safe',
+            houseStatus: r.houseStatus || 'no_damage',
+            workAvailability: (r.workAvailability || r.canWork || 'available') as any,
+            locationStatus: r.locationStatus || r.currentLocation || r.location || '自宅',
+            message: r.message || r.comment || '',
+            respondedAt: r.respondedAt || r.updatedAt || new Date().toISOString()
+          }));
+          setResponses(normalized);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to fetch responses:', err);
+    }
+  };
+
+  // Quick Template handler for triggering
+  const applyTemplate = (type: DisasterType) => {
+    setDisasterType(type);
+    if (type === 'earthquake') {
+      setTriggerTitle('【安否確認】地震発生に伴う安否状況確認');
+      setTriggerLevel('震度5強以上');
+      setTriggerMessage('強い地震が発生しました。身の安全を最優先に確保した上で、現在の安否状況・出社可否について回答をお願いします。');
+    } else if (type === 'typhoon_rain') {
+      setTriggerTitle('【安否確認】台風接近・大雨特別警報に伴う安否及び出社確認');
+      setTriggerLevel('警戒レベル4以上');
+      setTriggerMessage('非常に強い台風・大雨が予想されます。安全を確保し、本日の出社・テレワーク可否、周辺被害状況について回答をお願いします。');
+    } else if (type === 'blackout') {
+      setTriggerTitle('【安否確認】大規模停電・インフラ障害に伴う状況確認');
+      setTriggerLevel('停電発生');
+      setTriggerMessage('大規模停電が発生しています。業務継続・通信状況および社員の安全確保のため、現在の状況を回答してください。');
+    } else if (type === 'fire') {
+      setTriggerTitle('【緊急】事業所近隣での火災発生に伴う安否確認');
+      setTriggerLevel('火災発生');
+      setTriggerMessage('近隣での火災発生に伴い、安全確認および避難状況の確認を実施します。状況を回答してください。');
+    } else if (type === 'drill') {
+      setTriggerTitle('【安否確認訓練】第' + (new Date().getMonth() + 1) + '回 定期安否確認テスト');
+      setTriggerLevel('訓練');
+      setTriggerMessage('これは定期安否確認訓練です。実際の災害時を想定し、速やかに安否状況の選択・回答手順を確認してください。');
+      setIsTestMode(true);
+    } else {
+      setTriggerTitle('【緊急安否確認】災害発生に伴う状況確認');
+      setTriggerLevel('緊急発動');
+      setTriggerMessage('現在発生している事象に伴い、社員の皆様の安否確認を実施します。速やかに回答をお願いします。');
+    }
+  };
+
+  // Handle test mail send for trigger form
+  const handleSendTestTriggerMail = async () => {
+    if (!triggerTitle.trim()) {
+      alert('発動タイトルを入力してください。');
+      return;
+    }
+
+    const targetEmail = testEmailDestination.trim() || currentUser.email || currentUser.mobileEmail;
+    if (!targetEmail || !targetEmail.includes('@')) {
+      setShowTestEmailInput(true);
+      setTestResult({
+        success: false,
+        message: 'テスト送信先のメールアドレスを入力してください。'
+      });
+      return;
+    }
+
+    setTestingSend(true);
+    setTestResult(null);
+
+    try {
+      const nowStr = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const disasterLabel = disasterType === 'earthquake' ? '地震発生'
+        : disasterType === 'typhoon_rain' ? '台風・豪雨'
+        : disasterType === 'blackout' ? '停電・インフラ障害'
+        : disasterType === 'fire' ? '火災・事故'
+        : disasterType === 'drill' ? '安否確認テスト訓練'
+        : '緊急事態';
+
+      const emailSubject = `【安否確認テスト送信】${triggerTitle}`;
+      const emailText = `※これは安否確認発動のテスト送信です。実際の発動ではありません。\n\n` +
+        `【災害種別】: ${disasterLabel}\n` +
+        `【災害規模/レベル】: ${triggerLevel}\n` +
+        `【対象】: ${targetScope === 'all' ? '全社員・全拠点' : targetScope === 'offices' ? selectedOffices.join(', ') : selectedDivisions.join(', ')}\n\n` +
+        `【通知メッセージ本文】:\n${triggerMessage || '（メッセージなし）'}\n\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `【安否確認システムURL】:\n${window.location.origin}\n` +
+        `送信日時: ${nowStr}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━`;
+
+      const res = await fetch(`${API_BASE_URL}/notifications/test-email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          to: targetEmail,
+          subject: emailSubject,
+          text: emailText
+        })
+      });
+
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data.success) {
+        if (data.simulated) {
+          setTestResult({
+            success: true,
+            isSimulated: true,
+            message: `【テスト成功 (シミュレーション)】メール本文と配信ルーティングを正常に生成・検証しました。（※現在SMTP設定が未定義のため、サーバーログに出力されました）`
+          });
+        } else {
+          setTestResult({
+            success: true,
+            isSimulated: false,
+            message: `テストメールを ${targetEmail} へ正常に送信しました。`
+          });
+        }
+      } else {
+        const detailInfo = data.details ? ` (${data.details})` : '';
+        setTestResult({
+          success: false,
+          message: `${data.error || data.message || 'メール送信に失敗しました。'}${detailInfo}`
+        });
+      }
+    } catch (err: any) {
+      setTestResult({
+        success: false,
+        message: '通信エラーが発生しました: ' + (err.message || '')
+      });
+    } finally {
+      setTestingSend(false);
+    }
+  };
+
+  // Handle Trigger Submit
+  const handleTriggerSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!triggerTitle.trim()) {
+      setActionMessage({ type: 'error', text: '発動タイトルを入力してください。' });
+      return;
+    }
+
+    const resolvedOfficeIds = selectedOffices.map((o) => resolveOffice(o, offices)?.id || o);
+    const resolvedOfficeNames = selectedOffices.map((o) => resolveOffice(o, offices)?.name || o);
+    const expandedTargetOffices = Array.from(
+      new Set([
+        ...resolvedOfficeNames,
+        ...allUsers
+          .filter((u) => selectedOffices.some((s) => doesUserMatchOffice(u, s, offices)))
+          .map((u) => u.office || '')
+          .filter(Boolean),
+      ])
+    );
+
+    const resolvedDivisionIds = selectedDivisions.map((d) => resolveDivision(d, divisions)?.id || d);
+    const resolvedDivisionNames = selectedDivisions.map((d) => resolveDivision(d, divisions)?.name || d);
+    const expandedTargetDivisions = Array.from(
+      new Set([
+        ...resolvedDivisionNames,
+        ...allUsers
+          .filter((u) => selectedDivisions.some((s) => doesUserMatchDivision(u, s, divisions)))
+          .map((u) => u.division || (u as any).department || '')
+          .filter(Boolean),
+      ])
+    );
+
+    const payload = {
+      title: triggerTitle.trim(),
+      type: disasterType,
+      disasterType,
+      severity: triggerLevel || 'warning',
+      level: triggerLevel,
+      message: triggerMessage.trim(),
+      targetOffice: targetScope === 'offices' && resolvedOfficeNames.length > 0 ? resolvedOfficeNames[0] : '全社',
+      targetDivision: targetScope === 'divisions' && resolvedDivisionNames.length > 0 ? resolvedDivisionNames[0] : '全部署',
+      targetScope,
+      targetOffices: targetScope === 'offices' ? expandedTargetOffices : undefined,
+      targetOfficeIds: targetScope === 'offices' ? resolvedOfficeIds : undefined,
+      targetDivisions: targetScope === 'divisions' ? expandedTargetDivisions : undefined,
+      targetDivisionIds: targetScope === 'divisions' ? resolvedDivisionIds : undefined,
+      notifyWebPush: useWebPush,
+      notifyCompanyEmail: useCompanyEmail,
+      notifyPersonalEmail: usePersonalEmail,
+      channels: {
+        webPush: useWebPush,
+        companyEmail: useCompanyEmail,
+        personalEmail: usePersonalEmail,
+      },
+      isDrill: isTestMode,
+      isTest: isTestMode,
+      appBaseUrl: window.location.origin + window.location.pathname.replace(/\/+$/, ''),
+      createdBy: currentUser.id,
+      createdById: currentUser.id,
+      createdByName: currentUser.name,
+      force: isForceSend,
+      bypassCooldown: isForceSend,
+    };
+
+    const confirmText = isTestMode
+      ? `【テスト発動】対象者に安否確認の通知（テスト）を送信しますか？`
+      : `【本番発動】全社/対象者に緊急安否確認を発動し、WebPush・メール・個人メール宛へ一斉通知を送信します。よろしいですか？`;
+
+    if (onOpenConfirmModal) {
+      onOpenConfirmModal({
+        title: isTestMode ? '安否確認テスト発動' : '⚠️ 緊急安否確認の一斉発動',
+        message: confirmText,
+        confirmLabel: '発動して一斉送信',
+        isDangerous: !isTestMode,
+        onConfirm: async () => {
+          await executeTrigger(payload);
+        },
+      });
+    } else {
+      setConfirmModal({
+        isOpen: true,
+        title: isTestMode ? '安否確認テスト発動' : '⚠️ 緊急安否確認の一斉発動',
+        message: confirmText,
+        confirmText: '発動して一斉送信',
+        cancelText: 'キャンセル',
+        type: isTestMode ? 'info' : 'danger',
+        onConfirm: async () => {
+          await executeTrigger(payload);
+        },
+      });
+    }
+  };
+
+  const executeTrigger = async (payload: any) => {
+    setIsSending(true);
+    setActionMessage(null);
+    try {
+      const res = await fetch(`${API_BASE_URL}/safety-events`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        if (data.skipped && data.cooldownActive) {
+          setActionMessage({
+            type: 'error',
+            text: `【24時間連送抑制】${data.message || '前回の配信から24時間以内のため自動連送を抑制しました。'}`,
+          });
+        } else {
+          setActionMessage({
+            type: 'success',
+            text: `安否確認を発動しました！ (${data.totalTargets || 0}名に通知送信完了)`,
+          });
+          await fetchEvents();
+          setActiveTab('dashboard');
+          if (data.event?.id) {
+            setSelectedEventId(data.event.id);
+          }
+        }
+        window.dispatchEvent(new CustomEvent('notifications_updated'));
+        window.dispatchEvent(new CustomEvent('safety_updated'));
+      } else {
+        setActionMessage({ type: 'error', text: data.error || '安否確認の発動に失敗しました。' });
+      }
+    } catch (err: any) {
+      setActionMessage({ type: 'error', text: '通信エラーが発生しました: ' + err.message });
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  // Submit Answer
+  const handleResponseSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!activeEvent) return;
+
+    setIsSubmittingResponse(true);
+    setActionMessage(null);
+    try {
+      const resolvedMyOffice = resolveOffice(currentUser.officeId || currentUser.office, offices);
+      const resolvedMyDivision = resolveDivision(currentUser.divisionId || currentUser.division, divisions);
+      const payload = {
+        userId: currentUser.id,
+        userName: currentUser.name,
+        office: resolvedMyOffice?.name || currentUser.office,
+        officeId: currentUser.officeId || resolvedMyOffice?.id,
+        division: resolvedMyDivision?.name || currentUser.division,
+        divisionId: currentUser.divisionId || resolvedMyDivision?.id,
+        userOffice: resolvedMyOffice?.name || currentUser.office,
+        userDivision: resolvedMyDivision?.name || currentUser.division,
+        safetyStatus: mySafetyStatus,
+        status: mySafetyStatus,
+        familyStatus: myFamilyStatus,
+        houseStatus: myHouseStatus,
+        workAvailability: myWorkAvailability,
+        canWork: myWorkAvailability,
+        locationStatus: myLocation,
+        currentLocation: myLocation,
+        location: myLocation,
+        message: myComment.trim(),
+        comment: myComment.trim(),
+      };
+
+      const res = await fetch(`${API_BASE_URL}/safety-events/${activeEvent.id}/respond`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (res.ok) {
+        setActionMessage({ type: 'success', text: '安否状況を回答・登録しました。ご無事をお祈りいたします。' });
+        setIsMyAnswerModalOpen(false);
+        markSafetyEventAsResponded(currentUser?.id, activeEvent.id);
+        await fetchResponses(activeEvent.id);
+        await fetchEvents();
+        window.dispatchEvent(new CustomEvent('notifications_updated'));
+        window.dispatchEvent(new CustomEvent('safety_updated'));
+      } else {
+        const data = await res.json();
+        setActionMessage({ type: 'error', text: data.error || '回答の送信に失敗しました。' });
+      }
+    } catch (err: any) {
+      setActionMessage({ type: 'error', text: 'エラー: ' + err.message });
+    } finally {
+      setIsSubmittingResponse(false);
+    }
+  };
+
+  // Send Reminder to Unanswered Users
+  const handleSendReminder = async () => {
+    if (!activeEvent) return;
+    const confirmMsg = `未回答の対象者全員にリマインド通知（WebPush & メール）を一斉再送します。よろしいですか？`;
+    
+    const executeRemind = async () => {
+      setIsSending(true);
+      setActionMessage(null);
+      try {
+        const res = await fetch(`${API_BASE_URL}/safety-events/${activeEvent.id}/remind`, {
+          method: 'POST',
+        });
+        const data = await res.json();
+        if (res.ok) {
+          setActionMessage({
+            type: 'success',
+            text: `未回答者 ${data.remindedCount || 0}名 にリマインド通知を再送しました。`,
+          });
+        } else {
+          setActionMessage({ type: 'error', text: data.error || 'リマインド送信に失敗しました。' });
+        }
+      } catch (err: any) {
+        setActionMessage({ type: 'error', text: 'エラー: ' + err.message });
+      } finally {
+        setIsSending(false);
+      }
+    };
+
+    if (onOpenConfirmModal) {
+      onOpenConfirmModal({
+        title: 'リマインド一斉再送',
+        message: confirmMsg,
+        confirmLabel: '一斉再送する',
+        isDangerous: false,
+        onConfirm: executeRemind,
+      });
+    } else {
+      setConfirmModal({
+        isOpen: true,
+        title: 'リマインド一斉再送',
+        message: confirmMsg,
+        confirmText: '一斉再送する',
+        cancelText: 'キャンセル',
+        type: 'info',
+        onConfirm: executeRemind,
+      });
+    }
+  };
+
+  // Export CSV
+  const handleExportCSV = () => {
+    if (!activeEvent) return;
+    const answeredMap = new Map(responses.map(r => [r.userId, r]));
+    const rows = [
+      ['社員名', '拠点', '部署', '回答状況', '本人の安否', '家族の安否', '家屋状況', '出社可否', '現在地', 'コメント・要望', '回答日時']
+    ];
+
+    allUsers.forEach(u => {
+      const resp = answeredMap.get(u.id);
+      if (resp) {
+        const safetyMap: Record<string, string> = {
+          safe: '無事',
+          minor_injury: '軽傷',
+          severe_injury: '重傷',
+          need_rescue: '要救助',
+        };
+        const workMap: Record<string, string> = {
+          available: '出社可',
+          remote_only: '在宅可',
+          unavailable: '出社不可',
+          undecided: '未定',
+        };
+        rows.push([
+          u.name,
+          u.office || '',
+          u.division || '',
+          '回答済',
+          safetyMap[resp.safetyStatus] || resp.safetyStatus,
+          resp.familyStatus || '',
+          resp.houseStatus || '',
+          workMap[resp.workAvailability] || resp.workAvailability,
+          resp.locationStatus || '',
+          `"${(resp.message || '').replace(/"/g, '""')}"`,
+          resp.respondedAt,
+        ]);
+      } else {
+        rows.push([u.name, u.office || '', u.division || '', '未回答', '-', '-', '-', '-', '-', '-', '-']);
+      }
+    });
+
+    const csvContent = '\uFEFF' + rows.map(e => e.join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `安否確認集計_${activeEvent.title}_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Export Target Members List CSV
+  const handleExportTargetsCSV = () => {
+    const rows = [
+      ['社員番号/ID', '氏名', '営業所・拠点', '所属部署', 'PCメール', '携帯メール', '携帯メール登録状況', '個人メール(暗号化)', '個人メール登録状況', '緊急連絡先登録状況']
+    ];
+
+    filteredTargets.forEach(u => {
+      const hasMobile = !!(u.mobileEmail && u.mobileEmail.trim());
+      const hasPersonal = !!(u.personalEmailMasked || u.personalEmailEncrypted);
+      const regStatus = (hasMobile && hasPersonal)
+        ? '両方登録済'
+        : hasPersonal
+        ? '個人メールのみ登録'
+        : hasMobile
+        ? '携帯メールのみ登録'
+        : '未登録';
+
+      rows.push([
+        u.id,
+        u.name,
+        u.office || '',
+        u.division || '',
+        u.email || '',
+        u.mobileEmail || '',
+        hasMobile ? '登録済' : '未登録',
+        u.personalEmailMasked || (hasPersonal ? '登録済(暗号化)' : ''),
+        hasPersonal ? '登録済' : '未登録',
+        regStatus
+      ]);
+    });
+
+    const csvContent = '\uFEFF' + rows.map(e => e.join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `安否確認_対象者連絡先登録状況一覧_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // 対象者選択ハンドラー
+  const handleToggleTargetSelect = (userId: string) => {
+    setSelectedTargetUserIds(prev => 
+      prev.includes(userId) ? prev.filter(id => id !== userId) : [...prev, userId]
+    );
+  };
+
+  const handleSelectAllFilteredTargets = () => {
+    const allFilteredIds = filteredTargets.map(u => u.id);
+    const isAllSelected = allFilteredIds.every(id => selectedTargetUserIds.includes(id));
+    if (isAllSelected) {
+      setSelectedTargetUserIds(prev => prev.filter(id => !allFilteredIds.includes(id)));
+    } else {
+      setSelectedTargetUserIds(prev => Array.from(new Set([...prev, ...allFilteredIds])));
+    }
+  };
+
+  const handleSelectUnregisteredOnly = () => {
+    const unregisteredUsers = allUsers.filter(u => !u.personalEmailMasked && !u.personalEmailEncrypted);
+    const unregIds = unregisteredUsers.map(u => u.id);
+    setSelectedTargetUserIds(unregIds);
+    setActionMessage({
+      type: 'success',
+      text: `個人メール未登録の社員 ${unregIds.length} 名を選択しました。`
+    });
+  };
+
+  const handleClearTargetSelection = () => {
+    setSelectedTargetUserIds([]);
+  };
+
+  // 個人メール登録依頼メール送信実行
+  const handleSendRegistrationRequest = async () => {
+    if (selectedTargetUserIds.length === 0) {
+      alert('送信対象の社員を1名以上選択してください。');
+      return;
+    }
+
+    if (!requestSendCompany && !requestSendMobile) {
+      alert('会社PCメールまたは会社携帯メールのいずれか1つ以上を送信先として選択してください。');
+      return;
+    }
+
+    setIsSendingRequest(true);
+    setActionMessage(null);
+    try {
+      const appBaseUrl = window.location.origin + window.location.pathname.replace(/\/$/, '');
+      const payload = {
+        userIds: selectedTargetUserIds,
+        appBaseUrl,
+        customMessage: requestCustomMessage.trim(),
+        sendToCompanyEmail: requestSendCompany,
+        sendToMobileEmail: requestSendMobile,
+        senderName: currentUser.name ? `${currentUser.name} (${currentUser.office || ''} ${currentUser.division || ''})` : '安否確認管理者'
+      };
+
+      const res = await fetch(`${API_BASE_URL}/safety/request-registration`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+
+      if (res.ok && data.success) {
+        setIsRequestModalOpen(false);
+        setRequestResultModal({
+          open: true,
+          success: true,
+          message: data.message || `${data.sentCount} 名に登録依頼メールを送信しました。`,
+          details: data
+        });
+        setActionMessage({
+          type: 'success',
+          text: `【送信完了】${data.sentCount} 名の社員宛に個人メール登録依頼メールを送信しました。`
+        });
+        setSelectedTargetUserIds([]);
+      } else {
+        setRequestResultModal({
+          open: true,
+          success: false,
+          message: data.error || '登録依頼メールの送信に失敗しました。',
+          details: data
+        });
+      }
+    } catch (err: any) {
+      console.error('Request registration send error:', err);
+      setRequestResultModal({
+        open: true,
+        success: false,
+        message: `通信エラー: ${err.message || '送信できませんでした'}`
+      });
+    } finally {
+      setIsSendingRequest(false);
+    }
+  };
+
+  // Calculations for dashboard
+  const answeredUserIds = new Set(responses.map(r => r.userId));
+  const totalUsersCount = allUsers.length;
+  const answeredCount = responses.length;
+  const responseRate = totalUsersCount > 0 ? Math.round((answeredCount / totalUsersCount) * 100) : 0;
+
+  const safeCount = responses.filter(r => r.safetyStatus === 'safe').length;
+  const minorInjuryCount = responses.filter(r => r.safetyStatus === 'minor_injury').length;
+  const severeInjuryCount = responses.filter(r => r.safetyStatus === 'severe_injury' || r.safetyStatus === 'need_rescue').length;
+  const canWorkCount = responses.filter(r => r.workAvailability === 'available').length;
+  const remoteWorkCount = responses.filter(r => r.workAvailability === 'remote_only').length;
+  const cannotWorkCount = responses.filter(r => r.workAvailability === 'unavailable').length;
+
+  // Filtered members list for dashboard (拠点マスターID / 表記ゆれ吸収照合)
+  const filteredMembers = allUsers.filter(u => {
+    if (selectedOfficeFilter !== 'all' && !doesUserMatchOffice(u, selectedOfficeFilter, offices)) return false;
+    if (searchKeyword.trim()) {
+      const kw = searchKeyword.toLowerCase();
+      const matchName = u.name.toLowerCase().includes(kw);
+      const matchOffice = (u.office || '').toLowerCase().includes(kw);
+      const matchDivision = (u.division || '').toLowerCase().includes(kw);
+      if (!matchName && !matchOffice && !matchDivision) return false;
+    }
+    const isAnswered = answeredUserIds.has(u.id);
+    const resp = responses.find(r => r.userId === u.id);
+    if (statusFilter === 'unanswered' && isAnswered) return false;
+    if (statusFilter === 'safe' && (!resp || resp.safetyStatus !== 'safe')) return false;
+    if (statusFilter === 'danger' && (!resp || (resp.safetyStatus !== 'minor_injury' && resp.safetyStatus !== 'severe_injury' && resp.safetyStatus !== 'need_rescue'))) return false;
+    return true;
+  });
+
+  // Filtered & Sorted targets list for Target Members Roster (対象者一覧タブ: 拠点・部署マスターID照合＆兼務対応)
+  const filteredTargets = allUsers.filter(u => {
+    if (targetOfficeFilter !== 'all' && !doesUserMatchOffice(u, targetOfficeFilter, offices)) return false;
+    if (targetDivisionFilter !== 'all' && !doesUserMatchDivision(u, targetDivisionFilter, divisions)) return false;
+    
+    const hasMobile = !!(u.mobileEmail && u.mobileEmail.trim());
+    const hasPersonal = !!(u.personalEmailMasked || u.personalEmailEncrypted);
+
+    if (targetRegistrationFilter === 'both' && (!hasMobile || !hasPersonal)) return false;
+    if (targetRegistrationFilter === 'personalOnly' && (!hasPersonal || hasMobile)) return false;
+    if (targetRegistrationFilter === 'mobileOnly' && (!hasMobile || hasPersonal)) return false;
+    if (targetRegistrationFilter === 'none' && (hasMobile || hasPersonal)) return false;
+
+    if (targetSearchKeyword.trim()) {
+      const kw = targetSearchKeyword.toLowerCase();
+      const matchName = u.name.toLowerCase().includes(kw);
+      const matchKana = (u.kanaName || '').toLowerCase().includes(kw);
+      const matchOffice = (u.office || '').toLowerCase().includes(kw);
+      const matchDivision = (u.division || '').toLowerCase().includes(kw);
+      const matchEmail = (u.email || '').toLowerCase().includes(kw);
+      const matchMobileEmail = (u.mobileEmail || '').toLowerCase().includes(kw);
+      const matchPersonalEmail = (u.personalEmailMasked || '').toLowerCase().includes(kw);
+      if (!matchName && !matchKana && !matchOffice && !matchDivision && !matchEmail && !matchMobileEmail && !matchPersonalEmail) {
+        return false;
+      }
+    }
+    return true;
+  }).sort((a, b) => {
+    let comp = 0;
+    if (targetSortField === 'name') {
+      const aVal = (a.kanaName || a.name || '').toLowerCase();
+      const bVal = (b.kanaName || b.name || '').toLowerCase();
+      comp = aVal.localeCompare(bVal, 'ja');
+    } else if (targetSortField === 'office') {
+      const aVal = (resolveOffice(a.officeId || a.office, offices)?.name || a.office || '').toLowerCase();
+      const bVal = (resolveOffice(b.officeId || b.office, offices)?.name || b.office || '').toLowerCase();
+      comp = aVal.localeCompare(bVal, 'ja');
+    } else if (targetSortField === 'division') {
+      const aVal = (resolveDivision(a.divisionId || a.division, divisions)?.name || a.division || '').toLowerCase();
+      const bVal = (resolveDivision(b.divisionId || b.division, divisions)?.name || b.division || '').toLowerCase();
+      comp = aVal.localeCompare(bVal, 'ja');
+    } else if (targetSortField === 'mobileEmail') {
+      const aVal = (a.mobileEmail || '').toLowerCase();
+      const bVal = (b.mobileEmail || '').toLowerCase();
+      comp = aVal.localeCompare(bVal);
+    } else if (targetSortField === 'personalEmail') {
+      const aVal = (a.personalEmailMasked || '').toLowerCase();
+      const bVal = (b.personalEmailMasked || '').toLowerCase();
+      comp = aVal.localeCompare(bVal);
+    } else if (targetSortField === 'status') {
+      const aScore = (a.mobileEmail && (a.personalEmailMasked || a.personalEmailEncrypted)) ? 3 : (a.personalEmailMasked || a.personalEmailEncrypted) ? 2 : a.mobileEmail ? 1 : 0;
+      const bScore = (b.mobileEmail && (b.personalEmailMasked || b.personalEmailEncrypted)) ? 3 : (b.personalEmailMasked || b.personalEmailEncrypted) ? 2 : b.mobileEmail ? 1 : 0;
+      comp = aScore - bScore;
+    }
+    return targetSortOrder === 'asc' ? comp : -comp;
+  });
+
+  // Target registration statistics
+  const targetTotalCount = allUsers.length;
+  const targetPersonalRegisteredCount = allUsers.filter(u => !!(u.personalEmailMasked || u.personalEmailEncrypted)).length;
+  const targetMobileRegisteredCount = allUsers.filter(u => !!(u.mobileEmail && u.mobileEmail.trim())).length;
+  const targetBothRegisteredCount = allUsers.filter(u => !!(u.personalEmailMasked || u.personalEmailEncrypted) && !!(u.mobileEmail && u.mobileEmail.trim())).length;
+  const targetAtLeastOneRegisteredCount = allUsers.filter(u => !!(u.personalEmailMasked || u.personalEmailEncrypted) || !!(u.mobileEmail && u.mobileEmail.trim())).length;
+  const targetNoneRegisteredCount = targetTotalCount - targetAtLeastOneRegisteredCount;
+  const targetPersonalRate = targetTotalCount > 0 ? Math.round((targetPersonalRegisteredCount / targetTotalCount) * 100) : 0;
+  const targetMobileRate = targetTotalCount > 0 ? Math.round((targetMobileRegisteredCount / targetTotalCount) * 100) : 0;
+  const targetOverallRate = targetTotalCount > 0 ? Math.round((targetAtLeastOneRegisteredCount / targetTotalCount) * 100) : 0;
+
+  return (
+    <div className="flex-1 w-full min-w-0 max-w-7xl mx-auto space-y-4 sm:space-y-6 pb-12 overflow-x-hidden">
+      {/* Top Header Card */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="flex items-start sm:items-center gap-3 sm:gap-3.5 min-w-0">
+          <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-xl sm:rounded-2xl bg-rose-600 text-white flex items-center justify-center shadow-md shadow-rose-200 shrink-0">
+            <ShieldAlert className="w-5 h-5 sm:w-6 sm:h-6" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+              <h1 className="text-base sm:text-xl font-black text-slate-800 tracking-tight">
+                安否確認システム (BCP・災害対策)
+              </h1>
+              <span className="text-[10px] sm:text-xs px-2 sm:px-2.5 py-0.5 rounded-full font-bold bg-rose-100 text-rose-700 border border-rose-200 whitespace-nowrap">
+                ユーティリティ / BCP
+              </span>
+            </div>
+            <p className="text-[11px] sm:text-xs text-slate-500 mt-1 leading-relaxed break-words">
+              地震・津波・風水害発生時における全社安否確認の一斉発動、リアルタイム集計、および個人メール暗号化管理を行えます。
+            </p>
+          </div>
+        </div>
+
+        {/* Global Action Navigation Tabs */}
+        <div className="flex items-center gap-1 sm:gap-1.5 bg-slate-100 p-1 rounded-xl border border-slate-200 text-xs font-bold overflow-x-auto w-full md:w-auto shrink-0 max-w-full">
+          <button
+            onClick={() => setActiveTab('dashboard')}
+            className={`px-3 sm:px-3.5 py-2 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+              activeTab === 'dashboard'
+                ? 'bg-white text-rose-700 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <Users className="w-4 h-4 shrink-0" />
+            <span>集計ダッシュボード</span>
+          </button>
+
+          {isAdmin && (
+            <>
+              <button
+                onClick={() => setActiveTab('targets')}
+                className={`px-3 sm:px-3.5 py-2 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'targets'
+                    ? 'bg-white text-rose-700 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <UserCheck className="w-4 h-4 text-indigo-600 shrink-0" />
+                <span>対象者・登録管理</span>
+              </button>
+
+              <button
+                onClick={() => setActiveTab('jma_auto')}
+                className={`px-3 sm:px-3.5 py-2 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'jma_auto'
+                    ? 'bg-white text-amber-700 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Radio className={`w-4 h-4 shrink-0 ${jmaSettings.enabled ? 'text-amber-500 animate-pulse' : 'text-slate-400'}`} />
+                <span>気象庁連動</span>
+                {jmaSettings.enabled && (
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" title="気象庁連動: 監視中" />
+                )}
+              </button>
+
+              <button
+                onClick={() => setActiveTab('trigger')}
+                className={`px-3 sm:px-3.5 py-2 rounded-lg transition-all flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeTab === 'trigger'
+                    ? 'bg-slate-900 text-white shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Send className="w-4 h-4 shrink-0" />
+                <span>手動発動</span>
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Action Notification Banner */}
+      {actionMessage && (
+        <div
+          className={`p-4 rounded-xl border flex items-center justify-between text-xs font-bold ${
+            actionMessage.type === 'success'
+              ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+              : 'bg-rose-50 text-rose-800 border-rose-200'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {actionMessage.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            )}
+            <span>{actionMessage.text}</span>
+          </div>
+          <button
+            onClick={() => setActionMessage(null)}
+            className="text-slate-400 hover:text-slate-600 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 1: DASHBOARD (集計・進捗ダッシュボード) */}
+      {/* ========================================================================= */}
+      {activeTab === 'dashboard' && (
+        <div className="space-y-6">
+          {events.length === 0 ? (
+            <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center space-y-4">
+              <div className="w-16 h-16 bg-rose-50 text-rose-600 rounded-2xl flex items-center justify-center mx-auto ring-8 ring-rose-50/50">
+                <ShieldAlert className="w-8 h-8" />
+              </div>
+              <h2 className="text-base font-extrabold text-slate-800">
+                現在発動中の安否確認はありません
+              </h2>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">
+                緊急時や訓練時には、右上の「安否確認を発動」ボタンから全社・拠点向けに一斉通知を送信できます。
+              </p>
+              <button
+                onClick={() => setActiveTab('trigger')}
+                className="px-5 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shadow-sm transition-all inline-flex items-center gap-2 cursor-pointer"
+              >
+                <Send className="w-4 h-4" />
+                安否確認を発動する
+              </button>
+            </div>
+          ) : (
+            <>
+              {/* Event Selector Header */}
+              <div className="bg-white rounded-2xl border border-slate-200 p-3.5 sm:p-4 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-3">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 sm:gap-3 w-full md:w-auto min-w-0">
+                  <span className="text-xs font-bold text-slate-500 shrink-0">対象イベント:</span>
+                  <select
+                    value={selectedEventId || ''}
+                    onChange={(e) => setSelectedEventId(e.target.value)}
+                    className="w-full sm:w-auto px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500 cursor-pointer min-w-0"
+                  >
+                    {events.map((ev) => (
+                      <option key={ev.id} value={ev.id}>
+                        {ev.status === 'active' ? '🔴 [発動中] ' : '⚪ [完了] '}
+                        {ev.title} ({new Date(ev.createdAt).toLocaleString('ja-JP', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+                  <button
+                    onClick={handleExportCSV}
+                    className="px-3 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs whitespace-nowrap"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                    <span>CSV出力</span>
+                  </button>
+
+                  {isAdmin && (
+                    <>
+                      <button
+                        onClick={handleSendReminder}
+                        disabled={isSending || (totalUsersCount - answeredCount) === 0}
+                        className="px-3 sm:px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs disabled:opacity-50 whitespace-nowrap"
+                        title="未回答者に対してプッシュ通知・メール通知を再送します"
+                      >
+                        <Bell className="w-3.5 h-3.5 shrink-0" />
+                        <span>未回答者へ再通知 ({totalUsersCount - answeredCount}名)</span>
+                      </button>
+
+                      {activeEvent && activeEvent.status === 'active' && (
+                        <button
+                          onClick={() => handleCloseEvent(activeEvent.id)}
+                          className="px-3 py-1.5 rounded-lg border border-slate-300 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs whitespace-nowrap"
+                          title="安否確認イベントを終了（アーカイブ）します"
+                        >
+                          <CheckCircle2 className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+                          <span>終了・完了</span>
+                        </button>
+                      )}
+
+                      {activeEvent && (
+                        <button
+                          onClick={() => handleDeleteEvent(activeEvent.id)}
+                          className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs whitespace-nowrap"
+                          title="この安否確認イベントおよび全集計データを完全に削除します"
+                        >
+                          <Trash2 className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                          <span>イベント削除</span>
+                        </button>
+                      )}
+                    </>
+                  )}
+
+                  <button
+                    onClick={() => {
+                      if (activeEvent) fetchResponses(activeEvent.id);
+                    }}
+                    className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-100 text-slate-600 cursor-pointer shrink-0"
+                    title="再読み込み"
+                  >
+                    <RefreshCw className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Current User Response Status Card / Action Banner */}
+              {activeEvent && (
+                <div className={`p-3.5 sm:p-4 rounded-2xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3.5 sm:gap-4 shadow-sm transition-all ${
+                  currentUserResponse
+                    ? 'bg-gradient-to-r from-emerald-50/80 via-white to-teal-50/50 border-emerald-200'
+                    : 'bg-gradient-to-r from-rose-50 via-white to-amber-50/60 border-rose-200 ring-2 ring-rose-500/10'
+                }`}>
+                  <div className="flex items-start sm:items-center gap-3 sm:gap-3.5 min-w-0">
+                    <div className={`p-2.5 rounded-xl shrink-0 ${
+                      currentUserResponse ? 'bg-emerald-600 text-white' : 'bg-rose-600 text-white animate-pulse'
+                    }`}>
+                      <HeartHandshake className="w-5 h-5" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                        <span className="text-xs font-bold text-slate-500">あなたの安否回答状況:</span>
+                        {currentUserResponse ? (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-black bg-emerald-100 text-emerald-800 border border-emerald-300 whitespace-nowrap">
+                            <Check className="w-3 h-3 shrink-0" />
+                            回答済み ({currentUserResponse.safetyStatus === 'safe' ? '無事' : currentUserResponse.safetyStatus === 'minor_injury' ? '軽傷' : '重傷・要救助'})
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-black bg-rose-100 text-rose-800 border border-rose-300 animate-pulse whitespace-nowrap">
+                            <AlertCircle className="w-3 h-3 shrink-0" />
+                            未回答 (要回答)
+                          </span>
+                        )}
+                        <span className="text-xs font-bold text-slate-700 truncate">
+                          {currentUser.name} さん ({currentUser.office || '本社'} / {currentUser.division || '所属'})
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1 leading-relaxed break-words">
+                        {currentUserResponse
+                          ? `出社可否: ${currentUserResponse.workAvailability === 'available' ? '通常出社可' : currentUserResponse.workAvailability === 'remote_only' ? '在宅勤務可' : '出社不可'} | 現在地: ${currentUserResponse.locationStatus || '未記入'} (最終回答: ${new Date(currentUserResponse.respondedAt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })})`
+                          : '災害発生時の速やかな状況把握のため、現在の安全状況・出社可否をご回答ください。'}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                    <button
+                      type="button"
+                      onClick={() => setIsMyAnswerModalOpen(true)}
+                      className={`w-full sm:w-auto px-4 py-2.5 rounded-xl text-xs font-black flex items-center justify-center gap-1.5 transition-all shadow-xs cursor-pointer whitespace-nowrap ${
+                        currentUserResponse
+                          ? 'bg-white border border-emerald-300 text-emerald-800 hover:bg-emerald-50 hover:shadow-sm'
+                          : 'bg-rose-600 hover:bg-rose-700 text-white shadow-rose-200 shadow-md animate-bounce'
+                      }`}
+                    >
+                      <HeartHandshake className="w-4 h-4 shrink-0" />
+                      <span>{currentUserResponse ? '回答内容を変更・更新する' : '今すぐ安否を回答する'}</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Statistics Bento Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5 sm:gap-3.5">
+                {/* 1. 回答率 */}
+                <div className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-4 shadow-sm flex flex-col justify-between">
+                  <span className="text-[10px] sm:text-[11px] font-bold text-slate-500">回答率</span>
+                  <div className="my-1.5 sm:my-2 flex items-baseline gap-1.5 sm:gap-2">
+                    <span className="text-xl sm:text-2xl font-black text-rose-600 tabular-nums">{responseRate}%</span>
+                    <span className="text-[11px] sm:text-xs text-slate-400 font-bold tabular-nums">{answeredCount}/{totalUsersCount}名</span>
+                  </div>
+                  <div className="w-full bg-slate-100 h-1.5 sm:h-2 rounded-full overflow-hidden">
+                    <div className="bg-rose-600 h-full transition-all duration-500" style={{ width: `${responseRate}%` }} />
+                  </div>
+                </div>
+
+                {/* 2. 無事 */}
+                <div className="bg-white rounded-2xl border border-emerald-200 p-3 sm:p-4 shadow-sm bg-emerald-50/20">
+                  <span className="text-[10px] sm:text-[11px] font-bold text-emerald-700">無事・軽微</span>
+                  <div className="my-1.5 sm:my-2">
+                    <span className="text-xl sm:text-2xl font-black text-emerald-600 tabular-nums">{safeCount}</span>
+                    <span className="text-xs text-emerald-600/70 font-bold ml-1">名</span>
+                  </div>
+                  <span className="text-[10px] text-emerald-600 font-semibold">支障なし</span>
+                </div>
+
+                {/* 3. 軽傷・被害あり */}
+                <div className="bg-white rounded-2xl border border-amber-200 p-3 sm:p-4 shadow-sm bg-amber-50/20">
+                  <span className="text-[10px] sm:text-[11px] font-bold text-amber-700">軽傷・対応中</span>
+                  <div className="my-1.5 sm:my-2">
+                    <span className="text-xl sm:text-2xl font-black text-amber-600 tabular-nums">{minorInjuryCount}</span>
+                    <span className="text-xs text-amber-600/70 font-bold ml-1">名</span>
+                  </div>
+                  <span className="text-[10px] text-amber-600 font-semibold">自力対応中</span>
+                </div>
+
+                {/* 4. 重傷・要救助 */}
+                <div className="bg-white rounded-2xl border border-rose-200 p-3 sm:p-4 shadow-sm bg-rose-50/30">
+                  <span className="text-[10px] sm:text-[11px] font-bold text-rose-700">重傷・救助要請</span>
+                  <div className="my-1.5 sm:my-2">
+                    <span className="text-xl sm:text-2xl font-black text-rose-600 tabular-nums">{severeInjuryCount}</span>
+                    <span className="text-xs text-rose-600/70 font-bold ml-1">名</span>
+                  </div>
+                  <span className="text-[10px] text-rose-600 font-semibold">最優先支援</span>
+                </div>
+
+                {/* 5. 出社可 */}
+                <div className="bg-white rounded-2xl border border-indigo-200 p-3 sm:p-4 shadow-sm bg-indigo-50/20">
+                  <span className="text-[10px] sm:text-[11px] font-bold text-indigo-700">通常出社可</span>
+                  <div className="my-1.5 sm:my-2">
+                    <span className="text-xl sm:text-2xl font-black text-indigo-600 tabular-nums">{canWorkCount}</span>
+                    <span className="text-xs text-indigo-600/70 font-bold ml-1">名</span>
+                  </div>
+                  <span className="text-[10px] text-indigo-600 font-semibold">稼働可能</span>
+                </div>
+
+                {/* 6. 在宅/出社不可 */}
+                <div className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-4 shadow-sm">
+                  <span className="text-[10px] sm:text-[11px] font-bold text-slate-600">在宅 / 出社不可</span>
+                  <div className="my-1.5 sm:my-2 flex items-baseline gap-2">
+                    <span className="text-xl sm:text-2xl font-black text-slate-800 tabular-nums">{remoteWorkCount + cannotWorkCount}</span>
+                    <span className="text-xs text-slate-400 font-bold">名</span>
+                  </div>
+                  <span className="text-[10px] text-slate-500 font-medium">出社不可: {cannotWorkCount}名</span>
+                </div>
+              </div>
+
+              {/* Members Status Filter & List */}
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                <div className="p-3.5 sm:p-4 bg-slate-50 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Users className="w-4 h-4 text-slate-700 shrink-0" />
+                    <span className="text-xs font-bold text-slate-800">
+                      社員安否状況一覧 ({filteredMembers.length}名)
+                    </span>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 text-xs">
+                    {/* Status filter buttons (horizontal scrolling on mobile) */}
+                    <div className="flex items-center gap-0.5 overflow-x-auto bg-white rounded-lg border border-slate-200 p-0.5 shrink-0">
+                      <button
+                        onClick={() => setStatusFilter('all')}
+                        className={`px-2.5 py-1 rounded text-xs font-bold whitespace-nowrap cursor-pointer transition-colors ${
+                          statusFilter === 'all' ? 'bg-slate-800 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        全員
+                      </button>
+                      <button
+                        onClick={() => setStatusFilter('unanswered')}
+                        className={`px-2.5 py-1 rounded text-xs font-bold whitespace-nowrap cursor-pointer transition-colors ${
+                          statusFilter === 'unanswered' ? 'bg-amber-500 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        未回答のみ
+                      </button>
+                      <button
+                        onClick={() => setStatusFilter('danger')}
+                        className={`px-2.5 py-1 rounded text-xs font-bold whitespace-nowrap cursor-pointer transition-colors ${
+                          statusFilter === 'danger' ? 'bg-rose-600 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        被害・要救助
+                      </button>
+                      <button
+                        onClick={() => setStatusFilter('safe')}
+                        className={`px-2.5 py-1 rounded text-xs font-bold whitespace-nowrap cursor-pointer transition-colors ${
+                          statusFilter === 'safe' ? 'bg-emerald-600 text-white shadow-xs' : 'text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        無事
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {/* Office selector */}
+                      <select
+                        value={selectedOfficeFilter}
+                        onChange={(e) => setSelectedOfficeFilter(e.target.value)}
+                        className="px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 cursor-pointer flex-1 sm:flex-initial"
+                      >
+                        <option value="all">全拠点</option>
+                        {offices.map(off => (
+                          <option key={off.id} value={off.name}>{off.name}</option>
+                        ))}
+                      </select>
+
+                      {/* Search bar */}
+                      <div className="relative flex-1 sm:w-44">
+                        <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input
+                          type="text"
+                          placeholder="氏名・部署で検索..."
+                          value={searchKeyword}
+                          onChange={(e) => setSearchKeyword(e.target.value)}
+                          className="w-full pl-8 pr-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-rose-500"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Desktop View: Full Data Table (PC画面そのまま) */}
+                <div className="hidden md:block divide-y divide-slate-100 overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50/50 text-slate-500 font-bold border-b border-slate-100">
+                      <tr>
+                        <th className="py-3 px-4">氏名 / 所属</th>
+                        <th className="py-3 px-4">安否状況</th>
+                        <th className="py-3 px-4">家族・家屋</th>
+                        <th className="py-3 px-4">出社可否 / 現在地</th>
+                        <th className="py-3 px-4">連絡先 (暗号化保護)</th>
+                        <th className="py-3 px-4">コメント・要望</th>
+                        <th className="py-3 px-4">回答日時</th>
+                        <th className="py-3 px-3 text-center">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {filteredMembers.map((member) => {
+                        const resp = responses.find(r => r.userId === member.id);
+                        const isMe = currentUser.id === member.id;
+                        return (
+                          <tr
+                            key={member.id}
+                            onClick={() => {
+                              if (isMe) {
+                                setIsMyAnswerModalOpen(true);
+                              } else {
+                                setViewingResponseData({ user: member, response: resp });
+                              }
+                            }}
+                            className={`group cursor-pointer transition-colors ${
+                              isMe
+                                ? 'bg-rose-50/30 hover:bg-rose-50/70'
+                                : 'hover:bg-slate-50/90'
+                            }`}
+                            title={isMe ? 'クリックして自分の安否状況を回答・変更' : `クリックして ${member.name} さんの回答詳細を確認`}
+                          >
+                            <td className="py-3 px-4">
+                              <div className="flex items-center gap-1.5 font-bold text-slate-900">
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    triggerOpenUserModal(member);
+                                  }}
+                                  className="hover:text-indigo-600 hover:underline transition-colors cursor-pointer text-left"
+                                  title={`${member.name} さんの社員詳細を表示`}
+                                >
+                                  {member.name}
+                                </button>
+                                {isMe && (
+                                  <span className="text-[10px] font-black px-1.5 py-0.2 rounded bg-rose-100 text-rose-700 border border-rose-200">
+                                    あなた
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[10px] text-slate-400">
+                                {[member.office, member.division, member.position].filter(Boolean).join(' / ')}
+                              </div>
+                            </td>
+                            <td className="py-3 px-4">
+                              {resp ? (
+                                resp.safetyStatus === 'safe' ? (
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-2xs">
+                                    <Check className="w-3 h-3 text-emerald-600" />
+                                    無事
+                                  </span>
+                                ) : resp.safetyStatus === 'minor_injury' ? (
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-50 text-amber-700 border border-amber-200 shadow-2xs">
+                                    <AlertTriangle className="w-3 h-3 text-amber-600" />
+                                    軽傷・対応中
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-rose-50 text-rose-700 border border-rose-200 animate-pulse shadow-2xs">
+                                    <AlertOctagon className="w-3 h-3 text-rose-600" />
+                                    重傷・要救助
+                                  </span>
+                                )
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-slate-100 text-slate-400 border border-slate-200">
+                                  <Clock className="w-3 h-3" />
+                                  未回答
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 text-slate-600">
+                              {resp ? (
+                                <div className="space-y-0.5 text-[11px]">
+                                  <div>家族: {resp.familyStatus === 'all_safe' ? '全員無事' : resp.familyStatus === 'injured' ? '負傷者あり' : '未定'}</div>
+                                  <div>家屋: {resp.houseStatus === 'no_damage' ? '被害なし' : resp.houseStatus === 'partial_damage' ? '一部破損' : '倒壊・避難'}</div>
+                                </div>
+                              ) : (
+                                <span className="text-slate-400">-</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4">
+                              {resp ? (
+                                <div className="space-y-0.5 text-[11px]">
+                                  <div className="font-bold text-slate-800">
+                                    {resp.workAvailability === 'available' ? '通常出社可' : resp.workAvailability === 'remote_only' ? '在宅勤務可' : '出社不可'}
+                                  </div>
+                                  <div className="text-slate-500">現在地: {resp.locationStatus || '自宅'}</div>
+                                </div>
+                              ) : (
+                                <span className="text-slate-400">-</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="space-y-0.5 text-[10px] text-slate-500 font-mono">
+                                {member.mobileEmail && (
+                                  <div className="flex items-center gap-1">
+                                    <Smartphone className="w-2.5 h-2.5 text-indigo-500" />
+                                    <span>{member.mobileEmail}</span>
+                                  </div>
+                                )}
+                                {member.personalEmailMasked ? (
+                                  <div className="flex items-center gap-1 text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-100">
+                                    <Lock className="w-2.5 h-2.5 text-emerald-600" />
+                                    <span>個人: {member.personalEmailMasked}</span>
+                                  </div>
+                                ) : (
+                                  <span className="text-slate-300">個人メール未登録</span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="py-3 px-4 text-slate-700 max-w-xs">
+                              {resp?.message ? (
+                                <span className="line-clamp-2 text-slate-800">{resp.message}</span>
+                              ) : (
+                                <span className="text-slate-400">-</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 text-slate-400 text-[11px] whitespace-nowrap">
+                              {resp?.respondedAt ? (
+                                new Date(resp.respondedAt).toLocaleString('ja-JP', {
+                                  month: 'numeric',
+                                  day: 'numeric',
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })
+                              ) : (
+                                '-'
+                              )}
+                            </td>
+                            <td className="py-3 px-3 text-center whitespace-nowrap">
+                              <div className="flex items-center justify-center gap-1" onClick={(e) => e.stopPropagation()}>
+                                {isMe ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => setIsMyAnswerModalOpen(true)}
+                                    className="px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
+                                    title="自分の安否状況を回答・変更"
+                                  >
+                                    <HeartHandshake className="w-3 h-3" />
+                                    {resp ? '変更' : '回答'}
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => setViewingResponseData({ user: member, response: resp })}
+                                    className="px-2 py-1 rounded-lg text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 border border-slate-200 transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
+                                    title="回答詳細をポップアップ表示"
+                                  >
+                                    <Eye className="w-3 h-3 text-slate-500" />
+                                    詳細
+                                  </button>
+                                )}
+
+                                {resp && (isAdmin || isMe) && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteResponse(activeEvent.id, member.id, member.name)}
+                                    className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                                    title={`${member.name} さんの回答を削除（未回答にリセット）`}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Mobile View: Responsive Card List (スマホ最適化カード表示) */}
+                <div className="md:hidden divide-y divide-slate-100">
+                  {filteredMembers.map((member) => {
+                    const resp = responses.find(r => r.userId === member.id);
+                    const isMe = currentUser.id === member.id;
+                    return (
+                      <div
+                        key={member.id}
+                        onClick={() => {
+                          if (isMe) {
+                            setIsMyAnswerModalOpen(true);
+                          } else {
+                            setViewingResponseData({ user: member, response: resp });
+                          }
+                        }}
+                        className={`p-3.5 transition-colors cursor-pointer space-y-2.5 ${
+                          isMe ? 'bg-rose-50/40 hover:bg-rose-50/70' : 'hover:bg-slate-50'
+                        }`}
+                      >
+                        {/* Member Row: Name + Badge */}
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  triggerOpenUserModal(member);
+                                }}
+                                className="font-bold text-sm text-slate-900 hover:text-indigo-600 hover:underline transition-colors cursor-pointer text-left"
+                                title={`${member.name} さんの社員詳細を表示`}
+                              >
+                                {member.name}
+                              </button>
+                              {isMe && (
+                                <span className="text-[10px] font-black px-1.5 py-0.2 rounded bg-rose-100 text-rose-700 border border-rose-200 whitespace-nowrap">
+                                  あなた
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-slate-400 truncate mt-0.5">
+                              {[member.office, member.division, member.position].filter(Boolean).join(' / ')}
+                            </p>
+                          </div>
+
+                          <div className="shrink-0">
+                            {resp ? (
+                              resp.safetyStatus === 'safe' ? (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-2xs whitespace-nowrap">
+                                  <Check className="w-3 h-3 text-emerald-600 shrink-0" />
+                                  無事
+                                </span>
+                              ) : resp.safetyStatus === 'minor_injury' ? (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-amber-50 text-amber-700 border border-amber-200 shadow-2xs whitespace-nowrap">
+                                  <AlertTriangle className="w-3 h-3 text-amber-600 shrink-0" />
+                                  軽傷
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200 animate-pulse shadow-2xs whitespace-nowrap">
+                                  <AlertOctagon className="w-3 h-3 text-rose-600 shrink-0" />
+                                  要救助
+                                </span>
+                              )
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-bold bg-slate-100 text-slate-400 border border-slate-200 whitespace-nowrap">
+                                <Clock className="w-3 h-3 shrink-0" />
+                                未回答
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Response Details (if answered) */}
+                        {resp ? (
+                          <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-100 space-y-1.5 text-xs">
+                            <div className="grid grid-cols-2 gap-2 text-[11px]">
+                              <div>
+                                <span className="text-slate-400 block text-[10px]">出社・就業</span>
+                                <span className="font-bold text-slate-800">
+                                  {resp.workAvailability === 'available' ? '通常出社可' : resp.workAvailability === 'remote_only' ? '在宅勤務可' : '出社不可'}
+                                </span>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 block text-[10px]">現在地</span>
+                                <span className="text-slate-700 truncate block">{resp.locationStatus || '自宅'}</span>
+                              </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-2 text-[11px] pt-1 border-t border-slate-200/60">
+                              <div>
+                                <span className="text-slate-400 text-[10px]">家族: </span>
+                                <span className="text-slate-700">{resp.familyStatus === 'all_safe' ? '全員無事' : resp.familyStatus === 'injured' ? '負傷者あり' : '未定'}</span>
+                              </div>
+                              <div>
+                                <span className="text-slate-400 text-[10px]">家屋: </span>
+                                <span className="text-slate-700">{resp.houseStatus === 'no_damage' ? '被害なし' : resp.houseStatus === 'partial_damage' ? '一部破損' : '倒壊・避難'}</span>
+                              </div>
+                            </div>
+
+                            {resp.message && (
+                              <div className="pt-1 border-t border-slate-200/60 text-[11px] text-slate-700 bg-white p-2 rounded-lg border border-slate-100">
+                                <span className="text-[10px] text-slate-400 block font-bold">コメント:</span>
+                                <p className="line-clamp-2 mt-0.5">{resp.message}</p>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-between text-[11px] text-slate-400 bg-slate-50/60 px-2.5 py-1.5 rounded-lg border border-slate-100">
+                            <span>安否回答待ち</span>
+                            {member.personalEmailMasked ? (
+                              <span className="text-emerald-700 font-mono text-[10px] flex items-center gap-1">
+                                <Lock className="w-2.5 h-2.5 text-emerald-600" />
+                                個人メール登録済
+                              </span>
+                            ) : (
+                              <span className="text-slate-400 text-[10px]">個人メール未登録</span>
+                            )}
+                          </div>
+                        )}
+
+                        {/* Action Row */}
+                        <div className="flex items-center justify-between pt-1 text-[11px] text-slate-400" onClick={(e) => e.stopPropagation()}>
+                          <div>
+                            {resp?.respondedAt && (
+                              <span className="tabular-nums">
+                                回答: {new Date(resp.respondedAt).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5">
+                            {isMe ? (
+                              <button
+                                type="button"
+                                onClick={() => setIsMyAnswerModalOpen(true)}
+                                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                              >
+                                <HeartHandshake className="w-3.5 h-3.5" />
+                                <span>{resp ? '回答変更' : '今すぐ回答'}</span>
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => setViewingResponseData({ user: member, response: resp })}
+                                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                              >
+                                <Eye className="w-3.5 h-3.5 text-slate-500" />
+                                <span>詳細を見る</span>
+                              </button>
+                            )}
+
+                            {resp && (isAdmin || isMe) && (
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteResponse(activeEvent.id, member.id, member.name)}
+                                className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                                title="回答をリセット"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 2: TARGETS ROSTER (対象者一覧・登録状況) */}
+      {/* ========================================================================= */}
+      {activeTab === 'targets' && (
+        <div className="space-y-6">
+          {/* Summary Stat Cards for Registration Status */}
+          <div className="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-500">全社対象人数</span>
+                <span className="p-2 rounded-xl bg-slate-100 text-slate-700">
+                  <Users className="w-4 h-4" />
+                </span>
+              </div>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-black text-slate-800">{targetTotalCount}</span>
+                <span className="text-xs font-bold text-slate-400">名</span>
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1">安否確認システムの対象全社員</p>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-500">いずれか登録済</span>
+                <span className="p-2 rounded-xl bg-emerald-50 text-emerald-600">
+                  <ShieldCheck className="w-4 h-4" />
+                </span>
+              </div>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-black text-emerald-600">{targetAtLeastOneRegisteredCount}</span>
+                <span className="text-xs font-bold text-slate-400">名 ({targetOverallRate}%)</span>
+              </div>
+              <div className="w-full bg-slate-100 h-1.5 rounded-full mt-2 overflow-hidden">
+                <div
+                  className="bg-emerald-500 h-full rounded-full transition-all duration-500"
+                  style={{ width: `${targetOverallRate}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-500">暗号化個人メール</span>
+                <span className="p-2 rounded-xl bg-indigo-50 text-indigo-600">
+                  <Lock className="w-4 h-4" />
+                </span>
+              </div>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-black text-indigo-600">{targetPersonalRegisteredCount}</span>
+                <span className="text-xs font-bold text-slate-400">名 ({targetPersonalRate}%)</span>
+              </div>
+              <p className="text-[11px] text-slate-400 mt-1">私用アドレス(Gmail/キャリア等)</p>
+            </div>
+
+            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col justify-between">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-slate-500">緊急連絡先 未登録</span>
+                <span className="p-2 rounded-xl bg-rose-50 text-rose-600">
+                  <UserX className="w-4 h-4" />
+                </span>
+              </div>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-black text-rose-600">{targetNoneRegisteredCount}</span>
+                <span className="text-xs font-bold text-slate-400">名</span>
+              </div>
+              <p className="text-[11px] text-rose-600 font-bold mt-1">
+                {targetNoneRegisteredCount > 0 ? '⚠️ 要登録アナウンス' : '全員登録完了'}
+              </p>
+            </div>
+          </div>
+
+          {/* Roster Table Card */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+            {/* Table Filter and Action Toolbar */}
+            <div className="p-5 border-b border-slate-100 flex flex-col gap-4">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div className="flex items-center gap-2">
+                  <UserCheck className="w-5 h-5 text-indigo-600" />
+                  <div>
+                    <h3 className="text-sm font-extrabold text-slate-800">
+                      安否確認対象者・連絡先登録状況一覧
+                    </h3>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      全社の営業所、部署、氏名、携帯メール、個人メール（暗号化）の登録具合を一覧で確認し、未登録者への個別・一括依頼が可能です。
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2 sm:gap-2.5">
+                  {/* Search Keyword */}
+                  <div className="relative flex-1 sm:flex-initial">
+                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={targetSearchKeyword}
+                      onChange={(e) => setTargetSearchKeyword(e.target.value)}
+                      placeholder="氏名・部署・アドレス検索..."
+                      className="pl-8 pr-3 py-2 sm:py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white w-full sm:w-48"
+                    />
+                    {targetSearchKeyword && (
+                      <button
+                        onClick={() => setTargetSearchKeyword('')}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Office Filter */}
+                  <select
+                    value={targetOfficeFilter}
+                    onChange={(e) => setTargetOfficeFilter(e.target.value)}
+                    className="px-3 py-2 sm:py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer w-full sm:w-auto"
+                  >
+                    <option value="all">全拠点・営業所</option>
+                    {offices.map((o) => (
+                      <option key={o.id} value={o.name}>
+                        {o.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  {/* Division Filter */}
+                  <select
+                    value={targetDivisionFilter}
+                    onChange={(e) => setTargetDivisionFilter(e.target.value)}
+                    className="px-3 py-2 sm:py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer w-full sm:w-auto"
+                  >
+                    <option value="all">全部署</option>
+                    {divisions.map((d) => (
+                      <option key={d.id} value={d.name}>
+                        {d.name}
+                      </option>
+                    ))}
+                  </select>
+
+                  {/* Registration Filter */}
+                  <select
+                    value={targetRegistrationFilter}
+                    onChange={(e) => setTargetRegistrationFilter(e.target.value as any)}
+                    className="px-3 py-2 sm:py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer w-full sm:w-auto"
+                  >
+                    <option value="all">全登録状況 ({allUsers.length})</option>
+                    <option value="both">両方登録済 ({targetBothRegisteredCount})</option>
+                    <option value="personalOnly">個人メールのみ登録</option>
+                    <option value="mobileOnly">携帯メールのみ登録</option>
+                    <option value="none">未登録者のみ ({targetNoneRegisteredCount})</option>
+                  </select>
+
+                  {/* CSV Export Button */}
+                  <button
+                    onClick={handleExportTargetsCSV}
+                    className="px-3 py-2 sm:py-1.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer shadow-2xs shrink-0 w-full sm:w-auto"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+                    CSV出力
+                  </button>
+                </div>
+              </div>
+
+              {/* Action Bar for Registration Request & Selection */}
+              <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 bg-slate-50/60 p-3 rounded-xl">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-bold text-slate-600">
+                    選択中: <strong className="text-indigo-600 text-sm font-black">{selectedTargetUserIds.length}</strong> / {filteredTargets.length} 名
+                  </span>
+
+                  <button
+                    onClick={handleSelectAllFilteredTargets}
+                    className="px-2.5 py-1 text-[11px] font-bold rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 transition-colors"
+                  >
+                    {filteredTargets.every(u => selectedTargetUserIds.includes(u.id)) && filteredTargets.length > 0
+                      ? '表示中の全解除'
+                      : '表示中の全選択'}
+                  </button>
+
+                  <button
+                    onClick={handleSelectUnregisteredOnly}
+                    className="px-2.5 py-1 text-[11px] font-bold rounded-lg border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 transition-colors flex items-center gap-1"
+                  >
+                    <UserX className="w-3 h-3" />
+                    未登録者を一括選択 ({allUsers.filter(u => !u.personalEmailMasked && !u.personalEmailEncrypted).length}名)
+                  </button>
+
+                  {selectedTargetUserIds.length > 0 && (
+                    <button
+                      onClick={handleClearTargetSelection}
+                      className="px-2 py-1 text-[11px] font-bold text-slate-500 hover:text-slate-700 underline"
+                    >
+                      選択クリア
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => {
+                      if (selectedTargetUserIds.length === 0) {
+                        alert('依頼メールを送信する対象者を1名以上選択（チェック）してください。');
+                        return;
+                      }
+                      setIsRequestModalOpen(true);
+                    }}
+                    disabled={selectedTargetUserIds.length === 0}
+                    className={`w-full sm:w-auto justify-center px-4 py-2 rounded-xl text-xs font-black flex items-center gap-2 shadow-sm transition-all ${
+                      selectedTargetUserIds.length > 0
+                        ? 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer hover:shadow-md'
+                        : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                    }`}
+                  >
+                    <Mail className="w-4 h-4" />
+                    <span>個人メール登録の依頼メールを送信</span>
+                    {selectedTargetUserIds.length > 0 && (
+                      <span className="bg-white/20 px-2 py-0.5 rounded-full text-[11px]">
+                        {selectedTargetUserIds.length}名
+                      </span>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Target Members Table (Desktop View - 100% Unchanged) */}
+            <div className="hidden md:block overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-50/80 text-slate-600 font-bold border-b border-slate-200 select-none">
+                    {/* Checkbox Column */}
+                    <th className="py-3 px-3 text-center w-10">
+                      <input
+                        type="checkbox"
+                        checked={filteredTargets.length > 0 && filteredTargets.every(u => selectedTargetUserIds.includes(u.id))}
+                        onChange={handleSelectAllFilteredTargets}
+                        className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                        title="表示中を全選択/解除"
+                      />
+                    </th>
+
+                    {/* Name column with sort */}
+                    <th
+                      onClick={() => handleToggleTargetSort('name')}
+                      className="py-3 px-4 whitespace-nowrap cursor-pointer hover:bg-slate-100 transition-colors"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span>社員名</span>
+                        {targetSortField === 'name' ? (
+                          targetSortOrder === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-indigo-600" /> : <ArrowDown className="w-3.5 h-3.5 text-indigo-600" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-300" />
+                        )}
+                      </div>
+                    </th>
+
+                    {/* Office column with sort */}
+                    <th
+                      onClick={() => handleToggleTargetSort('office')}
+                      className="py-3 px-4 whitespace-nowrap cursor-pointer hover:bg-slate-100 transition-colors"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span>営業所</span>
+                        {targetSortField === 'office' ? (
+                          targetSortOrder === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-indigo-600" /> : <ArrowDown className="w-3.5 h-3.5 text-indigo-600" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-300" />
+                        )}
+                      </div>
+                    </th>
+
+                    {/* Division column with sort */}
+                    <th
+                      onClick={() => handleToggleTargetSort('division')}
+                      className="py-3 px-4 whitespace-nowrap cursor-pointer hover:bg-slate-100 transition-colors"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span>所属部署</span>
+                        {targetSortField === 'division' ? (
+                          targetSortOrder === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-indigo-600" /> : <ArrowDown className="w-3.5 h-3.5 text-indigo-600" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-300" />
+                        )}
+                      </div>
+                    </th>
+
+                    {/* Company PC Email */}
+                    <th className="py-3 px-4 whitespace-nowrap">会社PCメール</th>
+
+                    {/* Mobile Email column with sort */}
+                    <th
+                      onClick={() => handleToggleTargetSort('mobileEmail')}
+                      className="py-3 px-4 whitespace-nowrap cursor-pointer hover:bg-slate-100 transition-colors"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span>携帯メール</span>
+                        {targetSortField === 'mobileEmail' ? (
+                          targetSortOrder === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-indigo-600" /> : <ArrowDown className="w-3.5 h-3.5 text-indigo-600" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-300" />
+                        )}
+                      </div>
+                    </th>
+
+                    {/* Personal Email column with sort */}
+                    <th
+                      onClick={() => handleToggleTargetSort('personalEmail')}
+                      className="py-3 px-4 whitespace-nowrap cursor-pointer hover:bg-slate-100 transition-colors"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span>個人メール (暗号化)</span>
+                        {targetSortField === 'personalEmail' ? (
+                          targetSortOrder === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-indigo-600" /> : <ArrowDown className="w-3.5 h-3.5 text-indigo-600" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-300" />
+                        )}
+                      </div>
+                    </th>
+
+                    {/* Registration Status column with sort */}
+                    <th
+                      onClick={() => handleToggleTargetSort('status')}
+                      className="py-3 px-4 whitespace-nowrap text-center cursor-pointer hover:bg-slate-100 transition-colors"
+                    >
+                      <div className="flex items-center justify-center gap-1.5">
+                        <span>登録状況</span>
+                        {targetSortField === 'status' ? (
+                          targetSortOrder === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-indigo-600" /> : <ArrowDown className="w-3.5 h-3.5 text-indigo-600" />
+                        ) : (
+                          <ArrowUpDown className="w-3 h-3 text-slate-300" />
+                        )}
+                      </div>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredTargets.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="py-10 text-center text-slate-400 font-bold">
+                        条件に一致する対象者は見つかりませんでした
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredTargets.map((user) => {
+                      const hasMobile = !!(user.mobileEmail && user.mobileEmail.trim());
+                      const hasPersonal = !!(user.personalEmailMasked || user.personalEmailEncrypted);
+                      const isBoth = hasMobile && hasPersonal;
+                      const isSelected = selectedTargetUserIds.includes(user.id);
+
+                      return (
+                        <tr 
+                          key={user.id} 
+                          className={`transition-colors ${isSelected ? 'bg-indigo-50/60 hover:bg-indigo-50' : 'hover:bg-slate-50/80'}`}
+                        >
+                          {/* Checkbox */}
+                          <td className="py-2.5 px-3 text-center">
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => handleToggleTargetSelect(user.id)}
+                              className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                            />
+                          </td>
+
+                          {/* Name */}
+                          <td className="py-2.5 px-4 whitespace-nowrap">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                triggerOpenUserModal(user);
+                              }}
+                              className="flex items-center gap-2 hover:opacity-85 transition-opacity cursor-pointer group/tusr"
+                              title={`${user.name} さんの社員詳細を表示`}
+                            >
+                              <img
+                                src={getAvatarUrl(user.avatarUrl)}
+                                alt={user.name}
+                                className="w-6 h-6 rounded-full object-cover border border-slate-200 shrink-0 group-hover/tusr:ring-2 group-hover/tusr:ring-indigo-400 transition-all"
+                              />
+                              <span className="font-bold text-slate-800 group-hover/tusr:text-indigo-600 group-hover/tusr:underline text-xs transition-colors">{user.name}</span>
+                            </button>
+                          </td>
+
+                          {/* Office */}
+                          <td className="py-2.5 px-4 whitespace-nowrap">
+                            <span className="px-2 py-0.5 rounded-md font-bold text-[11px] bg-slate-100 text-slate-700">
+                              {user.office || '本社'}
+                            </span>
+                          </td>
+
+                          {/* Division */}
+                          <td className="py-2.5 px-4 whitespace-nowrap">
+                            <span className="font-bold text-slate-700">{user.division || '-'}</span>
+                          </td>
+
+                          {/* Company PC Email */}
+                          <td className="py-2.5 px-4 whitespace-nowrap">
+                            {user.email ? (
+                              <div className="flex items-center gap-1 text-[11px] font-mono text-slate-600">
+                                <Mail className="w-3 h-3 text-slate-400 shrink-0" />
+                                <span>{user.email}</span>
+                              </div>
+                            ) : (
+                              <span className="text-slate-300">-</span>
+                            )}
+                          </td>
+
+                          {/* Mobile Email */}
+                          <td className="py-2.5 px-4 whitespace-nowrap">
+                            {hasMobile ? (
+                              <div className="flex items-center gap-1 text-[11px] font-mono text-indigo-700 font-bold bg-indigo-50/70 px-2 py-0.5 rounded border border-indigo-100 w-fit">
+                                <Smartphone className="w-3 h-3 text-indigo-500 shrink-0" />
+                                <span>{user.mobileEmail}</span>
+                              </div>
+                            ) : (
+                              <span className="text-[11px] text-slate-400 italic">未登録</span>
+                            )}
+                          </td>
+
+                          {/* Personal Email (Encrypted) */}
+                          <td className="py-2.5 px-4 whitespace-nowrap">
+                            {hasPersonal ? (
+                              <div className="flex items-center gap-1.5 text-[11px] font-mono text-emerald-800 font-bold bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 w-fit">
+                                <Lock className="w-3 h-3 text-emerald-600 shrink-0" />
+                                <span>{user.personalEmailMasked || '登録済(暗号化)'}</span>
+                              </div>
+                            ) : (
+                              <span className="text-[11px] text-slate-400 italic">未登録</span>
+                            )}
+                          </td>
+
+                          {/* Registration Badge */}
+                          <td className="py-2.5 px-4 text-center whitespace-nowrap">
+                            {isBoth ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                                両方登録済
+                              </span>
+                            ) : hasPersonal ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
+                                <Lock className="w-3 h-3 text-indigo-600" />
+                                個人メール済
+                              </span>
+                            ) : hasMobile ? (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                                <Smartphone className="w-3 h-3 text-blue-600" />
+                                携帯メール済
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-100 text-rose-700 border border-rose-200">
+                                <AlertTriangle className="w-3 h-3 text-rose-500" />
+                                未登録
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Target Members Card List (Mobile Optimized View) */}
+            <div className="md:hidden divide-y divide-slate-100">
+              {filteredTargets.length === 0 ? (
+                <div className="py-10 text-center text-slate-400 font-bold text-xs">
+                  条件に一致する対象者は見つかりませんでした
+                </div>
+              ) : (
+                filteredTargets.map((user) => {
+                  const hasMobile = !!(user.mobileEmail && user.mobileEmail.trim());
+                  const hasPersonal = !!(user.personalEmailMasked || user.personalEmailEncrypted);
+                  const isBoth = hasMobile && hasPersonal;
+                  const isSelected = selectedTargetUserIds.includes(user.id);
+
+                  return (
+                    <div
+                      key={user.id}
+                      onClick={() => handleToggleTargetSelect(user.id)}
+                      className={`p-3.5 transition-colors cursor-pointer space-y-2.5 ${
+                        isSelected ? 'bg-indigo-50/50' : 'bg-white active:bg-slate-50'
+                      }`}
+                    >
+                      {/* Row 1: Checkbox + Avatar + Name + Registration Badge */}
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={(e) => {
+                              e.stopPropagation();
+                              handleToggleTargetSelect(user.id);
+                            }}
+                            className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer shrink-0"
+                          />
+                          <img
+                            src={getAvatarUrl(user.avatarUrl)}
+                            alt={user.name}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              triggerOpenUserModal(user);
+                            }}
+                            title={`${user.name} さんの社員詳細を表示`}
+                            className="w-7 h-7 rounded-full object-cover border border-slate-200 shrink-0 hover:ring-2 hover:ring-indigo-400 transition-all cursor-pointer"
+                          />
+                          <div className="min-w-0">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                triggerOpenUserModal(user);
+                              }}
+                              className="font-extrabold text-slate-800 hover:text-indigo-600 hover:underline text-xs truncate block text-left transition-colors cursor-pointer"
+                              title={`${user.name} さんの社員詳細を表示`}
+                            >
+                              {user.name}
+                            </button>
+                            <div className="text-[10px] text-slate-500 flex items-center gap-1.5 truncate mt-0.5">
+                              <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 font-bold shrink-0">
+                                {user.office || '本社'}
+                              </span>
+                              <span className="truncate">{user.division || '-'}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Registration Badge */}
+                        <div className="shrink-0">
+                          {isBoth ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                              <CheckCircle2 className="w-2.5 h-2.5 text-emerald-600" />
+                              両方済
+                            </span>
+                          ) : hasPersonal ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
+                              <Lock className="w-2.5 h-2.5 text-indigo-600" />
+                              個人済
+                            </span>
+                          ) : hasMobile ? (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                              <Smartphone className="w-2.5 h-2.5 text-blue-600" />
+                              携帯済
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-700 border border-rose-200">
+                              <AlertTriangle className="w-2.5 h-2.5 text-rose-500" />
+                              未登録
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Row 2: Contact detail tags */}
+                      <div className="grid grid-cols-1 gap-1.5 text-[11px] font-mono pl-6 sm:pl-0">
+                        {/* Company Email */}
+                        <div className="flex items-center gap-1.5 text-slate-600 truncate">
+                          <Mail className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span className="text-[10px] text-slate-400 font-sans shrink-0">社内:</span>
+                          <span className="truncate text-[10px]">{user.email || '-'}</span>
+                        </div>
+
+                        {/* Mobile & Personal Emails */}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div className="flex items-center gap-1 text-[10px]">
+                            <Smartphone className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span className="text-slate-400 font-sans">携帯:</span>
+                            {hasMobile ? (
+                              <span className="font-bold text-indigo-700 bg-indigo-50/70 px-1.5 py-0.2 rounded border border-indigo-100 truncate max-w-[150px]">
+                                {user.mobileEmail}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400 italic">未登録</span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1 text-[10px]">
+                            <Lock className="w-3 h-3 text-slate-400 shrink-0" />
+                            <span className="text-slate-400 font-sans">個人:</span>
+                            {hasPersonal ? (
+                              <span className="font-bold text-emerald-800 bg-emerald-50 px-1.5 py-0.2 rounded border border-emerald-200 truncate max-w-[150px]">
+                                {user.personalEmailMasked || '暗号化済'}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400 italic">未登録</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Table Footer */}
+            <div className="p-3.5 bg-slate-50/50 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-slate-500">
+              <span>
+                表示中: <strong className="text-slate-800">{filteredTargets.length}</strong> 名 / 全体 {allUsers.length} 名
+              </span>
+              <div className="flex flex-wrap items-center gap-3 text-[11px]">
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                  両方登録: {targetBothRegisteredCount}名
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-indigo-500" />
+                  個人メール: {targetPersonalRegisteredCount}名
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-rose-500" />
+                  未登録: {targetNoneRegisteredCount}名
+                </span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 2.5: JMA AUTO TRIGGER (気象庁連動・自動発動設定 & モニター) */}
+      {/* ========================================================================= */}
+      {activeTab === 'jma_auto' && (
+        <div className="space-y-6">
+          {/* Top Status & Settings Grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Left 2 Cols: Master Settings */}
+            <div className="lg:col-span-2 bg-white rounded-2xl border border-slate-200 p-4 sm:p-6 shadow-sm space-y-5 sm:space-y-6">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-4">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-amber-50 text-amber-600 border border-amber-200 flex items-center justify-center shrink-0">
+                    <Radio className="w-5 h-5 animate-pulse" />
+                  </div>
+                  <div>
+                    <h2 className="text-base font-extrabold text-slate-800">
+                      気象庁・地震速報連動 自動発動設定
+                    </h2>
+                    <p className="text-xs text-slate-500 mt-0.5">
+                      気象庁および防災地震情報APIを1分周期で自動監視し、指定震度以上の地震発生時に安否確認を自動起票・一斉配信します。
+                    </p>
+                  </div>
+                </div>
+
+                {/* Main Switch */}
+                <button
+                  onClick={() => setJmaSettings(prev => ({ ...prev, enabled: !prev.enabled }))}
+                  className={`relative inline-flex h-7 w-14 items-center rounded-full transition-colors cursor-pointer shrink-0 self-end sm:self-center ${
+                    jmaSettings.enabled ? 'bg-emerald-600' : 'bg-slate-300'
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                      jmaSettings.enabled ? 'translate-x-8' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              {/* Status Banner */}
+              <div className={`p-3.5 sm:p-4 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs font-bold ${
+                jmaSettings.enabled 
+                  ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                  : 'bg-slate-50 text-slate-600 border-slate-200'
+              }`}>
+                <div className="flex items-center gap-2">
+                  <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${jmaSettings.enabled ? 'bg-emerald-500 animate-ping' : 'bg-slate-400'}`} />
+                  <span>
+                    {jmaSettings.enabled 
+                      ? '気象庁連動エンジン：稼働中（1分周期で地震情報を自動監視中）' 
+                      : '気象庁連動エンジン：現在無効（自動発動は停止しています）'}
+                  </span>
+                </div>
+                {jmaSettings.lastCheckedAt && (
+                  <span className="text-[11px] font-mono text-slate-500 shrink-0">
+                    最終確認: {new Date(jmaSettings.lastCheckedAt).toLocaleTimeString('ja-JP')}
+                  </span>
+                )}
+              </div>
+
+              {/* Settings Form */}
+              <div className="space-y-5">
+                {/* Trigger Threshold */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    自動発動トリガー（最小震度基準）
+                  </label>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
+                    {[
+                      { id: '4', label: '震度4 以上', sub: '注意報レベル' },
+                      { id: '5minus', label: '震度5弱 以上', sub: '【標準推奨】' },
+                      { id: '5plus', label: '震度5強 以上', sub: '明確な被害' },
+                      { id: '6minus', label: '震度6弱 以上', sub: '大規模災害' },
+                      { id: '6plus', label: '震度6強 以上', sub: '激甚災害' },
+                      { id: '7', label: '震度7 (最大)', sub: '壊滅的被害' }
+                    ].map(item => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => setJmaSettings(prev => ({ ...prev, minIntensity: item.id }))}
+                        className={`p-2.5 sm:p-3 rounded-xl border text-left transition-all cursor-pointer ${
+                          jmaSettings.minIntensity === item.id
+                            ? 'bg-rose-50 border-rose-400 ring-2 ring-rose-200 text-rose-900'
+                            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                        }`}
+                      >
+                        <div className="font-extrabold text-xs">{item.label}</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">{item.sub}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Target Scope */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    自動発動時の対象者範囲
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setJmaSettings(prev => ({ ...prev, targetScope: 'all' }))}
+                      className={`p-3 sm:p-3.5 rounded-xl border text-left transition-all cursor-pointer flex items-center justify-between ${
+                        jmaSettings.targetScope === 'all'
+                          ? 'bg-indigo-50 border-indigo-300 ring-2 ring-indigo-100 text-indigo-900'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-bold text-xs">全社一斉発動（全事業所・全部署）</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">全社員（{allUsers.length}名）に回答依頼を通知（推奨）</div>
+                      </div>
+                      {jmaSettings.targetScope === 'all' && <Check className="w-4 h-4 text-indigo-600 shrink-0" />}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => setJmaSettings(prev => ({ ...prev, targetScope: 'affected_offices' }))}
+                      className={`p-3 sm:p-3.5 rounded-xl border text-left transition-all cursor-pointer flex items-center justify-between ${
+                        jmaSettings.targetScope === 'affected_offices'
+                          ? 'bg-indigo-50 border-indigo-300 ring-2 ring-indigo-100 text-indigo-900'
+                          : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <div>
+                        <div className="font-bold text-xs">震源周辺・主要拠点のみ</div>
+                        <div className="text-[10px] text-slate-500 mt-0.5">名古屋・東京・大阪・静岡など該当エリア拠点のみ</div>
+                      </div>
+                      {jmaSettings.targetScope === 'affected_offices' && <Check className="w-4 h-4 text-indigo-600 shrink-0" />}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Delivery Channels */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    自動配信チャネル（複数選択）
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <label className={`flex items-center gap-2.5 p-3 rounded-xl border cursor-pointer transition-all ${
+                      jmaSettings.notifyWebPush ? 'bg-amber-50/60 border-amber-300 text-amber-900' : 'bg-slate-50 border-slate-200 text-slate-500'
+                    }`}>
+                      <input
+                        type="checkbox"
+                        checked={jmaSettings.notifyWebPush}
+                        onChange={e => setJmaSettings(prev => ({ ...prev, notifyWebPush: e.target.checked }))}
+                        className="rounded text-amber-600 focus:ring-amber-500 w-4 h-4"
+                      />
+                      <div>
+                        <div className="text-xs font-bold flex items-center gap-1">
+                          <Bell className="w-3.5 h-3.5 text-amber-600" />
+                          Web Push 通知
+                        </div>
+                        <div className="text-[10px] text-slate-500">スマホ・ブラウザ即時通知</div>
+                      </div>
+                    </label>
+
+                    <label className={`flex items-center gap-2.5 p-3 rounded-xl border cursor-pointer transition-all ${
+                      jmaSettings.notifyCompanyEmail ? 'bg-blue-50/60 border-blue-300 text-blue-900' : 'bg-slate-50 border-slate-200 text-slate-500'
+                    }`}>
+                      <input
+                        type="checkbox"
+                        checked={jmaSettings.notifyCompanyEmail}
+                        onChange={e => setJmaSettings(prev => ({ ...prev, notifyCompanyEmail: e.target.checked }))}
+                        className="rounded text-blue-600 focus:ring-blue-500 w-4 h-4"
+                      />
+                      <div>
+                        <div className="text-xs font-bold flex items-center gap-1">
+                          <Mail className="w-3.5 h-3.5 text-blue-600" />
+                          社用・携帯メール
+                        </div>
+                        <div className="text-[10px] text-slate-500">会社アドレスへ直通URL送信</div>
+                      </div>
+                    </label>
+
+                    <label className={`flex items-center gap-2.5 p-3 rounded-xl border cursor-pointer transition-all ${
+                      jmaSettings.notifyPersonalEmail ? 'bg-emerald-50/60 border-emerald-300 text-emerald-900' : 'bg-slate-50 border-slate-200 text-slate-500'
+                    }`}>
+                      <input
+                        type="checkbox"
+                        checked={jmaSettings.notifyPersonalEmail}
+                        onChange={e => setJmaSettings(prev => ({ ...prev, notifyPersonalEmail: e.target.checked }))}
+                        className="rounded text-emerald-600 focus:ring-emerald-500 w-4 h-4"
+                      />
+                      <div>
+                        <div className="text-xs font-bold flex items-center gap-1">
+                          <Lock className="w-3.5 h-3.5 text-emerald-600" />
+                          個人メール (暗号化)
+                        </div>
+                        <div className="text-[10px] text-slate-500">私用アドレスへ伏字配信</div>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Drill mode option */}
+                <div className="pt-2">
+                  <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={jmaSettings.isDrillMode}
+                      onChange={e => setJmaSettings(prev => ({ ...prev, isDrillMode: e.target.checked }))}
+                      className="rounded text-rose-600 focus:ring-rose-500 w-4 h-4"
+                    />
+                    <span>自動発動時に【訓練】フラグを付与する（テスト訓練期間用）</span>
+                  </label>
+                </div>
+
+                {/* Save Button */}
+                <div className="flex items-center justify-end pt-4 border-t border-slate-100">
+                  <button
+                    onClick={handleSaveJmaSettings}
+                    disabled={isSavingJmaSettings}
+                    className="w-full sm:w-auto justify-center px-6 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold shadow-sm transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {isSavingJmaSettings ? (
+                      <RefreshCw className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Check className="w-4 h-4 text-emerald-400" />
+                    )}
+                    気象庁連動設定を保存して反映
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Right 1 Col: Test Simulation Sandbox */}
+            <div className="bg-gradient-to-br from-rose-50 to-orange-50/50 rounded-2xl border border-rose-200 p-6 shadow-sm flex flex-col justify-between space-y-5">
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <Sparkles className="w-5 h-5 text-rose-600" />
+                  <h3 className="text-sm font-black text-rose-950">
+                    疑似地震テスト発動シミュレーター
+                  </h3>
+                </div>
+                <p className="text-xs text-rose-800/80 leading-relaxed">
+                  「もし今、愛知県や首都圏で震度6弱が発生したら」を安全に疑似テストできます。実際にイベント起票と回答直通メール配信が実行されます。
+                </p>
+
+                <div className="mt-5 space-y-4">
+                  {/* Epicenter selector */}
+                  <div>
+                    <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                      想定震源地
+                    </label>
+                    <div className="flex flex-wrap gap-1.5 mb-2">
+                      {['愛知県西部', '静岡県東部', '東京湾', '大阪府北部', '能登半島', '日向灘'].map(place => (
+                        <button
+                          key={place}
+                          type="button"
+                          onClick={() => setSimEpicenter(place)}
+                          className={`text-[11px] px-2 py-0.5 rounded-md border font-bold transition-all cursor-pointer ${
+                            simEpicenter === place
+                              ? 'bg-rose-600 text-white border-rose-600 shadow-xs'
+                              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-100'
+                          }`}
+                        >
+                          {place}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      type="text"
+                      value={simEpicenter}
+                      onChange={e => setSimEpicenter(e.target.value)}
+                      className="w-full text-xs font-bold border border-slate-300 rounded-lg p-2 bg-white"
+                      placeholder="震源地を入力"
+                    />
+                  </div>
+
+                  {/* Intensity selector */}
+                  <div>
+                    <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                      想定最大震度
+                    </label>
+                    <select
+                      value={simScale}
+                      onChange={e => setSimScale(Number(e.target.value))}
+                      className="w-full text-xs font-bold border border-slate-300 rounded-lg p-2 bg-white"
+                    >
+                      <option value={40}>震度4</option>
+                      <option value={45}>震度5弱</option>
+                      <option value={50}>震度5強 (標準テスト)</option>
+                      <option value={55}>震度6弱</option>
+                      <option value={60}>震度6強</option>
+                      <option value={70}>震度7</option>
+                    </select>
+                  </div>
+
+                  {/* Magnitude */}
+                  <div>
+                    <label className="block text-xs font-bold text-slate-800 mb-1.5">
+                      想定マグニチュード: M{simMagnitude}
+                    </label>
+                    <input
+                      type="range"
+                      min="4.0"
+                      max="8.5"
+                      step="0.1"
+                      value={simMagnitude}
+                      onChange={e => setSimMagnitude(Number(e.target.value))}
+                      className="w-full accent-rose-600"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-rose-200/60">
+                <button
+                  type="button"
+                  onClick={handleRunSimulation}
+                  disabled={isRunningSimulation}
+                  className="w-full py-3 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-xs shadow-md shadow-rose-300 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  {isRunningSimulation ? (
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Send className="w-4 h-4" />
+                  )}
+                  疑似地震で連動テスト発動を実行
+                </button>
+                <p className="text-[10px] text-center text-rose-700 mt-2 font-medium">
+                  ※【テスト】表示付きで全社に回答URL付き通知が送信されます
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Bottom Grid: Real-time Quake Monitor & Auto-trigger History */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Real-time Quake Feed */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Radio className="w-5 h-5 text-amber-500 animate-pulse" />
+                  <h3 className="text-sm font-extrabold text-slate-800">
+                    気象庁・最新地震速報モニター (直近の観測フィード)
+                  </h3>
+                </div>
+                <button
+                  onClick={fetchRecentQuakes}
+                  disabled={isLoadingQuakes}
+                  className="text-xs text-indigo-600 hover:text-indigo-800 font-bold flex items-center gap-1 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoadingQuakes ? 'animate-spin' : ''}`} />
+                  更新
+                </button>
+              </div>
+
+              <div className="divide-y divide-slate-100 max-h-[360px] overflow-y-auto">
+                {recentQuakes && recentQuakes.length > 0 ? (
+                  recentQuakes.map((q, idx) => {
+                    const maxScale = q.earthquake?.maxScale || q.maxScale || 0;
+                    const scaleStr = maxScale >= 70 ? '震度7' : maxScale >= 60 ? '震度6強' : maxScale >= 55 ? '震度6弱' : maxScale >= 50 ? '震度5強' : maxScale >= 45 ? '震度5弱' : maxScale >= 40 ? '震度4' : maxScale >= 30 ? '震度3' : maxScale >= 20 ? '震度2' : '震度1';
+                    const isOverThreshold = maxScale >= 45;
+                    const time = q.earthquake?.time || q.time || '';
+                    const name = q.earthquake?.hypocenter?.name || q.hypocenter?.name || '震源地不明';
+                    const mag = q.earthquake?.hypocenter?.magnitude || q.hypocenter?.magnitude || '-';
+
+                    return (
+                      <div key={q.id || idx} className="py-3 flex items-center justify-between text-xs">
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-2">
+                            <span className="font-extrabold text-slate-800">{name}</span>
+                            <span className="text-[11px] font-mono text-slate-500">M{mag}</span>
+                          </div>
+                          <div className="text-[11px] text-slate-400 font-mono">{time}</div>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <span className={`px-2.5 py-1 rounded-full text-xs font-black border ${
+                            isOverThreshold 
+                              ? 'bg-rose-100 text-rose-800 border-rose-300 animate-bounce' 
+                              : maxScale >= 30 
+                              ? 'bg-amber-100 text-amber-800 border-amber-200' 
+                              : 'bg-slate-100 text-slate-700 border-slate-200'
+                          }`}>
+                            {scaleStr}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="py-8 text-center text-xs text-slate-400">
+                    現在取得可能な地震速報データはありません。
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Auto-Trigger History Logs */}
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Clock className="w-5 h-5 text-indigo-600" />
+                  <h3 className="text-sm font-extrabold text-slate-800">
+                    自動発動・シミュレーション履歴ログ
+                  </h3>
+                </div>
+                <span className="text-[11px] text-slate-400 font-mono">
+                  直近 {jmaSettings.logs?.length || 0} 件
+                </span>
+              </div>
+
+              <div className="divide-y divide-slate-100 max-h-[360px] overflow-y-auto">
+                {jmaSettings.logs && jmaSettings.logs.length > 0 ? (
+                  jmaSettings.logs.map((log: any, idx: number) => (
+                    <div key={log.id || idx} className="py-3 flex items-center justify-between text-xs">
+                      <div className="space-y-0.5">
+                        <div className="flex items-center gap-2">
+                          <span className="font-extrabold text-slate-800">{log.epicenter}</span>
+                          <span className="font-bold text-rose-700">{log.maxScaleText}</span>
+                          {log.isSimulated && (
+                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-100 text-amber-800 font-bold border border-amber-200">
+                              疑似テスト
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-400 font-mono">
+                          {new Date(log.time).toLocaleString('ja-JP')}
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          setSelectedEventId(log.eventId);
+                          setActiveTab('dashboard');
+                        }}
+                        className="text-xs text-indigo-600 hover:text-indigo-800 font-bold px-2.5 py-1 rounded-lg bg-indigo-50 hover:bg-indigo-100 transition-colors cursor-pointer"
+                      >
+                        集計を表示 →
+                      </button>
+                    </div>
+                  ))
+                ) : (
+                  <div className="py-8 text-center text-xs text-slate-400">
+                    自動発動の履歴ログはまだありません。
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* TAB 3: TRIGGER (安否確認発動) */}
+      {/* ========================================================================= */}
+      {activeTab === 'trigger' && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm space-y-6">
+          <div>
+            <h2 className="text-base font-extrabold text-slate-800 flex items-center gap-2">
+              <Send className="w-5 h-5 text-rose-600" />
+              安否確認の一斉発動
+            </h2>
+            <p className="text-xs text-slate-500 mt-1">
+              災害種別を選択し、WebPush・会社メール・個人メール（暗号化）を通じて全社または指定拠点へ緊急確認を一斉送信します。
+            </p>
+          </div>
+
+          {/* 24時間連送抑制（クールダウン）警告・案内バナー */}
+          {cooldownInfo?.isCooldownActive && (
+            <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 space-y-2 text-xs text-amber-900 shadow-2xs">
+              <div className="font-bold text-amber-950 flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0" />
+                <span>【24時間連送抑制（重複連送防止）が有効です】</span>
+              </div>
+              <p className="text-amber-800 leading-relaxed text-[11px]">
+                前回の安否確認（「{cooldownInfo.lastEvent?.title || '安否確認'}」 / 発動者: {cooldownInfo.lastEvent?.createdByName || '管理者'}）の配信から24時間経過していません。<br />
+                余震や断続的な通知による社員の混乱を防ぐため、通常の自動送信は抑制されます。
+              </p>
+              <div className="flex items-center gap-2 pt-1 border-t border-amber-200/80">
+                <label className="flex items-center gap-2 font-bold text-rose-700 cursor-pointer bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-xl border border-rose-300 transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={isForceSend}
+                    onChange={(e) => setIsForceSend(e.target.checked)}
+                    className="w-4 h-4 rounded text-rose-600 focus:ring-rose-500 border-rose-400 cursor-pointer"
+                  />
+                  <span>緊急送信（24時間連送抑制を解除して強制送信する）</span>
+                </label>
+              </div>
+            </div>
+          )}
+
+          {/* Quick Template Selector */}
+          <div>
+            <label className="block text-xs font-bold text-slate-700 mb-2">
+              定型テンプレートからクイック入力
+            </label>
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">
+              {[
+                { type: 'earthquake' as DisasterType, label: '地震発生 (震度5強+)' },
+                { type: 'tsunami' as DisasterType, label: '津波警報発令' },
+                { type: 'typhoon' as DisasterType, label: '台風・暴風特別警報' },
+                { type: 'flood' as DisasterType, label: '大雨・河川氾濫' },
+                { type: 'fire' as DisasterType, label: '火災・事故' },
+                { type: 'drill' as DisasterType, label: '安否確認テスト訓練' },
+              ].map((tpl) => (
+                <button
+                  key={tpl.type}
+                  type="button"
+                  onClick={() => applyTemplate(tpl.type)}
+                  className={`p-2.5 rounded-xl border text-xs font-bold text-left transition-all cursor-pointer ${
+                    disasterType === tpl.type
+                      ? 'bg-rose-50 border-rose-300 text-rose-800 ring-2 ring-rose-400/20'
+                      : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                  }`}
+                >
+                  {tpl.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <form onSubmit={handleTriggerSubmit} className="space-y-5">
+            {/* Type, Title & Level */}
+            <div className="grid grid-cols-1 md:grid-cols-12 gap-3">
+              <div className="md:col-span-3">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  災害種別 <span className="text-rose-500">*</span>
+                </label>
+                <select
+                  value={disasterType}
+                  onChange={(e) => {
+                    const selected = e.target.value as DisasterType;
+                    applyTemplate(selected);
+                  }}
+                  className="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:bg-white cursor-pointer"
+                >
+                  <option value="earthquake">地震 (震度5強以上)</option>
+                  <option value="tsunami">津波 (津波警報発令)</option>
+                  <option value="typhoon">台風・暴風特別警報</option>
+                  <option value="flood">大雨・河川氾濫</option>
+                  <option value="fire">火災・重大事故</option>
+                  <option value="drill">安否確認テスト訓練</option>
+                </select>
+              </div>
+
+              <div className="md:col-span-6">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  発動タイトル <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="例: 【安否確認】地震発生に伴う安否状況確認"
+                  value={triggerTitle}
+                  onChange={(e) => setTriggerTitle(e.target.value)}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold focus:outline-none focus:ring-2 focus:ring-rose-500 focus:bg-white"
+                />
+              </div>
+
+              <div className="md:col-span-3">
+                <label className="block text-xs font-bold text-slate-700 mb-1">
+                  災害規模 / 警報レベル
+                </label>
+                <input
+                  type="text"
+                  placeholder="例: 震度5強以上"
+                  value={triggerLevel}
+                  onChange={(e) => setTriggerLevel(e.target.value)}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold focus:outline-none focus:ring-2 focus:ring-rose-500 focus:bg-white"
+                />
+              </div>
+            </div>
+
+            {/* Message */}
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-1">
+                通知メッセージ本文
+              </label>
+              <textarea
+                rows={3}
+                value={triggerMessage}
+                onChange={(e) => setTriggerMessage(e.target.value)}
+                className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-rose-500 focus:bg-white leading-relaxed"
+              />
+            </div>
+
+            {/* Target Scope */}
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-2">
+                通知対象範囲
+              </label>
+              <div className="flex items-center gap-4 text-xs font-bold">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="scope"
+                    checked={targetScope === 'all'}
+                    onChange={() => setTargetScope('all')}
+                    className="text-rose-600 focus:ring-rose-500"
+                  />
+                  全社員・全拠点 ({allUsers.length}名)
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="scope"
+                    checked={targetScope === 'offices'}
+                    onChange={() => setTargetScope('offices')}
+                    className="text-rose-600 focus:ring-rose-500"
+                  />
+                  特定拠点のみ選択
+                </label>
+              </div>
+
+              {targetScope === 'offices' && (
+                <div className="mt-3 flex flex-wrap gap-2 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                  {offices.map((off) => (
+                    <label key={off.id} className="flex items-center gap-1.5 text-xs font-bold cursor-pointer bg-white px-2.5 py-1.5 rounded-lg border border-slate-200">
+                      <input
+                        type="checkbox"
+                        checked={selectedOffices.some(s => isSameOffice(s, off.id || off.name, offices))}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedOffices([...selectedOffices, off.name]);
+                          } else {
+                            setSelectedOffices(selectedOffices.filter(o => !isSameOffice(o, off.id || off.name, offices)));
+                          }
+                        }}
+                        className="text-rose-600 rounded focus:ring-rose-500"
+                      />
+                      {off.name} ({allUsers.filter(u => doesUserMatchOffice(u, off.id || off.name, offices)).length}名)
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Notification Channels */}
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-2">
+                送信通知チャネル
+              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <label className="flex items-center justify-between p-3 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
+                  <div className="flex items-center gap-2.5">
+                    <Bell className="w-4 h-4 text-rose-600" />
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 block">Web Push通知</span>
+                      <span className="text-[10px] text-slate-400">スマホ・PCのブラウザへ即時プッシュ</span>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={useWebPush}
+                    onChange={(e) => setUseWebPush(e.target.checked)}
+                    className="w-4 h-4 text-rose-600 rounded focus:ring-rose-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-3 rounded-xl border border-slate-200 bg-slate-50 cursor-pointer">
+                  <div className="flex items-center gap-2.5">
+                    <Mail className="w-4 h-4 text-indigo-600" />
+                    <div>
+                      <span className="text-xs font-bold text-slate-800 block">社内・携帯メール</span>
+                      <span className="text-[10px] text-slate-400">PCメール / 携帯メール宛</span>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={useCompanyEmail}
+                    onChange={(e) => setUseCompanyEmail(e.target.checked)}
+                    className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-3 rounded-xl border border-emerald-200 bg-emerald-50/30 cursor-pointer">
+                  <div className="flex items-center gap-2.5">
+                    <Lock className="w-4 h-4 text-emerald-600" />
+                    <div>
+                      <span className="text-xs font-bold text-emerald-900 block">個人メールアドレス</span>
+                      <span className="text-[10px] text-emerald-600">AES-256暗号化された個人アドレス宛</span>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={usePersonalEmail}
+                    onChange={(e) => setUsePersonalEmail(e.target.checked)}
+                    className="w-4 h-4 text-emerald-600 rounded focus:ring-emerald-500"
+                  />
+                </label>
+              </div>
+            </div>
+
+            {/* Test Mode Flag */}
+            <div className="p-3.5 bg-amber-50 rounded-xl border border-amber-200 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                <div>
+                  <span className="text-xs font-bold text-amber-900 block">テスト発動モード</span>
+                  <span className="text-[10px] text-amber-700">
+                    ONにするとタイトルに【訓練・テスト】が付与され、実際の緊急発動と区別されます。
+                  </span>
+                </div>
+              </div>
+              <input
+                type="checkbox"
+                checked={isTestMode}
+                onChange={(e) => setIsTestMode(e.target.checked)}
+                className="w-4 h-4 text-amber-600 rounded focus:ring-amber-500 cursor-pointer"
+              />
+            </div>
+
+            {/* Submit Button & Test Email Area */}
+            <div className="pt-3 border-t border-slate-100 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!showTestEmailInput) {
+                      setShowTestEmailInput(true);
+                    } else {
+                      handleSendTestTriggerMail();
+                    }
+                  }}
+                  disabled={testingSend || !triggerTitle.trim()}
+                  className="px-3.5 py-2.5 rounded-xl border border-slate-200 hover:bg-slate-100/80 text-slate-700 text-xs font-bold flex items-center justify-center gap-1.5 transition-all disabled:opacity-50 cursor-pointer shadow-2xs"
+                  title="入力中の内容でテストメールを送信し、疎通やフォーマットを確認します"
+                >
+                  {testingSend ? (
+                    <>
+                      <RefreshCw className="w-4 h-4 animate-spin text-slate-400" />
+                      テストメール送信中...
+                    </>
+                  ) : (
+                    <>
+                      <Send className="w-4 h-4 text-slate-500" />
+                      自分宛にテスト送信
+                    </>
+                  )}
+                </button>
+                {!showTestEmailInput && (
+                  <button
+                    type="button"
+                    onClick={() => setShowTestEmailInput(true)}
+                    className="text-[11px] text-indigo-600 hover:text-indigo-800 underline font-bold cursor-pointer"
+                  >
+                    宛先を指定
+                  </button>
+                )}
+              </div>
+
+              <button
+                type="submit"
+                disabled={isSending}
+                className="px-6 py-3 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shadow-md shadow-rose-200 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                <Radio className="w-4 h-4" />
+                {isSending ? '一斉送信中...' : isTestMode ? 'テスト発動を実行' : '緊急安否確認を発動する'}
+              </button>
+            </div>
+
+            {/* Test Email Destination Input Box */}
+            {showTestEmailInput && (
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 text-xs space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-700 flex items-center gap-1.5">
+                    <Mail className="w-3.5 h-3.5 text-slate-500" />
+                    テスト送信先メールアドレス:
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowTestEmailInput(false)}
+                    className="text-slate-400 hover:text-slate-600 text-[11px] cursor-pointer"
+                  >
+                    閉じる
+                  </button>
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    type="email"
+                    value={testEmailDestination}
+                    onChange={(e) => setTestEmailDestination(e.target.value)}
+                    placeholder="example@company.co.jp"
+                    className="flex-1 px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSendTestTriggerMail}
+                    disabled={testingSend || !triggerTitle.trim() || !testEmailDestination.trim()}
+                    className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs disabled:opacity-50 cursor-pointer shrink-0"
+                  >
+                    送信
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  ※PCメール、携帯メール、または届くか確認したい任意のアドレスを指定できます。
+                </p>
+              </div>
+            )}
+
+            {/* Test Result Message Banner */}
+            {testResult && (
+              <div className={`p-3.5 rounded-xl text-xs flex items-start gap-2.5 ${
+                testResult.success 
+                  ? testResult.isSimulated ? 'bg-amber-50 text-amber-800 border border-amber-200' : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                  : 'bg-rose-50 text-rose-800 border border-rose-200'
+              }`}>
+                {testResult.success ? (
+                  <CheckCircle2 className={`w-4 h-4 shrink-0 mt-0.5 ${testResult.isSimulated ? 'text-amber-600' : 'text-emerald-600'}`} />
+                ) : (
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                )}
+                <div className="space-y-1">
+                  <p className="font-bold">{testResult.message}</p>
+                  {!testResult.success && (
+                    <p className="text-[11px] text-rose-700/80">
+                      💡 本番サーバー（社内NAS / オンプレミス）で実メールを配信するには、サーバー環境変数 <code>SMTP_HOST</code>, <code>SMTP_PORT</code>, <code>SMTP_USER</code>, <code>SMTP_PASS</code> を設定してください。
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+          </form>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 1: 自分の安否を回答・変更するポップアップモーダル */}
+      {/* ========================================================================= */}
+      {isMyAnswerModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-0 sm:p-4 animate-in fade-in duration-150">
+          <div className="bg-white sm:rounded-3xl border-0 sm:border border-slate-200 shadow-2xl max-w-2xl w-full overflow-hidden flex flex-col h-dvh sm:h-auto max-h-dvh sm:max-h-[92vh] rounded-none animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="p-4 sm:p-5 bg-gradient-to-r from-rose-600 to-rose-700 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl sm:rounded-2xl bg-white/20 flex items-center justify-center text-white shrink-0">
+                  <HeartHandshake className="w-5 h-5" />
+                </div>
+                <div className="min-w-0">
+                  <h2 className="text-sm sm:text-base font-extrabold text-white flex items-center gap-2 truncate">
+                    安否状況の回答・変更
+                  </h2>
+                  <p className="text-[11px] sm:text-xs text-rose-100 mt-0.5 truncate">
+                    回答者: <strong className="text-white font-bold">{currentUser.name}</strong> ({currentUser.office || '本社'} / {currentUser.division || '所属'})
+                    {activeEvent && ` | 対象: ${activeEvent.title}`}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsMyAnswerModalOpen(false)}
+                className="p-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+                title="閉じる"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-4 sm:p-6 overflow-y-auto space-y-5 sm:space-y-6 flex-1">
+              {/* 個人メール設定案内バナー */}
+              <div className="p-3 bg-indigo-50/80 rounded-2xl border border-indigo-100 flex items-center justify-between gap-3 text-xs text-indigo-900">
+                <div className="flex items-center gap-2">
+                  <ShieldAlert className="w-4 h-4 text-indigo-600 shrink-0" />
+                  <span>
+                    <strong>緊急連絡網:</strong> 私用メールへの暗号化配信設定は「<strong>マイページ</strong>」から設定できます。
+                  </span>
+                </div>
+                {currentUser.personalEmailMasked && (
+                  <span className="text-[10px] font-mono font-bold text-emerald-800 bg-emerald-100/80 px-2 py-0.5 rounded-lg border border-emerald-200 shrink-0">
+                    登録済: {currentUser.personalEmailMasked}
+                  </span>
+                )}
+              </div>
+
+              {/* 1タップ・クイック入力プリセット */}
+              <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black text-slate-700 flex items-center gap-1.5">
+                    ⚡ 1タップ・クイック選択プリセット
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    タップで下の項目が一括入力されます
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => applyQuickPreset('safe')}
+                    className="p-2.5 rounded-xl border border-emerald-200 bg-emerald-50 hover:bg-emerald-100/80 text-emerald-900 text-left transition-all cursor-pointer flex flex-col justify-between"
+                  >
+                    <div className="flex items-center gap-1.5 font-black text-xs text-emerald-800">
+                      <span>🟢</span>
+                      <span>自身・家族とも無事</span>
+                    </div>
+                    <span className="text-[10px] text-emerald-700 mt-1">
+                      無事 / 通常出社可
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => applyQuickPreset('remote')}
+                    className="p-2.5 rounded-xl border border-blue-200 bg-blue-50 hover:bg-blue-100/80 text-blue-900 text-left transition-all cursor-pointer flex flex-col justify-between"
+                  >
+                    <div className="flex items-center gap-1.5 font-black text-xs text-blue-800">
+                      <span>🟡</span>
+                      <span>無事・在宅勤務可</span>
+                    </div>
+                    <span className="text-[10px] text-blue-700 mt-1">
+                      無事 / テレワーク
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => applyQuickPreset('injured')}
+                    className="p-2.5 rounded-xl border border-amber-200 bg-amber-50 hover:bg-amber-100/80 text-amber-900 text-left transition-all cursor-pointer flex flex-col justify-between"
+                  >
+                    <div className="flex items-center gap-1.5 font-black text-xs text-amber-800">
+                      <span>🟠</span>
+                      <span>軽傷・要確認</span>
+                    </div>
+                    <span className="text-[10px] text-amber-700 mt-1">
+                      軽傷 / 出社未定
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => applyQuickPreset('rescue')}
+                    className="p-2.5 rounded-xl border border-rose-200 bg-rose-50 hover:bg-rose-100/80 text-rose-900 text-left transition-all cursor-pointer flex flex-col justify-between"
+                  >
+                    <div className="flex items-center gap-1.5 font-black text-xs text-rose-800">
+                      <span>🔴</span>
+                      <span>被害大・要救助</span>
+                    </div>
+                    <span className="text-[10px] text-rose-700 mt-1">
+                      要救助 / 出社不可
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <form id="my-safety-response-form" onSubmit={handleResponseSubmit} className="space-y-6">
+                {/* 1. 本人の安否 */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    1. ご自身の安否状況 <span className="text-rose-500">*</span>
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                    {[
+                      { value: 'safe', label: '無事 (怪我なし)', desc: '身体に支障なし' },
+                      { value: 'minor_injury', label: '軽傷 (自力対応可)', desc: '治療・手当対応中' },
+                      { value: 'severe_injury', label: '重傷 (要手当て)', desc: '病院・手当が必要' },
+                      { value: 'need_rescue', label: '要救助 (緊急)', desc: '救助・支援要請' },
+                    ].map((opt) => (
+                      <label
+                        key={opt.value}
+                        className={`p-3 rounded-xl border flex flex-col justify-between cursor-pointer transition-all ${
+                          mySafetyStatus === opt.value
+                            ? 'bg-rose-50/70 border-rose-500 ring-2 ring-rose-500/20'
+                            : 'bg-slate-50 border-slate-200 hover:bg-slate-100/70'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-xs font-bold text-slate-800">{opt.label}</span>
+                          <input
+                            type="radio"
+                            name="safetyStatus"
+                            value={opt.value}
+                            checked={mySafetyStatus === opt.value}
+                            onChange={() => setMySafetyStatus(opt.value as any)}
+                            className="text-rose-600 focus:ring-rose-500"
+                          />
+                        </div>
+                        <span className="text-[10px] text-slate-500">{opt.desc}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 2. 家族の安否 */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    2. 同居家族・ご親族の状況
+                  </label>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {[
+                      { value: 'all_safe', label: '全員無事' },
+                      { value: 'injured', label: '負傷者あり' },
+                      { value: 'unreachable', label: '連絡取れず・確認中' },
+                      { value: 'none', label: '単身 / 該当なし' },
+                    ].map((opt) => (
+                      <label
+                        key={opt.value}
+                        className={`p-2.5 rounded-xl border text-xs font-bold text-center cursor-pointer transition-all ${
+                          myFamilyStatus === opt.value
+                            ? 'bg-slate-800 text-white border-slate-800 shadow-xs'
+                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="familyStatus"
+                          value={opt.value}
+                          checked={myFamilyStatus === opt.value}
+                          onChange={() => setMyFamilyStatus(opt.value as any)}
+                          className="hidden"
+                        />
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 3. 家屋・自宅の状況 */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    3. 自宅・家屋の被害状況
+                  </label>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {[
+                      { value: 'no_damage', label: '被害なし' },
+                      { value: 'partial_damage', label: '一部損壊 / ライフライン寸断' },
+                      { value: 'severe_damage', label: '大規模損壊 / 倒壊' },
+                      { value: 'evacuated', label: '避難所へ避難中' },
+                    ].map((opt) => (
+                      <label
+                        key={opt.value}
+                        className={`p-2.5 rounded-xl border text-xs font-bold text-center cursor-pointer transition-all ${
+                          myHouseStatus === opt.value
+                            ? 'bg-slate-800 text-white border-slate-800 shadow-xs'
+                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="houseStatus"
+                          value={opt.value}
+                          checked={myHouseStatus === opt.value}
+                          onChange={() => setMyHouseStatus(opt.value as any)}
+                          className="hidden"
+                        />
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 4. 出社・就業可否 */}
+                <div>
+                  <label className="block text-xs font-bold text-slate-700 mb-2">
+                    4. 今後の出社・テレワーク可否 <span className="text-rose-500">*</span>
+                  </label>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {[
+                      { value: 'available', label: '通常通り出社可' },
+                      { value: 'remote_only', label: '在宅勤務・リモート可' },
+                      { value: 'unavailable', label: '出社不可 (対応優先)' },
+                      { value: 'undecided', label: '未定 / 状況判断中' },
+                    ].map((opt) => (
+                      <label
+                        key={opt.value}
+                        className={`p-2.5 rounded-xl border text-xs font-bold text-center cursor-pointer transition-all ${
+                          myWorkAvailability === opt.value
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="workAvailability"
+                          value={opt.value}
+                          checked={myWorkAvailability === opt.value}
+                          onChange={() => setMyWorkAvailability(opt.value as any)}
+                          className="hidden"
+                        />
+                        {opt.label}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 5. 現在地 ＆ 6. 特記事項 */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-bold text-slate-700">
+                        5. 現在地・避難場所
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleGetLocation}
+                        disabled={isGettingLocation}
+                        className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        title="スマートフォンのGPS位置情報を取得して現在地に自動入力します"
+                      >
+                        {isGettingLocation ? (
+                          <>
+                            <RefreshCw className="w-3 h-3 animate-spin" />
+                            <span>GPS取得中...</span>
+                          </>
+                        ) : (
+                          <>
+                            <span>📍 GPS現在地を取得</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    <input
+                      type="text"
+                      value={myLocation}
+                      onChange={(e) => setMyLocation(e.target.value)}
+                      placeholder="自宅 / 〇〇小学校体育館 / 営業先 等"
+                      className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold focus:outline-none focus:ring-2 focus:ring-rose-500 focus:bg-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-700 mb-1">
+                      6. 連絡事項・会社への要望・特記事項
+                    </label>
+                    <input
+                      type="text"
+                      value={myComment}
+                      onChange={(e) => setMyComment(e.target.value)}
+                      placeholder="家族の状況や必要支援、出社目処など"
+                      className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-none focus:ring-2 focus:ring-rose-500 focus:bg-white"
+                    />
+                  </div>
+                </div>
+              </form>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-3.5 sm:p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-2 sm:gap-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsMyAnswerModalOpen(false)}
+                className="px-3 sm:px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-200/70 transition-colors cursor-pointer shrink-0"
+              >
+                閉じる
+              </button>
+              <button
+                type="submit"
+                form="my-safety-response-form"
+                disabled={isSubmittingResponse}
+                className="flex-1 sm:flex-initial px-4 sm:px-6 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-extrabold rounded-xl shadow-md shadow-rose-200 transition-all flex items-center justify-center gap-1.5 sm:gap-2 cursor-pointer disabled:opacity-50"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                {isSubmittingResponse ? '送信中...' : '安否状況を回答・登録する'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 2: 社員の回答詳細ポップアップ（閲覧専用・編集不可） */}
+      {/* ========================================================================= */}
+      {viewingResponseData && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-0 sm:p-4 animate-in fade-in duration-150">
+          <div className="bg-white sm:rounded-3xl border-0 sm:border border-slate-200 shadow-2xl max-w-lg w-full overflow-hidden flex flex-col h-dvh sm:h-auto max-h-dvh sm:max-h-[90vh] rounded-none animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="p-4 sm:p-5 bg-gradient-to-r from-slate-800 to-slate-900 text-white flex items-center justify-between shrink-0">
+              <button
+                type="button"
+                onClick={() => triggerOpenUserModal(viewingResponseData.user)}
+                className="flex items-center gap-2.5 sm:gap-3 min-w-0 text-left group/respusr cursor-pointer"
+                title={`${viewingResponseData.user.name} さんの社員詳細を表示`}
+              >
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl sm:rounded-2xl bg-white/10 group-hover/respusr:bg-indigo-500/40 flex items-center justify-center text-white shrink-0 font-black text-sm transition-colors">
+                  {viewingResponseData.user.name.slice(0, 1)}
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm sm:text-base font-extrabold text-white group-hover/respusr:text-indigo-200 group-hover/respusr:underline flex items-center gap-2 truncate transition-colors">
+                    {viewingResponseData.user.name} さんの安否詳細
+                  </h3>
+                  <p className="text-[11px] sm:text-xs text-slate-300 mt-0.5 truncate">
+                    {[viewingResponseData.user.office, viewingResponseData.user.division, viewingResponseData.user.position].filter(Boolean).join(' / ')}
+                  </p>
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewingResponseData(null)}
+                className="p-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+                title="閉じる"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-4 sm:p-6 overflow-y-auto space-y-4 sm:space-y-5 flex-1 text-xs">
+              {/* 安否ステータス 大バッジ */}
+              <div className="p-4 rounded-2xl border flex items-center justify-between gap-3 bg-slate-50 border-slate-200">
+                <span className="font-bold text-slate-600">本人の安否状況:</span>
+                {viewingResponseData.response ? (
+                  viewingResponseData.response.safetyStatus === 'safe' ? (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-black bg-emerald-100 text-emerald-800 border border-emerald-300">
+                      <Check className="w-4 h-4 text-emerald-600" />
+                      無事 (怪我なし)
+                    </span>
+                  ) : viewingResponseData.response.safetyStatus === 'minor_injury' ? (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-black bg-amber-100 text-amber-800 border border-amber-300">
+                      <AlertTriangle className="w-4 h-4 text-amber-600" />
+                      軽傷 (自力対応中)
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-black bg-rose-100 text-rose-800 border border-rose-300 animate-pulse">
+                      <AlertOctagon className="w-4 h-4 text-rose-600" />
+                      重傷・要救助 (最優先)
+                    </span>
+                  )
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold bg-slate-200 text-slate-600 border border-slate-300">
+                    <Clock className="w-4 h-4" />
+                    未回答
+                  </span>
+                )}
+              </div>
+
+              {viewingResponseData.response ? (
+                <>
+                  {/* Detailed Items Grid */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
+                      <span className="text-[11px] text-slate-400 font-bold block mb-1">同居家族の状況</span>
+                      <span className="font-bold text-slate-800 text-xs">
+                        {viewingResponseData.response.familyStatus === 'all_safe' ? '全員無事' : viewingResponseData.response.familyStatus === 'injured' ? '負傷者あり' : viewingResponseData.response.familyStatus === 'unreachable' ? '連絡取れず・確認中' : '単身 / 該当なし'}
+                      </span>
+                    </div>
+
+                    <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
+                      <span className="text-[11px] text-slate-400 font-bold block mb-1">自宅・家屋の被害</span>
+                      <span className="font-bold text-slate-800 text-xs">
+                        {viewingResponseData.response.houseStatus === 'no_damage' ? '被害なし' : viewingResponseData.response.houseStatus === 'partial_damage' ? '一部破損 / ライフライン寸断' : viewingResponseData.response.houseStatus === 'severe_damage' ? '大規模損壊 / 倒壊' : '避難所へ避難中'}
+                      </span>
+                    </div>
+
+                    <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
+                      <span className="text-[11px] text-slate-400 font-bold block mb-1">今後の出社・就業</span>
+                      <span className="font-bold text-indigo-700 text-xs">
+                        {viewingResponseData.response.workAvailability === 'available' ? '通常通り出社可' : viewingResponseData.response.workAvailability === 'remote_only' ? '在宅勤務・テレワーク可' : viewingResponseData.response.workAvailability === 'unavailable' ? '出社不可 (対応優先)' : '未定 / 状況判断中'}
+                      </span>
+                    </div>
+
+                    <div className="p-3 bg-slate-50 rounded-xl border border-slate-100">
+                      <span className="text-[11px] text-slate-400 font-bold block mb-1">現在地・避難場所</span>
+                      <span className="font-bold text-slate-800 text-xs">
+                        {viewingResponseData.response.locationStatus || '自宅'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Comments / Requests */}
+                  <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-100 space-y-1">
+                    <span className="text-[11px] text-slate-400 font-bold block">連絡事項・会社への要望</span>
+                    <p className="text-slate-800 whitespace-pre-wrap leading-relaxed">
+                      {viewingResponseData.response.message || '（特記事項なし）'}
+                    </p>
+                  </div>
+
+                  {/* Responded At */}
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 px-1">
+                    <span>回答日時:</span>
+                    <span className="font-mono font-bold text-slate-600">
+                      {new Date(viewingResponseData.response.respondedAt).toLocaleString('ja-JP')}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <div className="p-6 text-center text-slate-400 space-y-2 bg-slate-50 rounded-2xl border border-slate-100">
+                  <AlertCircle className="w-8 h-8 mx-auto text-slate-300" />
+                  <p className="font-bold text-slate-600">まだ回答が送信されていません</p>
+                  <p className="text-[11px] text-slate-400">
+                    一斉安否通知が送信されているか、または登録連絡先を確認してください。
+                  </p>
+                </div>
+              )}
+
+              {/* 連絡先状況 (暗号化保護) */}
+              <div className="p-3.5 bg-indigo-50/50 rounded-2xl border border-indigo-100 space-y-2">
+                <span className="text-[11px] font-bold text-indigo-900 block">登録連絡先情報</span>
+                <div className="space-y-1 text-[11px] font-mono text-slate-600">
+                  {viewingResponseData.user.email && (
+                    <div className="flex items-center gap-1.5">
+                      <Mail className="w-3 h-3 text-slate-400" />
+                      <span>社内: {viewingResponseData.user.email}</span>
+                    </div>
+                  )}
+                  {viewingResponseData.user.mobileEmail && (
+                    <div className="flex items-center gap-1.5">
+                      <Smartphone className="w-3 h-3 text-indigo-500" />
+                      <span>携帯: {viewingResponseData.user.mobileEmail}</span>
+                    </div>
+                  )}
+                  {viewingResponseData.user.personalEmailMasked ? (
+                    <div className="flex items-center gap-1.5 text-emerald-800 font-bold">
+                      <Lock className="w-3 h-3 text-emerald-600" />
+                      <span>個人(暗号化): {viewingResponseData.user.personalEmailMasked}</span>
+                    </div>
+                  ) : (
+                    <div className="text-slate-400">個人メール: 未登録</div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-3.5 sm:p-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-2 sm:gap-3 shrink-0">
+              {viewingResponseData.response && (isAdmin || currentUser.id === viewingResponseData.user.id) ? (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (activeEvent) {
+                      await handleDeleteResponse(activeEvent.id, viewingResponseData.user.id, viewingResponseData.user.name);
+                      setViewingResponseData(null);
+                    }
+                  }}
+                  className="px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-bold text-rose-600 hover:bg-rose-50 border border-rose-200 transition-colors cursor-pointer flex items-center gap-1.5 shrink-0"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">回答を削除（未回答にリセット）</span>
+                  <span className="sm:hidden">削除</span>
+                </button>
+              ) : (
+                <div />
+              )}
+
+              <button
+                type="button"
+                onClick={() => setViewingResponseData(null)}
+                className="px-4 sm:px-5 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer shrink-0"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: 個人メール登録依頼メール送信モーダル */}
+      {/* ========================================================================= */}
+      {isRequestModalOpen && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-0 sm:p-4 animate-in fade-in duration-150">
+          <div className="bg-white sm:rounded-3xl border-0 sm:border border-slate-200 shadow-2xl max-w-xl w-full overflow-hidden flex flex-col h-dvh sm:h-auto max-h-dvh sm:max-h-[90vh] rounded-none animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="p-4 sm:p-5 bg-gradient-to-r from-indigo-600 to-indigo-700 text-white flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-white/20 flex items-center justify-center text-white shrink-0">
+                  <Mail className="w-5 h-5" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-sm sm:text-base font-black truncate">
+                    個人メール登録の依頼メールを送信
+                  </h3>
+                  <p className="text-[11px] sm:text-xs text-indigo-100 mt-0.5 truncate">
+                    選択した対象者へ、緊急連絡先（個人メール）登録案内を一斉配信
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsRequestModalOpen(false)}
+                className="p-1.5 rounded-lg text-white/80 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-4 sm:p-6 space-y-4 sm:space-y-5 overflow-y-auto flex-1 text-xs">
+              {/* Target Count & List Preview */}
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-700 flex items-center gap-1.5">
+                    <Users className="w-4 h-4 text-indigo-600" />
+                    送信対象者: <strong className="text-indigo-600 text-sm font-black">{selectedTargetUserIds.length}</strong> 名
+                  </span>
+                  <span className="text-[11px] text-slate-500">
+                    （全社対象者一覧より選択中）
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto p-2 bg-white rounded-xl border border-slate-200">
+                  {selectedTargetUserIds.map(id => {
+                    const u = allUsers.find(user => user.id === id);
+                    if (!u) return null;
+                    const hasPersonal = !!(u.personalEmailMasked || u.personalEmailEncrypted);
+                    return (
+                      <span
+                        key={u.id}
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-bold border ${
+                          hasPersonal 
+                            ? 'bg-slate-100 text-slate-700 border-slate-200' 
+                            : 'bg-rose-50 text-rose-700 border-rose-200'
+                        }`}
+                      >
+                        {u.name}
+                        {!hasPersonal && <span className="text-[9px] bg-rose-200 text-rose-800 px-1 rounded">未</span>}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Delivery Channels */}
+              <div className="space-y-2">
+                <label className="font-bold text-slate-800 block">
+                  送信先チャネルの選択 <span className="text-rose-500">*</span>
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label className="flex items-center justify-between p-3 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100/70 cursor-pointer transition-colors">
+                    <div className="flex items-center gap-2">
+                      <Mail className="w-4 h-4 text-slate-600" />
+                      <div>
+                        <span className="font-bold text-slate-800 block">会社PCメール宛</span>
+                        <span className="text-[10px] text-slate-400">社内アドレス (example@company.co.jp)</span>
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={requestSendCompany}
+                      onChange={(e) => setRequestSendCompany(e.target.checked)}
+                      className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500 cursor-pointer"
+                    />
+                  </label>
+
+                  <label className="flex items-center justify-between p-3 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100/70 cursor-pointer transition-colors">
+                    <div className="flex items-center gap-2">
+                      <Smartphone className="w-4 h-4 text-indigo-600" />
+                      <div>
+                        <span className="font-bold text-slate-800 block">会社携帯メール宛</span>
+                        <span className="text-[10px] text-slate-400">支給携帯のアドレス</span>
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={requestSendMobile}
+                      onChange={(e) => setRequestSendMobile(e.target.checked)}
+                      className="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500 cursor-pointer"
+                    />
+                  </label>
+                </div>
+              </div>
+
+              {/* Custom Message input */}
+              <div className="space-y-1.5">
+                <label className="font-bold text-slate-800 block">
+                  管理者からの案内メッセージ（任意・追加文面）
+                </label>
+                <textarea
+                  value={requestCustomMessage}
+                  onChange={(e) => setRequestCustomMessage(e.target.value)}
+                  placeholder="例：来期のBCP対策および災害時初動体制強化のため、各自ご自身の私用メールアドレス（Gmailや携帯キャリアメール等）の登録にご協力をお願いいたします。"
+                  rows={3}
+                  className="w-full px-3.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-700 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:bg-white resize-none"
+                />
+              </div>
+
+              {/* Email Content Direct-link preview */}
+              <div className="p-3.5 bg-indigo-50/70 border border-indigo-100 rounded-2xl space-y-2">
+                <div className="flex items-center gap-2 font-bold text-indigo-900">
+                  <ShieldCheck className="w-4 h-4 text-indigo-600" />
+                  <span>スムーズなワンクリック登録の仕組み</span>
+                </div>
+                <p className="text-[11px] text-indigo-800 leading-relaxed">
+                  配信されるメールには、専用のディープリンクURLが記載されます。受信者がURLをクリックすると、<strong>マイページの「安否確認・緊急連絡先（個人メール）」が自動的に展開された状態</strong>で開くため、社員が迷わずスムーズに登録できます。
+                </p>
+                <div className="p-2 bg-white rounded-lg border border-indigo-200 font-mono text-[10px] text-indigo-700 break-all select-all">
+                  {window.location.origin + window.location.pathname}?tab=mypage&openEmergencyContact=true
+                </div>
+              </div>
+
+              {/* Privacy Notice */}
+              <div className="flex items-start gap-2 p-3 bg-emerald-50 rounded-xl border border-emerald-200 text-emerald-900">
+                <Lock className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <p className="text-[11px] leading-relaxed">
+                  <strong>高度暗号化（AES-256-GCM）保護:</strong> 登録された個人メールはサーバー上で暗号化され、管理者を含め第三者からは伏字（<code>m***@gmail.com</code> 等）で保護されます。
+                </p>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-3.5 sm:p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between gap-2 sm:gap-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => setIsRequestModalOpen(false)}
+                disabled={isSendingRequest}
+                className="px-3 sm:px-4 py-2 sm:py-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-100 text-slate-700 text-xs font-bold transition-colors cursor-pointer shrink-0"
+              >
+                キャンセル
+              </button>
+
+              <button
+                type="button"
+                onClick={handleSendRegistrationRequest}
+                disabled={isSendingRequest || selectedTargetUserIds.length === 0}
+                className="flex-1 sm:flex-initial px-4 sm:px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 sm:gap-2 shadow-md shadow-indigo-200 transition-all cursor-pointer disabled:opacity-50"
+              >
+                {isSendingRequest ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>送信処理中...</span>
+                  </>
+                ) : (
+                  <>
+                    <Send className="w-4 h-4" />
+                    <span>依頼メール送信 ({selectedTargetUserIds.length}名)</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: 登録依頼送信結果モーダル */}
+      {/* ========================================================================= */}
+      {requestResultModal && requestResultModal.open && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl max-w-md w-full overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+            <div className={`p-4 sm:p-5 flex items-center gap-3 text-white ${
+              requestResultModal.success ? 'bg-emerald-600' : 'bg-rose-600'
+            }`}>
+              <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center text-white shrink-0">
+                {requestResultModal.success ? (
+                  <CheckCircle2 className="w-6 h-6" />
+                ) : (
+                  <AlertTriangle className="w-6 h-6" />
+                )}
+              </div>
+              <div>
+                <h3 className="text-base font-black">
+                  {requestResultModal.success ? '登録依頼メール送信完了' : '送信エラー'}
+                </h3>
+                <p className="text-xs text-white/90">
+                  {requestResultModal.success ? '対象社員への配信が正常に完了しました' : 'メールの送信中に問題が発生しました'}
+                </p>
+              </div>
+            </div>
+
+            <div className="p-5 space-y-4 text-xs">
+              <p className="font-bold text-slate-800 leading-relaxed">
+                {requestResultModal.message}
+              </p>
+
+              {requestResultModal.details && (
+                <div className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-1.5 text-slate-600 font-mono text-[11px]">
+                  <div className="flex justify-between">
+                    <span>送信対象者数:</span>
+                    <strong className="text-slate-900">{requestResultModal.details.totalRequested || 0} 名</strong>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>正常配信数:</span>
+                    <strong className="text-emerald-700">{requestResultModal.details.sentCount || 0} 名</strong>
+                  </div>
+                  {requestResultModal.details.skippedCount > 0 && (
+                    <div className="flex justify-between text-amber-700">
+                      <span>スキップ (宛先なし):</span>
+                      <strong>{requestResultModal.details.skippedCount} 名</strong>
+                    </div>
+                  )}
+                  {requestResultModal.details.directUrl && (
+                    <div className="pt-2 border-t border-slate-200">
+                      <span className="text-[10px] text-slate-500 font-sans block mb-1">配信された登録先URL:</span>
+                      <div className="p-2 bg-white rounded border border-slate-200 text-[10px] break-all select-all">
+                        {requestResultModal.details.directUrl}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="flex justify-end pt-2">
+                <button
+                  type="button"
+                  onClick={() => setRequestResultModal(null)}
+                  className="px-6 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white font-bold transition-colors cursor-pointer text-xs"
+                >
+                  閉じる
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <ConfirmModal
+        {...confirmModal}
+        onClose={() => setConfirmModal((prev) => ({ ...prev, isOpen: false }))}
+      />
+    </div>
+  );
+};
+export default SafetyConfirmation;

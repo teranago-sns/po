@@ -1,0 +1,576 @@
+import React, { useState } from 'react';
+import { Hash, Home, Bookmark, User, Calendar as CalendarIcon, FileText, MessageSquare, Phone, ClipboardList, Monitor, Shield, HardDrive, Users, ShieldAlert, Wrench, ChevronDown, ChevronRight, FileCheck2, FolderArchive, BookOpen, ExternalLink, CalendarDays, HardHat, Undo2, Camera, Boxes, FolderKanban } from 'lucide-react';
+import { Post, BoardTopic, User as UserType } from '../types';
+import { isToggleableMenuKey, isOptionalMenuVisible } from '../utils/menuVisibility';
+
+export type AppTab = 'timeline' | 'calendar' | 'inspection_scheduler' | 'inspection_report' | 'site_management' | 'assets' | 'projects' | 'workflow' | 'board' | 'chat' | 'memo' | 'documents' | 'daily_report' | 'files' | 'members' | 'mypage' | 'admin' | 'safety_confirmation' | 'photo_reports';
+
+export interface SidebarUnreadCounts {
+  chat?: number;
+  memo?: number;
+  workflow?: number;
+  board?: number;
+  event?: number;
+  report?: number;
+  safety?: number;
+  project?: number;
+}
+
+interface SidebarProps {
+  posts?: Post[];
+  topics?: BoardTopic[];
+  selectedTag: string | null;
+  onSelectTag: (tag: string | null) => void;
+  activeTab: AppTab;
+  onChangeTab: (tab: AppTab) => void;
+  currentUser?: UserType;
+  impersonatorAdmin?: UserType | null;
+  onRevertToAdmin?: () => void;
+  className?: string;
+  onCollapse?: () => void;
+  unreadCounts?: SidebarUnreadCounts;
+  isUtilityOpen?: boolean;
+  onToggleUtility?: (open: boolean) => void;
+  onOpenSchedulePollModal?: () => void;
+  pendingPollCount?: number;
+}
+
+export const Sidebar = React.memo(function Sidebar({
+  posts = [],
+  topics = [],
+  selectedTag,
+  onSelectTag,
+  activeTab,
+  onChangeTab,
+  currentUser,
+  impersonatorAdmin,
+  onRevertToAdmin,
+  className,
+  onCollapse,
+  unreadCounts,
+  isUtilityOpen: propIsUtilityOpen,
+  onToggleUtility,
+  onOpenSchedulePollModal,
+  pendingPollCount = 0,
+}: SidebarProps) {
+  const [internalUtilityOpen, setInternalUtilityOpen] = useState<boolean>(() => {
+    const saved = localStorage.getItem('is_utility_open');
+    return saved !== null ? saved === 'true' : true;
+  });
+
+  const utilityOpen = propIsUtilityOpen !== undefined ? propIsUtilityOpen : internalUtilityOpen;
+
+  const handleToggleUtility = () => {
+    const nextVal = !utilityOpen;
+    if (onToggleUtility) {
+      onToggleUtility(nextVal);
+    } else {
+      setInternalUtilityOpen(nextVal);
+      localStorage.setItem('is_utility_open', String(nextVal));
+    }
+  };
+  // タイムラインタブ表示時のみハッシュタグ集計を計算・メモ化（他タブ表示時の不要な全件ループを排除）
+  const sortedTags = React.useMemo(() => {
+    if (activeTab !== 'timeline') return [];
+    const tagCounts: Record<string, number> = {};
+
+    (topics || []).forEach((topic) => {
+      if (topic && topic.tags && Array.isArray(topic.tags)) {
+        topic.tags.forEach((tag) => {
+          tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+        });
+      }
+    });
+
+    (posts || []).forEach((post) => {
+      if (post && post.tags && Array.isArray(post.tags)) {
+        post.tags.forEach((tag) => {
+          tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+        });
+      }
+    });
+
+    return Object.entries(tagCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10);
+  }, [topics, posts, activeTab]);
+
+  const containerClassName = `relative ${className || "bg-white rounded-xl border border-slate-200 p-6 flex flex-col gap-8 shrink-0 shadow-sm ring-1 ring-slate-900/5 sticky top-24"}`;
+
+  const isMaintenanceUser = 
+    (currentUser?.department && currentUser.department.includes('保守')) || 
+    (currentUser?.division && currentUser.division.includes('保守'));
+  const reportLabel = isMaintenanceUser ? '保守日報' : '週報';
+
+  // ページ・メニュー表示権限判定（個人/管理者設定のメニュー表示ON/OFFを管理者本人にも反映）
+  const isTabAllowed = (tabId: AppTab) => {
+    if (isToggleableMenuKey(tabId) && !isOptionalMenuVisible(currentUser, tabId)) {
+      return false;
+    }
+    const isSystemAdmin = currentUser?.isAdmin === true || currentUser?.role === 'admin' || (currentUser as any)?.id === 'u1';
+    if (isSystemAdmin) return true;
+    if (tabId === 'inspection_scheduler') {
+      return currentUser?.preferences?.showInspectionScheduler === true || (currentUser as any)?.showInspectionScheduler === true;
+    }
+    if (tabId === 'files') {
+      return currentUser?.preferences?.showSharedFiles === true || (currentUser as any)?.showSharedFiles === true;
+    }
+    if (tabId === 'safety_confirmation') {
+      return currentUser?.preferences?.showSafetyConfirmation === true || (currentUser as any)?.showSafetyConfirmation === true || currentUser?.preferences?.safetyConfirmationPermission === true;
+    }
+    if (currentUser?.preferences?.allowedTabs && currentUser.preferences.allowedTabs.length > 0) {
+      return currentUser.preferences.allowedTabs.includes(tabId);
+    }
+    return true;
+  };
+
+  const hasUtilityItems = 
+    isTabAllowed('timeline') ||
+    isTabAllowed('members') ||
+    isTabAllowed('photo_reports') ||
+    isTabAllowed('inspection_scheduler') || 
+    isTabAllowed('files') || 
+    isTabAllowed('safety_confirmation') || 
+    Boolean(onOpenSchedulePollModal) ||
+    currentUser?.isAdmin;
+
+  return (
+    <div className={containerClassName}>
+      {onCollapse && (
+        <button
+          type="button"
+          onClick={onCollapse}
+          className="absolute top-4 right-4 p-1.5 hover:bg-slate-100 text-slate-400 hover:text-slate-600 rounded-lg transition-colors cursor-pointer flex items-center justify-center border border-slate-200/60 bg-white shadow-xs"
+          title="メニューを閉じる"
+        >
+          <svg className="w-3.5 h-3.5 fill-current text-slate-500" viewBox="0 0 24 24">
+            <path d="M14 7l-5 5 5 5V7z" />
+          </svg>
+        </button>
+      )}
+      <nav className="space-y-1">
+        <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">メニュー</div>
+        {isTabAllowed('mypage') && (
+          <button
+            onClick={() => onChangeTab('mypage')}
+            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg font-bold transition-colors ${
+              activeTab === 'mypage'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-slate-700 hover:bg-slate-100'
+            }`}
+          >
+            <User className="w-4 h-4" />
+            マイページ
+          </button>
+        )}
+        {isTabAllowed('calendar') && (
+          <button
+            onClick={() => onChangeTab('calendar')}
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'calendar'
+                ? 'bg-indigo-50 text-indigo-700'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <CalendarIcon className="w-4 h-4" />
+            カレンダー
+          </button>
+        )}
+        {isTabAllowed('workflow') && (
+          <button
+            onClick={() => onChangeTab('workflow')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'workflow'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <FileText className="w-4 h-4" />
+              <span>ワークフロー</span>
+            </div>
+            {Boolean(unreadCounts?.workflow) && (
+              <span className="px-1.5 py-0.5 text-[10px] font-bold text-white bg-purple-600 rounded-full min-w-[18px] text-center shadow-xs">
+                {(unreadCounts?.workflow || 0) > 99 ? '99+' : unreadCounts?.workflow}
+              </span>
+            )}
+          </button>
+        )}
+        {isTabAllowed('board') && (
+          <button
+            onClick={() => onChangeTab('board')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'board'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <Monitor className="w-4 h-4" />
+              <span>掲示板</span>
+            </div>
+            {Boolean(unreadCounts?.board) && (
+              <span className="px-1.5 py-0.5 text-[10px] font-bold text-white bg-indigo-600 rounded-full min-w-[18px] text-center shadow-xs">
+                {(unreadCounts?.board || 0) > 99 ? '99+' : unreadCounts?.board}
+              </span>
+            )}
+          </button>
+        )}
+        {isTabAllowed('chat') && (
+          <button
+            onClick={() => onChangeTab('chat')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'chat'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <MessageSquare className="w-4 h-4" />
+              <span>チャットルーム</span>
+            </div>
+            {Boolean(unreadCounts?.chat) && (
+              <span className="px-1.5 py-0.5 text-[10px] font-bold text-white bg-rose-500 rounded-full min-w-[18px] text-center shadow-xs animate-pulse">
+                {(unreadCounts?.chat || 0) > 99 ? '99+' : unreadCounts?.chat}
+              </span>
+            )}
+          </button>
+        )}
+        {isTabAllowed('memo') && (
+          <button
+            onClick={() => onChangeTab('memo')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'memo'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <Phone className="w-4 h-4" />
+              <span>伝言メモ</span>
+            </div>
+            {Boolean(unreadCounts?.memo) && (
+              <span className="px-1.5 py-0.5 text-[10px] font-bold text-white bg-amber-500 rounded-full min-w-[18px] text-center shadow-xs">
+                {(unreadCounts?.memo || 0) > 99 ? '99+' : unreadCounts?.memo}
+              </span>
+            )}
+          </button>
+        )}
+        {isTabAllowed('projects') && (
+          <button
+            onClick={() => onChangeTab('projects')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'projects'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <FolderKanban className="w-4 h-4 text-indigo-600" />
+              <span>プロジェクト</span>
+            </div>
+            {Boolean(unreadCounts?.project) && (
+              <span className="px-1.5 py-0.5 text-[10px] font-bold text-white bg-sky-600 rounded-full min-w-[18px] text-center shadow-xs">
+                {(unreadCounts?.project || 0) > 99 ? '99+' : unreadCounts?.project}
+              </span>
+            )}
+          </button>
+        )}
+        {isTabAllowed('documents') && (
+          <button
+            onClick={() => onChangeTab('documents')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'documents'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <FolderArchive className="w-4 h-4" />
+              <span>文書管理</span>
+            </div>
+          </button>
+        )}
+        {isTabAllowed('daily_report') && (
+          <button
+            onClick={() => onChangeTab('daily_report')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'daily_report'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <ClipboardList className="w-4 h-4" />
+              <span>{reportLabel}</span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="px-1.5 py-0.5 text-[10px] font-bold text-amber-700 bg-amber-100 rounded-full text-center">
+                開発中
+              </span>
+              {Boolean(unreadCounts?.report) && (
+                <span className="px-1.5 py-0.5 text-[10px] font-bold text-white bg-blue-600 rounded-full min-w-[18px] text-center shadow-xs">
+                  {(unreadCounts?.report || 0) > 99 ? '99+' : unreadCounts?.report}
+                </span>
+              )}
+            </div>
+          </button>
+        )}
+        {isTabAllowed('inspection_report') && (
+          <button
+            onClick={() => onChangeTab('inspection_report')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'inspection_report'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <FileCheck2 className="w-4 h-4 text-emerald-600" />
+              <span>点検報告書</span>
+            </div>
+            <span className="px-1.5 py-0.5 text-[10px] font-bold text-amber-700 bg-amber-100 rounded-full text-center">
+              開発中
+            </span>
+          </button>
+        )}
+        {isTabAllowed('site_management') && (
+          <button
+            onClick={() => onChangeTab('site_management')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'site_management'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <HardHat className="w-4 h-4 text-amber-600" />
+              <span>現場管理</span>
+            </div>
+            <span className="px-1.5 py-0.5 text-[10px] font-bold text-amber-700 bg-amber-100 rounded-full text-center">
+              開発中
+            </span>
+          </button>
+        )}
+        {isTabAllowed('assets') && (
+          <button
+            onClick={() => onChangeTab('assets')}
+            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-medium transition-colors ${
+              activeTab === 'assets'
+                ? 'bg-indigo-50 text-indigo-700 font-bold'
+                : 'text-slate-600 hover:bg-slate-50'
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <Boxes className="w-4 h-4 text-sky-600" />
+              <span>資産管理</span>
+            </div>
+          </button>
+        )}
+        {/* ユーティリティ（各種管理・拡張ツール） */}
+        {hasUtilityItems && (
+          <div className="pt-2 border-t border-slate-100 space-y-1">
+            <button
+              type="button"
+              onClick={handleToggleUtility}
+              className="w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm font-bold text-slate-700 hover:bg-slate-100 hover:text-indigo-700 transition-colors cursor-pointer"
+            >
+              <div className="flex items-center gap-2">
+                <Wrench className="w-4 h-4 text-indigo-600 shrink-0" />
+                <span>ユーティリティー</span>
+              </div>
+              {utilityOpen ? (
+                <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+              ) : (
+                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
+              )}
+            </button>
+
+            {utilityOpen && (
+              <div className="pl-2 space-y-0.5 pt-0.5">
+                {isTabAllowed('timeline') && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('timeline')}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-colors ${
+                      activeTab === 'timeline'
+                        ? 'bg-indigo-50 text-indigo-700 font-bold shadow-2xs'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <Home className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span className="truncate">タイムライン</span>
+                  </button>
+                )}
+                {isTabAllowed('members') && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('members')}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-colors ${
+                      activeTab === 'members'
+                        ? 'bg-indigo-50 text-indigo-700 font-bold shadow-2xs'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <Users className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span className="truncate">社員名簿</span>
+                  </button>
+                )}
+                {isTabAllowed('inspection_scheduler') && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('inspection_scheduler')}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-colors ${
+                      activeTab === 'inspection_scheduler'
+                        ? 'bg-indigo-50 text-indigo-700 font-bold shadow-2xs'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <ClipboardList className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span className="truncate">点検予定管理</span>
+                  </button>
+                )}
+                {isTabAllowed('photo_reports') && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('photo_reports')}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-colors ${
+                      activeTab === 'photo_reports'
+                        ? 'bg-indigo-50 text-indigo-700 font-bold shadow-2xs'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <Camera className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span className="truncate">写真報告書</span>
+                  </button>
+                )}
+                {isTabAllowed('files') && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('files')}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-colors ${
+                      activeTab === 'files'
+                        ? 'bg-indigo-50 text-indigo-700 font-bold'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <HardDrive className="w-3.5 h-3.5 text-indigo-500 shrink-0" />
+                    <span className="truncate">共有ファイル</span>
+                  </button>
+                )}
+                {isTabAllowed('safety_confirmation') && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('safety_confirmation')}
+                    className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-all ${
+                      activeTab === 'safety_confirmation'
+                        ? 'bg-rose-50 text-rose-700 font-bold shadow-2xs'
+                        : 'text-slate-600 hover:bg-rose-50/60 hover:text-rose-700'
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <ShieldAlert className="w-3.5 h-3.5 text-rose-600 shrink-0" />
+                      <span className="truncate">安否確認</span>
+                    </div>
+                    {Boolean(unreadCounts?.safety) && (
+                      <span className="px-1.5 py-0.2 text-[10px] font-extrabold text-white bg-rose-600 rounded-full shrink-0 ml-1 animate-pulse shadow-xs">
+                        {unreadCounts?.safety}
+                      </span>
+                    )}
+                  </button>
+                )}
+                {/* 日程調整アシスタント */}
+                {onOpenSchedulePollModal && (
+                  <button
+                    type="button"
+                    onClick={onOpenSchedulePollModal}
+                    className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap text-slate-600 hover:bg-amber-50/70 hover:text-amber-800 transition-colors group cursor-pointer"
+                    title="空き枠自動抽出 ＆ アンケート集計で会議日程を調整"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <CalendarDays className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      <span className="truncate font-semibold">日程調整</span>
+                    </div>
+                    {pendingPollCount > 0 && (
+                      <span className="text-[9px] px-1.5 py-0.2 rounded-full font-bold bg-rose-500 text-white shrink-0 ml-1 animate-pulse shadow-2xs">
+                        未回答 {pendingPollCount}
+                      </span>
+                    )}
+                  </button>
+                )}
+
+                {/* 総合操作マニュアル (Manフォルダ) */}
+                <a
+                  href={`${import.meta.env.BASE_URL}Man/index.html`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap text-slate-600 hover:bg-indigo-50/60 hover:text-indigo-700 transition-colors group cursor-pointer"
+                  title="網羅的な全機能操作マニュアル（HTML版）を新しいタブで開く"
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <BookOpen className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span className="truncate font-semibold">操作マニュアル</span>
+                  </div>
+                  <ExternalLink className="w-3 h-3 text-slate-400 group-hover:text-indigo-600 shrink-0 opacity-70 group-hover:opacity-100" />
+                </a>
+
+                {impersonatorAdmin && onRevertToAdmin && (
+                  <button
+                    type="button"
+                    onClick={onRevertToAdmin}
+                    className="w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-xs font-bold whitespace-nowrap bg-amber-50 text-amber-900 hover:bg-amber-100 border border-amber-300 transition-all shadow-xs cursor-pointer group"
+                    title={`元の管理者（${impersonatorAdmin.name}）のアカウントに復帰します`}
+                  >
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Undo2 className="w-3.5 h-3.5 text-amber-700 shrink-0 group-hover:-translate-x-0.5 transition-transform" />
+                      <span className="truncate">管理者（{impersonatorAdmin.name}）に戻る</span>
+                    </div>
+                    <span className="text-[9px] px-1.5 py-0.5 rounded font-black bg-amber-500 text-white shrink-0 ml-1 shadow-2xs">
+                      復帰
+                    </span>
+                  </button>
+                )}
+
+                {currentUser?.isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('admin')}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-1.5 rounded-md text-xs font-medium whitespace-nowrap transition-colors ${
+                      activeTab === 'admin'
+                        ? 'bg-indigo-50 text-indigo-700 font-bold'
+                        : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                    }`}
+                  >
+                    <Shield className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                    <span className="truncate">管理者メニュー</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </nav>
+
+      {activeTab === 'timeline' && sortedTags.length > 0 && (
+        <div className="space-y-3">
+          <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">人気のタグ</div>
+          <div className="flex flex-wrap gap-2">
+            {sortedTags.map(([tag]) => (
+              <button
+                key={tag}
+                onClick={() => onSelectTag(tag)}
+                className={`px-3 py-1.5 rounded-full text-xs transition-colors ${
+                  selectedTag === tag
+                    ? 'bg-indigo-600 text-white font-medium'
+                    : 'bg-slate-100 hover:bg-indigo-100 hover:text-indigo-700 text-slate-600'
+                }`}
+              >
+                # {tag}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});

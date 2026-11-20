@@ -1,0 +1,8722 @@
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import fs from 'fs';
+import net from 'net';
+import crypto from 'crypto';
+import multer from 'multer';
+import webpush from 'web-push';
+import nodemailer from 'nodemailer';
+import { simpleParser } from 'mailparser';
+import { createServer as createViteServer } from 'vite';
+import { expandRecurringEvents } from './src/utils/recurrenceUtils';
+import stampsRouter from './routes/stamps.js';
+import logsRouter from './routes/logs.js';
+import documentsRouter from './routes/documents.js';
+import schedulePollsRouter from './routes/schedulePolls.js';
+import photoReportsRouter from './routes/photoReports.js';
+import sitesRouter from './routes/sites.js';
+import inspectionsRouter from './routes/inspections.js';
+import eventsRouter from './routes/events.js';
+import safetyRouter from './routes/safety.js';
+import chatQuizzesRouter from './routes/chatQuizzes.js';
+import assetsRouter from './routes/assets.js';
+import projectsRouter from './routes/projects.js';
+import {
+  requireApiAuth,
+  issueSessionToken,
+  revokeSessionToken,
+  extractTokenFromRequest,
+  checkLoginRateLimit,
+  recordLoginAttempt,
+  updateSessionsForUser,
+  revokeAllSessionsForUser,
+  createStrictCorsOptions,
+  isAllowedOrigin,
+  isSafeFilename,
+  resolveSafeChildPath
+} from './routes/authSession.js';
+
+// サーバークラッシュ防止（非同期未処理例外・Promise拒否でプロセスが落ちるのを完全防止）
+process.on('uncaughtException', (err) => {
+  console.error('[Process Error Guard] Uncaught Exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process Error Guard] Unhandled Rejection:', reason);
+});
+
+function loadEnvFileIfPresent() {
+  try {
+    const envPath = path.join(process.cwd(), '.env');
+    if (!fs.existsSync(envPath)) return;
+    const content = fs.readFileSync(envPath, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx <= 0) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let val = line.slice(eqIdx + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+        val = val.slice(1, -1);
+      }
+      if (process.env[key] === undefined) {
+        process.env[key] = val;
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+loadEnvFileIfPresent();
+
+async function startServer() {
+  loadEnvFileIfPresent();
+  const app = express();
+  const PORT = 3000;
+
+  // 1. 厳格CORS設定（完全一致リストのみ許可、部分一致や全許可フォールバックを排除）
+  const corsOptions: cors.CorsOptions = createStrictCorsOptions();
+
+  app.use(cors(corsOptions));
+  app.options('*', cors(corsOptions));
+
+  // 2. セキュリティ強化レスポンスヘッダーミドルウェア
+  const isAiStudioPreviewEnv = Boolean(process.env.APP_URL || process.env.SHARED_APP_URL);
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    // ドキュメントプレビューやiframe埋め込みを許可するため、許可オリジンのみ frame-ancestors に指定
+    if (
+      req.path.includes('/documents') || 
+      req.path.includes('/uploads/documents') ||
+      req.path.includes('/preview') ||
+      req.path.includes('/file/') ||
+      req.query.inline === '1'
+    ) {
+      res.setHeader(
+        'Content-Security-Policy',
+        "frame-ancestors 'self' https://teranago-sns.github.io https://micchy-ken.github.io https://sns.teranago.synology.me http://sns.teranago.synology.me http://localhost:3000 http://localhost:3001 http://localhost:5173"
+      );
+    } else if (isAiStudioPreviewEnv && !req.path.startsWith('/api')) {
+      // AI Studio 開発プレビュー環境では各種プレビュー用親フレーム (*.usercontent.goog / aistudio.google.com 等) からのiframe表示を妨げないよう非APIレスポンスには制限ヘッダーを付与しない
+    } else {
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    }
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
+
+  // 3. レートリミット設定 (社内SNSの同時接続・高頻度定期ポーリングに最適化)
+  // 【重要】社内LANやリバースプロキシ環境では全社員が同一IPとして見えるため、
+  // 通常の定期ポーリング（GETリクエスト: チャット・掲示板・伝言メモ・カレンダー・ワークフロー等）で
+  // 誤って全社アクセスが遮断されるのを防ぐため、GET/HEAD/OPTIONS等の読み取りリクエストは遮断対象外とします。
+  // POST/PUT/DELETE等の書き込みリクエストに対して総当たり・連打保護を適用します。
+  const writeRateLimitMap = new Map<string, { count: number; resetAt: number }>();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [ip, record] of writeRateLimitMap.entries()) {
+      if (now > record.resetAt) {
+        writeRateLimitMap.delete(ip);
+      }
+    }
+  }, 10 * 60 * 1000); // 10分おきにメモリクリーンアップ
+
+  app.use((req, res, next) => {
+    // 読み取り（GET/HEAD）およびプリフライト（OPTIONS）は常時許可（社内定期同期を絶対に切断させない）
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+      return next();
+    }
+
+    const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const windowMs = 15 * 60 * 1000; // 15分間
+    const maxWriteRequests = 3000; // 15分間に3,000回（通常業務で絶対に引っかからない十分な余裕）
+
+    const record = writeRateLimitMap.get(ip) || { count: 0, resetAt: now + windowMs };
+    if (now > record.resetAt) {
+      record.count = 0;
+      record.resetAt = now + windowMs;
+    }
+    record.count += 1;
+    writeRateLimitMap.set(ip, record);
+
+    if (record.count > maxWriteRequests) {
+      if (req.headers.origin && isAllowedOrigin(req.headers.origin)) {
+        res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+      return res.status(429).json({ error: 'Too Many Requests - 書き込みリクエスト上限を超えました。時間をおいて再試行してください。' });
+    }
+    next();
+  });
+
+  // リクエストボディ上限設定 (DoS攻撃対策: 10MB)
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+  // 4. 全 /api/* エンドポイントに対する Bearer セッショントークン認証・IDOR防止ミドルウェア
+  app.use('/api', requireApiAuth);
+
+  const dataDir = path.join(process.cwd(), 'data');
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+
+  // ==========================================
+  // Web Push (VAPID) 設定・初期化
+  // ==========================================
+  const vapidKeysPath = path.join(dataDir, 'vapid-keys.json');
+  let vapidKeys: { publicKey: string; privateKey: string };
+
+  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+    vapidKeys = {
+      publicKey: process.env.VAPID_PUBLIC_KEY,
+      privateKey: process.env.VAPID_PRIVATE_KEY
+    };
+    console.log('[WebPush] VAPID keys loaded from environment variables.');
+  } else if (fs.existsSync(vapidKeysPath)) {
+    try {
+      vapidKeys = JSON.parse(fs.readFileSync(vapidKeysPath, 'utf8'));
+    } catch (e) {
+      vapidKeys = webpush.generateVAPIDKeys();
+      fs.writeFileSync(vapidKeysPath, JSON.stringify(vapidKeys, null, 2), 'utf8');
+    }
+  } else {
+    vapidKeys = webpush.generateVAPIDKeys();
+    fs.writeFileSync(vapidKeysPath, JSON.stringify(vapidKeys, null, 2), 'utf8');
+  }
+
+  try {
+    webpush.setVapidDetails(
+      process.env.VAPID_EMAIL || 'mailto:admin@example.com',
+      vapidKeys.publicKey,
+      vapidKeys.privateKey
+    );
+    console.log('[WebPush] VAPID keys loaded. Public Key:', vapidKeys.publicKey);
+  } catch (e) {
+    console.error('[WebPush] Failed to set VAPID details:', e);
+  }
+
+  // Push Subscription 保存管理
+  const subscriptionsPath = path.join(dataDir, 'push-subscriptions.json');
+  interface StoredSubscription {
+    id: string;
+    userId: string;
+    subscription: webpush.PushSubscription;
+    userAgent?: string;
+    createdAt: string;
+    lastActiveAt: string;
+  }
+
+  function loadSubscriptions(): StoredSubscription[] {
+    if (!fs.existsSync(subscriptionsPath)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(subscriptionsPath, 'utf8'));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveSubscriptions(subs: StoredSubscription[]) {
+    try {
+      fs.writeFileSync(subscriptionsPath, JSON.stringify(subs, null, 2), 'utf8');
+    } catch (e) {
+      console.error('[WebPush] Failed to save subscriptions:', e);
+    }
+  }
+
+  // 共有ディープリンクURLの自動解決ヘルパー
+  function resolveDeepLinkUrl(url?: string, data: any = {}) {
+    if (url && url !== '/' && url !== '' && url !== '/index.html') {
+      return url;
+    }
+    const tab = data.tab || data.category;
+    if (data.topicId || data.bulletinId) {
+      return `/?tab=board&topicId=${data.topicId || data.bulletinId}`;
+    }
+    if (data.eventId) {
+      return `/?tab=calendar&eventId=${data.eventId}`;
+    }
+    if (data.applicationId || data.appId) {
+      return `/?tab=workflow&appId=${data.applicationId || data.appId}`;
+    }
+    if (data.memoId) {
+      return `/?tab=memo&memoId=${data.memoId}`;
+    }
+    if (data.chatRoomId || data.roomId) {
+      return `/?tab=chat&chatRoomId=${data.chatRoomId || data.roomId}`;
+    }
+    if (data.reportId) {
+      return `/?tab=daily_report&reportId=${data.reportId}`;
+    }
+    if (data.safetyEventId) {
+      return `/?tab=safety_confirmation&safetyEventId=${data.safetyEventId}`;
+    }
+    if (data.projectId || data.taskId) {
+      const q = new URLSearchParams({ tab: 'projects' });
+      if (data.projectId) q.set('projectId', String(data.projectId));
+      if (data.taskId) q.set('taskId', String(data.taskId));
+      return `/?${q.toString()}`;
+    }
+    if (tab) {
+      return `/?tab=${tab}`;
+    }
+    return url || '/';
+  }
+
+  function classifyPushEndpoint(endpoint = '') {
+    const ep = String(endpoint || '').toLowerCase();
+    if (ep.includes('fcm.googleapis.com') || ep.includes('android.googleapis.com')) return 'FCM(Android/Chrome)';
+    if (ep.includes('web.push.apple.com')) return 'APNs(iOS/Safari)';
+    if (ep.includes('notify.windows.com')) return 'WNS(Windows/Edge)';
+    if (ep.includes('push.services.mozilla.com')) return 'Mozilla(Firefox)';
+    return 'Other';
+  }
+
+  // Push通知送信ヘルパー関数 (高優先度 & 確実な配信)
+  async function sendPushNotificationToUser(params: {
+    targetUserId?: string;
+    targetUserIds?: string[];
+    excludeUserId?: string;
+    title: string;
+    body: string;
+    icon?: string;
+    badge?: string;
+    url?: string;
+    data?: any;
+    tag?: string;
+    requireInteraction?: boolean;
+    renotify?: boolean;
+    silent?: boolean;
+  }) {
+    const {
+      targetUserId,
+      targetUserIds,
+      excludeUserId,
+      title,
+      body,
+      icon = '/icon.svg',
+      badge = '/icon.svg',
+      url = '/',
+      data = {},
+      tag,
+      requireInteraction = true,
+      renotify = true,
+      silent = false
+    } = params;
+
+    const allSubs = loadSubscriptions();
+    let targets: StoredSubscription[] = [];
+
+    if (targetUserId === 'all') {
+      targets = allSubs.filter(s => !excludeUserId || s.userId !== String(excludeUserId));
+    } else if (Array.isArray(targetUserIds) && targetUserIds.length > 0) {
+      const idSet = new Set(targetUserIds.map(String));
+      targets = allSubs.filter(s => idSet.has(s.userId) && (!excludeUserId || s.userId !== String(excludeUserId)));
+    } else if (targetUserId) {
+      targets = allSubs.filter(s => s.userId === String(targetUserId));
+    }
+
+    if (targets.length === 0) return { sentCount: 0, failureCount: 0, totalTargets: 0 };
+
+    const finalUrl = resolveDeepLinkUrl(url, data);
+    const notificationTag = tag || `notif_${Date.now()}`;
+    const payload = JSON.stringify({
+      title,
+      body,
+      icon,
+      badge,
+      url: finalUrl,
+      data: {
+        ...data,
+        url: finalUrl
+      },
+      tag: notificationTag,
+      requireInteraction,
+      renotify,
+      silent
+    });
+
+    const staleEndpoints: string[] = [];
+    const failures: Array<{ userId: string; provider: string; statusCode: number | string; message: string }> = [];
+    let sentCount = 0;
+    let failureCount = 0;
+
+    // Web Push標準オプション (高優先度、24時間TTL、トピック集約)
+    const sanitizedTopic = notificationTag.replace(/[^a-zA-Z0-9_-]/g, '');
+    const pushOptions: webpush.RequestOptions = {
+      TTL: 86400, // 24時間保持 (オフライン復帰時にも確実に配信)
+      urgency: 'high', // 最高優先度
+      topic: (sanitizedTopic.length > 32 ? sanitizedTopic.slice(-32) : sanitizedTopic) || undefined
+    };
+
+    await Promise.all(
+      targets.map(async (sub) => {
+        const endpoint = sub?.subscription?.endpoint || '';
+        const provider = classifyPushEndpoint(endpoint);
+        try {
+          await webpush.sendNotification(sub.subscription, payload, pushOptions);
+          sentCount++;
+        } catch (err: any) {
+          failureCount++;
+          const statusCode = err?.statusCode || 'unknown';
+          const errBody = typeof err?.body === 'string' ? err.body.slice(0, 200) : (err?.message || 'unknown error');
+          console.error(
+            `[WebPush] Push failed for user=${sub.userId} provider=${provider} status=${statusCode} tag=${notificationTag} topic=${pushOptions.topic || ''}: ${errBody}`
+          );
+          failures.push({
+            userId: sub.userId,
+            provider,
+            statusCode,
+            message: errBody,
+          });
+          if (err.statusCode === 404 || err.statusCode === 410) {
+            staleEndpoints.push(endpoint);
+          }
+        }
+      })
+    );
+
+    if (staleEndpoints.length > 0) {
+      const remainingSubs = allSubs.filter(s => !staleEndpoints.includes(s.subscription.endpoint));
+      saveSubscriptions(remainingSubs);
+      console.log(`[WebPush] Pruned ${staleEndpoints.length} stale subscriptions.`);
+    }
+
+    return {
+      sentCount,
+      failureCount,
+      totalTargets: targets.length,
+      ...(failures.length > 0 ? { failures } : {}),
+    };
+  }
+
+  // ==========================================
+  // Web Push API エンドポイント
+  // ==========================================
+
+  // VAPID公開鍵取得
+  app.get('/api/push/vapid-public-key', (req, res) => {
+    res.json({ publicKey: vapidKeys.publicKey });
+  });
+
+  // Service Worker ファイルの明示的サーブ (/sw.js)
+  app.get('/sw.js', (req, res) => {
+    res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    res.setHeader('Service-Worker-Allowed', '/');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    const swPath = path.join(process.cwd(), 'public', 'sw.js');
+    if (fs.existsSync(swPath)) {
+      res.sendFile(swPath);
+    } else {
+      res.status(404).send('// Service Worker file not found');
+    }
+  });
+
+  // 端末のPush通知購読登録
+  app.post('/api/push/subscribe', (req, res) => {
+    try {
+      const { userId, subscription, userAgent } = req.body;
+      if (!userId || !subscription || !subscription.endpoint) {
+        return res.status(400).json({ error: 'ユーザーIDおよび購読情報が必要です。' });
+      }
+
+      const allSubs = loadSubscriptions();
+      const existingIdx = allSubs.findIndex(s => s.subscription.endpoint === subscription.endpoint);
+      const now = new Date().toISOString();
+
+      if (existingIdx >= 0) {
+        allSubs[existingIdx] = {
+          ...allSubs[existingIdx],
+          userId: String(userId),
+          subscription,
+          userAgent: userAgent || allSubs[existingIdx].userAgent,
+          lastActiveAt: now
+        };
+      } else {
+        allSubs.push({
+          id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          userId: String(userId),
+          subscription,
+          userAgent,
+          createdAt: now,
+          lastActiveAt: now
+        });
+      }
+
+      saveSubscriptions(allSubs);
+      const userSubCount = allSubs.filter(s => s.userId === String(userId)).length;
+      res.json({ success: true, message: '通知の購読を登録しました。', count: userSubCount });
+    } catch (err: any) {
+      console.error('[WebPush] Subscribe error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 端末のPush通知購読解除
+  app.post('/api/push/unsubscribe', (req, res) => {
+    try {
+      const { endpoint, userId } = req.body;
+      if (!endpoint) {
+        return res.status(400).json({ error: '解除対象のエンドポイントが必要です。' });
+      }
+
+      let allSubs = loadSubscriptions();
+      const initialCount = allSubs.length;
+      allSubs = allSubs.filter(s => {
+        if (s.subscription.endpoint === endpoint) return false;
+        if (userId && s.userId === String(userId) && !endpoint) return false;
+        return true;
+      });
+
+      saveSubscriptions(allSubs);
+      res.json({ success: true, message: '通知の購読を解除しました。', removed: initialCount - allSubs.length });
+    } catch (err: any) {
+      console.error('[WebPush] Unsubscribe error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ユーザーの通知購読状態確認
+  app.get('/api/push/status/:userId', (req, res) => {
+    try {
+      const userId = String(req.params.userId);
+      const allSubs = loadSubscriptions();
+      const userSubs = allSubs.filter(s => s.userId === userId);
+      res.json({
+        isSubscribed: userSubs.length > 0,
+        subscriptionCount: userSubs.length
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // プッシュ通知送信 API
+  app.post('/api/push/send', async (req, res) => {
+    try {
+      const {
+        targetUserId,
+        targetUserIds,
+        excludeUserId,
+        title,
+        body,
+        icon = '/icon.svg',
+        badge = '/icon.svg',
+        url = '/',
+        data = {},
+        tag,
+        requireInteraction,
+        renotify,
+        silent
+      } = req.body;
+
+      if (!title || !body) {
+        return res.status(400).json({ error: 'タイトルと本文は必須です。' });
+      }
+
+      const result = await sendPushNotificationToUser({
+        targetUserId,
+        targetUserIds,
+        excludeUserId,
+        title,
+        body,
+        icon,
+        badge,
+        url,
+        data,
+        tag,
+        requireInteraction,
+        renotify,
+        silent
+      });
+
+      res.json({
+        success: true,
+        sentCount: result.sentCount,
+        failureCount: result.failureCount,
+        totalTargets: result.totalTargets
+      });
+    } catch (err: any) {
+      console.error('[WebPush] Send notification error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // テスト通知送信 API
+  app.post('/api/push/test', async (req, res) => {
+    try {
+      const { userId } = req.body;
+      if (!userId) {
+        return res.status(400).json({ error: 'ユーザーIDが必要です。' });
+      }
+
+      const allSubs = loadSubscriptions();
+      const targets = allSubs.filter(s => s.userId === String(userId));
+
+      if (targets.length === 0) {
+        return res.status(404).json({
+          error: 'このユーザーに登録された通知先端末が見つかりません。まず「通知を有効にする」を実行してください。'
+        });
+      }
+
+      const payload = JSON.stringify({
+        title: '🎉 Web Push通知テスト',
+        body: 'スマートフォンへのプッシュ通知連携が正常に動作しています！',
+        icon: '/icon.svg',
+        badge: '/icon.svg',
+        url: '/',
+        tag: 'test-notification',
+        renotify: true
+      });
+
+      let sentCount = 0;
+      const staleEndpoints: string[] = [];
+
+      await Promise.all(
+        targets.map(async (sub) => {
+          try {
+            await webpush.sendNotification(sub.subscription, payload);
+            sentCount++;
+          } catch (err: any) {
+            console.error(`[WebPush] Test push error:`, err.statusCode || err.message);
+            if (err.statusCode === 404 || err.statusCode === 410) {
+              staleEndpoints.push(sub.subscription.endpoint);
+            }
+          }
+        })
+      );
+
+      if (staleEndpoints.length > 0) {
+        const remainingSubs = allSubs.filter(s => !staleEndpoints.includes(s.subscription.endpoint));
+        saveSubscriptions(remainingSubs);
+      }
+
+      res.json({
+        success: true,
+        message: `${sentCount}台の端末にテスト通知を送信しました。`,
+        sentCount
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // SMTP メール通知設定・送信処理
+  // ==========================================
+  const smtpConfig = {
+    host: process.env.SMTP_HOST || '',
+    port: parseInt(process.env.SMTP_PORT || '587', 10),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: {
+      user: process.env.SMTP_USER || '',
+      pass: process.env.SMTP_PASS || ''
+    },
+    tls: {
+      rejectUnauthorized: false
+    }
+  };
+
+  const smtpFromEmail = process.env.SMTP_FROM_EMAIL || 'noreply@example.com';
+  const smtpFromName = process.env.SMTP_FROM_NAME || 'Aipo送信用（このメールには返信できません）';
+  const smtpFromFormatted = `"${smtpFromName}" <${smtpFromEmail}>`;
+
+  async function sendEmailNotification(options: {
+    to: string | string[];
+    subject: string;
+    text?: string;
+    html?: string;
+  }) {
+    if (!options.to || (Array.isArray(options.to) && options.to.length === 0)) {
+      throw new Error('送信先メールアドレスが指定されていません。');
+    }
+
+    const transporter = nodemailer.createTransport(smtpConfig);
+    const mailOptions = {
+      from: smtpFromFormatted,
+      to: Array.isArray(options.to) ? options.to.join(', ') : options.to,
+      subject: options.subject,
+      text: options.text || '',
+      html: options.html || (options.text ? `<p style="white-space: pre-wrap;">${options.text}</p>` : '')
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log('[Email] Notification sent successfully:', info.messageId, 'to:', options.to);
+    return info;
+  }
+
+  // SMTP / POP3 メールサーバー設定情報取得 API
+  app.get(['/api/email/config', '/api/email/config/'], (req, res) => {
+    res.json({
+      host: smtpConfig.host,
+      port: smtpConfig.port,
+      secure: smtpConfig.secure,
+      user: smtpConfig.auth.user,
+      fromEmail: smtpFromEmail,
+      fromName: smtpFromName,
+      isConfigured: !!(smtpConfig.host && smtpConfig.auth.user),
+      inbound: {
+        host: pop3Config.host,
+        port: pop3Config.port,
+        secure: pop3Config.secure,
+        user: pop3Config.user,
+        defaultTag: pop3Config.defaultTag,
+        deleteAfterImport: pop3Config.deleteAfterImport,
+        checkIntervalSec: pop3Config.checkIntervalSec,
+        status: pop3State.lastCheckStatus,
+        lastCheckedAt: pop3State.lastCheckedAt,
+        totalImportedCount: pop3State.totalImportedCount
+      }
+    });
+  });
+
+  // 汎用メール送信 API (GET / POST 両対応)
+  app.all(['/api/email/send', '/api/email/send/'], async (req, res) => {
+    try {
+      const to = req.body?.to || req.query?.to;
+      const subject = req.body?.subject || req.query?.subject;
+      const text = req.body?.text || req.query?.text;
+      const html = req.body?.html || req.query?.html;
+
+      if (!to || !subject) {
+        return res.status(400).json({ error: '宛先 (to) および件名 (subject) は必須です。POST (JSON) または GET (?to=...&subject=...) で送信してください。' });
+      }
+      const info = await sendEmailNotification({ to, subject, text, html });
+      res.json({ success: true, messageId: info.messageId, message: 'メールを正常に送信しました。' });
+    } catch (err: any) {
+      console.error('[Email] Send error:', err);
+      res.status(500).json({ error: err.message || 'メールの送信に失敗しました。' });
+    }
+  });
+
+  // テストメール送信 API (GET / POST 両対応)
+  app.all(['/api/email/test', '/api/email/test/'], async (req, res) => {
+    try {
+      const to = req.body?.to || req.query?.to;
+      const recipientName = req.body?.recipientName || req.query?.recipientName;
+      const targetUser = req.body?.targetUser || req.query?.targetUser;
+
+      if (!to) {
+        return res.status(400).json({
+          error: '送信先のメールアドレスを指定してください。',
+          usage: 'POST (JSON: { "to": "user@example.com" }) または GET (?to=user@example.com) でアクセス可能です。'
+        });
+      }
+
+      const nameStr = recipientName ? `${recipientName} 様` : (targetUser?.name ? `${targetUser.name} 様` : '管理者 様');
+      const nowStr = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+
+      const subject = '【テストメール】寺岡オートドアSNS メール通知連携テスト';
+      const text = `${nameStr}\n\n寺岡オートドアSNS からのメール通知送信テストです。\n本メールを受信できている場合、SMTPメール通知機能（${smtpConfig.host}:${smtpConfig.port}）の設定および連携は正常に機能しています。\n\n送信日時: ${nowStr}\n差出人: ${smtpFromFormatted}\n送信先: ${to}`;
+      const html = `
+        <div style="font-family: sans-serif; padding: 24px; line-height: 1.6; color: #1e293b; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+          <div style="background-color: #2563eb; color: #ffffff; padding: 12px 16px; border-radius: 8px 8px 0 0; margin: -24px -24px 20px -24px;">
+            <h2 style="margin: 0; font-size: 18px; font-weight: 600;">📧 寺岡オートドアSNS メール通知テスト</h2>
+          </div>
+          <p style="font-size: 15px; font-weight: 600; color: #0f172a;">${nameStr}</p>
+          <p>寺岡オートドアSNSシステムからのテストメール送信通知です。</p>
+          <p>このメールが届いている場合、設定されたSMTPメールサーバー（<b>${smtpConfig.host}:${smtpConfig.port}</b>）との連携は正常に完了しています。</p>
+          <div style="background-color: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid #f1f5f9; margin: 20px 0;">
+            <p style="margin: 0 0 8px 0; font-size: 13px; font-weight: 600; color: #475569;">【通信設定詳細】</p>
+            <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #64748b;">
+              <li><b>送信日時:</b> ${nowStr}</li>
+              <li><b>SMTP サーバー:</b> ${smtpConfig.host}:${smtpConfig.port} (認証ユーザー: ${smtpConfig.auth.user})</li>
+              <li><b>差出人アドレス:</b> ${smtpFromFormatted}</li>
+              <li><b>テスト送信先:</b> ${to}</li>
+            </ul>
+          </div>
+          <p style="font-size: 12px; color: #94a3b8; margin-bottom: 0;">※本メールはシステムテスト目的で自動配信されています。返信はできません。</p>
+        </div>
+      `;
+
+      const info = await sendEmailNotification({ to, subject, text, html });
+      res.json({
+        success: true,
+        messageId: info.messageId,
+        message: `${to} へテストメールを正常に送信しました。`
+      });
+    } catch (err: any) {
+      console.error('[Email] Test email error:', err);
+      res.status(500).json({ error: err.message || 'テストメールの送信に失敗しました。' });
+    }
+  });
+
+  // 安否確認・通知テストメール送信 API (/api/notifications/test-email)
+  app.post('/api/notifications/test-email', async (req, res) => {
+    try {
+      const { to, subject, text, html } = req.body || {};
+      if (!to) {
+        return res.status(400).json({ error: '送信先アドレス (to) を指定してください' });
+      }
+
+      const testSubject = subject || '【寺岡オートドアSNS】安否確認テスト通知';
+      const testText = text || 'これは寺岡オートドアSNS 安否確認システムからのテストメール通知です。正常に受信できていれば、メール配信連携は完了しています。';
+
+      try {
+        const info = await sendEmailNotification({
+          to,
+          subject: testSubject,
+          text: testText,
+          html
+        });
+        return res.json({ success: true, message: `${to} へテストメールを送信しました`, messageId: info?.messageId });
+      } catch (smtpErr: any) {
+        console.warn('[Email] SMTP未接続または送信エラーのためシミュレーションモードで完了:', smtpErr.message);
+        // 本番環境外・SMTP非導通環境でもUIが停止しないようシミュレーション結果を返す
+        return res.json({
+          success: true,
+          simulated: true,
+          message: `${to} 宛てのテスト配信内容を検証しました (SMTP未接続/テスト環境)`,
+          details: smtpErr.message
+        });
+      }
+    } catch (err: any) {
+      console.error('Error in /api/notifications/test-email:', err);
+      res.status(500).json({ error: 'テストメール処理中にエラーが発生しました', details: err.message });
+    }
+  });
+
+  // 外部ファイル（NAS共有用）ストレージディレクトリ
+  const externalFilesDir = path.join(process.cwd(), 'data', 'external-files');
+  if (!fs.existsSync(externalFilesDir)) {
+    fs.mkdirSync(externalFilesDir, { recursive: true });
+  }
+
+  // NAS 02-施工図PDF ベースディレクトリ (デフォルト: data/drawings または環境変数 DRAWINGS_DIR)
+  const drawingsBaseDir = process.env.DRAWINGS_DIR || path.join(process.cwd(), 'data', 'drawings');
+  if (!fs.existsSync(drawingsBaseDir)) {
+    try {
+      fs.mkdirSync(drawingsBaseDir, { recursive: true });
+    } catch (_) {}
+  }
+
+  // パス正規化ヘルパー: Windows UNCパス (/volume1/Teraoka-Sekkei/share/02-施工図PDF/現場A/平面図.pdf) 等から相対パスを抽出
+  function sanitizeDrawingRelPath(rawPath: string): string {
+    if (!rawPath || typeof rawPath !== 'string') return '';
+    let cleaned = rawPath.trim().replace(/^["']|["']$/g, '').replace(/\\/g, '/');
+    
+    cleaned = cleaned.replace(/^(?:\\\\|\/\/)[^\/]+\/(?:Teraoka-Sekkei\/)?(?:share\/)?02-施工図PDF\/?/i, '');
+    cleaned = cleaned.replace(/^(?:\\\\|\/\/)[^\/]+\/[^\/]+\/02-施工図PDF\/?/i, '');
+    cleaned = cleaned.replace(/^(?:\/|\\\\)volume1\/Teraoka-Sekkei\/share\/02-施工図PDF\/?/i, '');
+    cleaned = cleaned.replace(/^[a-zA-Z]:\/(?:02-施工図PDF\/)?/i, '');
+    cleaned = cleaned.replace(/^\/?02-施工図PDF\//i, '');
+    cleaned = cleaned.replace(/^\/+/g, '');
+    
+    return cleaned;
+  }
+
+  // 掲示板添付ファイル用ストレージディレクトリ（/app/bulletinsfiles または ./bulletinsfiles）
+  const bulletinsFilesDir = process.env.BULLETINS_FILES_DIR ||
+    (fs.existsSync('/app/bulletinsfiles') ? '/app/bulletinsfiles' : path.join(process.cwd(), 'bulletinsfiles'));
+
+  if (!fs.existsSync(bulletinsFilesDir)) {
+    try {
+      fs.mkdirSync(bulletinsFilesDir, { recursive: true });
+    } catch (e) {
+      console.error('掲示板添付用ディレクトリの作成に失敗しました:', e);
+    }
+  }
+
+  // 静的ファイル配信
+  const publicDir = path.join(process.cwd(), 'public');
+  // 静的ファイル配信オプション（30日間ブラウザキャッシュ）
+  const staticFileOptions = {
+    maxAge: '30d',
+    immutable: true,
+    setHeaders: (res: any) => {
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Cache-Control', 'private, max-age=2592000, immutable');
+    }
+  };
+
+  const uploadsDir = path.join(process.cwd(), 'uploads');
+  if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir, { recursive: true });
+  }
+  app.use('/public', express.static(publicDir, { maxAge: '7d' }));
+  app.use(['/uploads', '/api/uploads'], requireApiAuth, express.static(uploadsDir, staticFileOptions));
+  app.use('/stamps', express.static(path.join(publicDir, 'stamps'), staticFileOptions));
+  app.use('/api/stamps-static', requireApiAuth, express.static(path.join(publicDir, 'stamps'), staticFileOptions));
+  app.use('/external-files', requireApiAuth, express.static(externalFilesDir, staticFileOptions));
+  app.use('/bulletinsfiles', requireApiAuth, express.static(bulletinsFilesDir, staticFileOptions));
+  app.use('/api/bulletinsfiles', requireApiAuth, express.static(bulletinsFilesDir, staticFileOptions));
+
+  // スタンプ管理APIルーター
+  app.use('/api/stamps', stampsRouter);
+
+  // アクセス・操作ログ管理APIルーター
+  app.use('/api/logs', logsRouter);
+  app.use('/api/access-logs', logsRouter);
+
+  // 現場管理・施工スケジュール・在庫DB部品連携APIルーター
+  app.use(['/api/sites', '/api/genba-sites'], sitesRouter);
+
+  // 安否確認・災害速報・連送抑制APIルーター
+  app.use(['/api/safety-events', '/api/safety/events', '/api/safety'], safetyRouter);
+
+  // 資産管理・動的スキーマ・点検/入替アラート・履歴APIルーター（/api 汎用ルーターより先にマウント）
+  app.use(['/api/assets', '/api/asset-management'], assetsRouter);
+
+  // プロジェクト・Todo・資料メモボードAPIルーター（/api 汎用ルーターより先にマウント）
+  app.use(['/api/projects', '/api/project-boards', '/api/tasks'], projectsRouter);
+
+  // 文書管理・フォルダ機能APIルーター
+  const documentsFilesDir = path.join(uploadsDir, 'documents');
+  if (!fs.existsSync(documentsFilesDir)) {
+    fs.mkdirSync(documentsFilesDir, { recursive: true });
+  }
+  app.use(['/uploads/documents', '/api/uploads/documents', '/api/documents/uploads'], requireApiAuth, express.static(documentsFilesDir, staticFileOptions));
+  app.use(['/api/documents', '/api/document', '/api'], documentsRouter);
+
+  // 日程調整APIルーター
+  app.use(['/api/schedule-polls', '/api/schedule/polls', '/api/polls'], schedulePollsRouter);
+  app.use('/api', schedulePollsRouter);
+
+  // 点検・写真報告書APIルーター
+  const photoReportsDir = path.join(uploadsDir, 'photo-reports');
+  if (!fs.existsSync(photoReportsDir)) {
+    fs.mkdirSync(photoReportsDir, { recursive: true });
+  }
+  app.use(['/uploads/photo-reports', '/api/uploads/photo-reports', '/api/photo-reports/image', '/api/photo-reports/file'], requireApiAuth, express.static(photoReportsDir, staticFileOptions));
+  app.use(['/api/photo-reports', '/api/inspection-photo-reports'], photoReportsRouter);
+  app.use('/api', photoReportsRouter);
+
+  // チャット内クイズ・アンケート出題＆回答APIルーター
+  app.use(['/api/chats/quizzes', '/api/chat-quizzes'], chatQuizzesRouter);
+  app.use('/api', chatQuizzesRouter);
+
+  // 点検報告書・CRM点検データ・点検予定下書きAPIルーター
+  app.use(['/api/inspections', '/api/inspection', '/api'], inspectionsRouter);
+
+  // カレンダー行事・予定・現場工事スケジュールAPIルーター
+  app.use(['/api/events', '/api'], eventsRouter);
+
+  // PWA・静的アイコン・マニフェスト等の明示的エンドポイント（開発/本番問わずバイナリとして確実に返却）
+  const publicStaticFiles = ['pwa-192x192.png', 'pwa-512x512.png', 'icon.svg', 'manifest.json'];
+  publicStaticFiles.forEach(fileName => {
+    const handleStaticAsset = (req: express.Request, res: express.Response) => {
+      const filePath = path.join(publicDir, fileName);
+      if (fs.existsSync(filePath)) {
+        if (fileName.endsWith('.png')) {
+          res.setHeader('Content-Type', 'image/png');
+        } else if (fileName.endsWith('.svg')) {
+          res.setHeader('Content-Type', 'image/svg+xml');
+        } else if (fileName.endsWith('.json')) {
+          res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+        }
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        if (req.query.download === '1') {
+          return res.download(filePath, fileName);
+        }
+        res.sendFile(filePath);
+      } else {
+        res.status(404).send('Not found');
+      }
+    };
+    app.get(`/${fileName}`, handleStaticAsset);
+    app.get(`/public/${fileName}`, handleStaticAsset);
+    app.get(`/po/${fileName}`, handleStaticAsset);
+    app.get(`/po/public/${fileName}`, handleStaticAsset);
+    app.get(`/teranago-sns-new/${fileName}`, handleStaticAsset);
+    app.get(`/teranago-sns-new/public/${fileName}`, handleStaticAsset);
+  });
+
+  // 公開ファイル直接ダウンロード用 API（パストラバーサル厳格検証）
+  app.get('/api/public-files/download/:filename', (req, res) => {
+    const rawFilename = req.params.filename;
+    if (!isSafeFilename(rawFilename)) {
+      return res.status(400).json({ error: '不正なファイル名が指定されました' });
+    }
+    const fileName = path.basename(decodeURIComponent(rawFilename));
+    const filePath = resolveSafeChildPath(publicDir, fileName);
+    if (!filePath) {
+      return res.status(400).json({ error: '不正なファイルパスです' });
+    }
+    if (fs.existsSync(filePath)) {
+      res.download(filePath, fileName);
+    } else {
+      res.status(404).json({ error: 'ファイルが見つかりません' });
+    }
+  });
+
+  // ==========================================
+  // 掲示板添付ファイルアップロード API (/app/bulletinsfiles へ保存)
+  // ==========================================
+  const bulletinsStorage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      if (!fs.existsSync(bulletinsFilesDir)) {
+        fs.mkdirSync(bulletinsFilesDir, { recursive: true });
+      }
+      cb(null, bulletinsFilesDir);
+    },
+    filename: function (req, file, cb) {
+      let originalName = file.originalname;
+      try {
+        originalName = Buffer.from(file.originalname, 'latin1').toString('utf8');
+      } catch (e) {
+        originalName = file.originalname;
+      }
+      const ext = path.extname(originalName);
+      const baseName = path.basename(originalName, ext);
+      const timeStamp = Date.now();
+      const safeFilename = `${timeStamp}_${baseName}${ext}`;
+      cb(null, safeFilename);
+    }
+  });
+  const uploadBulletins = multer({ storage: bulletinsStorage });
+
+  const handleBulletinUpload = (req: express.Request, res: express.Response) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'ファイルが選択されていません。' });
+      }
+      const fileUrl = `/bulletinsfiles/${encodeURIComponent(req.file.filename)}`;
+      res.json({
+        message: 'アップロード成功',
+        url: fileUrl,
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        size: req.file.size
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  app.post('/api/upload', uploadBulletins.single('file'), handleBulletinUpload);
+  app.post('/api/bulletins/upload', uploadBulletins.single('file'), handleBulletinUpload);
+
+  // 掲示板添付ファイル一覧取得 API（非同期 fs.promises でイベントループのブロッキングを防止）
+  app.get('/api/bulletinsfiles/list', async (req, res) => {
+    try {
+      if (!fs.existsSync(bulletinsFilesDir)) {
+        return res.json([]);
+      }
+      const filenames = await fs.promises.readdir(bulletinsFilesDir);
+      const items = await Promise.all(
+        filenames.map(async (filename) => {
+          const filePath = path.join(bulletinsFilesDir, filename);
+          try {
+            const stat = await fs.promises.stat(filePath);
+            if (stat.isDirectory()) return null;
+
+            const ext = path.extname(filename).toLowerCase().replace('.', '');
+            const displayName = filename.includes('_') ? filename.substring(filename.indexOf('_') + 1) : filename;
+
+            return {
+              name: displayName,
+              rawFilename: filename,
+              path: filename,
+              url: `/bulletinsfiles/${encodeURIComponent(filename)}`,
+              size: stat.size,
+              mtime: stat.mtime.toISOString(),
+              isDirectory: false,
+              extension: ext,
+              source: 'bulletin'
+            };
+          } catch (e) {
+            return null;
+          }
+        })
+      );
+
+      const result = items.filter(Boolean) as any[];
+      result.sort((a, b) => new Date(b.mtime).getTime() - new Date(a.mtime).getTime());
+
+      res.json(result);
+    } catch (err: any) {
+      console.error('掲示板添付ファイル一覧取得エラー:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/bulletins/file/:filename', (req, res) => {
+    try {
+      const rawParam = req.params.filename;
+      if (!isSafeFilename(rawParam)) {
+        return res.status(400).json({ error: '不正なファイル名が指定されました' });
+      }
+      const filename = path.basename(decodeURIComponent(rawParam));
+      const safePath = resolveSafeChildPath(bulletinsFilesDir, filename);
+      if (!safePath) {
+        return res.status(400).json({ error: '不正なファイルパスです' });
+      }
+      if (fs.existsSync(safePath)) {
+        if (req.query.download === '1') {
+          return res.download(safePath, filename);
+        }
+        res.sendFile(safePath);
+      } else {
+        res.status(404).json({ error: '添付ファイルが見つかりません' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板添付ファイルの削除 API
+  app.delete('/api/bulletins/file', (req, res) => {
+    try {
+      const fileUrl = (req.query.fileUrl || req.body?.fileUrl || '') as string;
+      const filenameParam = (req.query.filename || req.body?.filename || '') as string;
+
+      let filename = filenameParam;
+      if (!filename && fileUrl) {
+        const urlParts = fileUrl.split('/bulletinsfiles/');
+        if (urlParts.length > 1) {
+          filename = decodeURIComponent(urlParts[urlParts.length - 1].split('?')[0]);
+        } else {
+          filename = path.basename(fileUrl.split('?')[0]);
+        }
+      }
+
+      if (!filename || !isSafeFilename(filename)) {
+        return res.status(400).json({ error: '有効なファイル名が指定されていません。' });
+      }
+
+      const safeFilename = path.basename(filename);
+      const targetPath = resolveSafeChildPath(bulletinsFilesDir, safeFilename);
+      if (!targetPath) {
+        return res.status(400).json({ error: '不正なファイルパスです。' });
+      }
+
+      if (fs.existsSync(targetPath)) {
+        fs.unlinkSync(targetPath);
+        console.log(`[Bulletins] 添付ファイルを削除しました: ${targetPath}`);
+        return res.json({ message: '添付ファイルを削除しました', filename: safeFilename });
+      } else {
+        return res.status(404).json({ error: '対象の添付ファイルが存在しません', filename: safeFilename });
+      }
+    } catch (err: any) {
+      console.error('添付ファイル削除エラー:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板添付ファイルの一括削除 API
+  app.post('/api/bulletins/delete-multiple', (req, res) => {
+    try {
+      const fileUrls: string[] = req.body?.fileUrls || [];
+      const deleted: string[] = [];
+      const errors: string[] = [];
+
+      fileUrls.forEach(fileUrl => {
+        if (!fileUrl) return;
+        let filename = '';
+        const urlParts = fileUrl.split('/bulletinsfiles/');
+        if (urlParts.length > 1) {
+          filename = decodeURIComponent(urlParts[urlParts.length - 1].split('?')[0]);
+        } else {
+          filename = path.basename(fileUrl.split('?')[0]);
+        }
+
+        if (filename && isSafeFilename(filename)) {
+          const safeFilename = path.basename(filename);
+          const targetPath = resolveSafeChildPath(bulletinsFilesDir, safeFilename);
+          if (targetPath && fs.existsSync(targetPath)) {
+            try {
+              fs.unlinkSync(targetPath);
+              deleted.push(safeFilename);
+            } catch (e: any) {
+              errors.push(`${safeFilename}: ${e.message}`);
+            }
+          }
+        }
+      });
+
+      res.json({ message: '添付ファイル一括削除完了', deleted, errors });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 外部NAS同期・外部ファイル連携用 API
+  // ==========================================
+  const externalStorage = multer.diskStorage({
+    destination: function (req, file, cb) {
+      const rawFolder = typeof req.body.folder === 'string' ? req.body.folder.trim() : '';
+      if (rawFolder) {
+        const resolvedFolder = resolveSafeChildPath(externalFilesDir, rawFolder);
+        if (!resolvedFolder) {
+          return cb(new Error('不正なフォルダパスが指定されました'), '');
+        }
+        if (!fs.existsSync(resolvedFolder)) {
+          fs.mkdirSync(resolvedFolder, { recursive: true });
+        }
+        return cb(null, resolvedFolder);
+      }
+      if (!fs.existsSync(externalFilesDir)) {
+        fs.mkdirSync(externalFilesDir, { recursive: true });
+      }
+      cb(null, externalFilesDir);
+    },
+    filename: function (req, file, cb) {
+      let originalName = file.originalname;
+      try {
+        originalName = Buffer.from(file.originalname, 'latin1').toString('utf8');
+      } catch (e) {
+        originalName = file.originalname;
+      }
+      const safeBaseName = path.basename(originalName);
+      if (!isSafeFilename(safeBaseName)) {
+        return cb(new Error('不正なファイル名です'), '');
+      }
+      cb(null, safeBaseName);
+    }
+  });
+  const uploadExternal = multer({ storage: externalStorage });
+
+  app.post('/api/external-files/upload', uploadExternal.single('file'), (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'ファイルが選択されていません。' });
+      }
+      const relPath = req.body.folder ? (req.body.folder + '/' + req.file.filename).replace(/\\/g, '/') : req.file.filename;
+      res.json({
+        message: 'アップロード完了しました。',
+        file: {
+          name: req.file.filename,
+          path: relPath,
+          url: '/api/external-files/serve?path=' + encodeURIComponent(relPath),
+          size: req.file.size,
+          mtime: new Date().toISOString(),
+          isDirectory: false,
+          extension: path.extname(req.file.filename).replace('.', '').toLowerCase()
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  function getAllFilesRecursive(dirPath: string, relativeRoot = ""): any[] {
+    let results: any[] = [];
+    if (!fs.existsSync(dirPath)) return results;
+    try {
+      const list = fs.readdirSync(dirPath);
+      list.forEach((file) => {
+        if (file.startsWith('.') || file === '@eaDir' || file === 'thumbs.db') return;
+        
+        const filePath = path.join(dirPath, file);
+        const relPath = relativeRoot ? path.join(relativeRoot, file) : file;
+        const stat = fs.statSync(filePath);
+        
+        if (stat.isDirectory()) {
+          results.push({
+            name: file,
+            path: relPath.replace(/\\/g, '/'),
+            size: 0,
+            mtime: stat.mtime,
+            isDirectory: true,
+            extension: ''
+          });
+          results = results.concat(getAllFilesRecursive(filePath, relPath));
+        } else {
+          const ext = path.extname(file).replace('.', '').toLowerCase();
+          results.push({
+            name: file,
+            path: relPath.replace(/\\/g, '/'),
+            url: '/api/external-files/serve?path=' + encodeURIComponent(relPath.replace(/\\/g, '/')),
+            size: stat.size,
+            mtime: stat.mtime,
+            isDirectory: false,
+            extension: ext
+          });
+        }
+      });
+    } catch (e) {
+      console.error('Error scanning folder:', e);
+    }
+    return results;
+  }
+
+  app.get('/api/external-files/list', (req, res) => {
+    try {
+      const allFiles = getAllFilesRecursive(externalFilesDir);
+      const query = typeof req.query.q === 'string' ? req.query.q.toLowerCase().trim() : '';
+      
+      if (query) {
+        const filtered = allFiles.filter(f => 
+          f.name.toLowerCase().includes(query) || 
+          f.path.toLowerCase().includes(query)
+        );
+        return res.json(filtered);
+      }
+      
+      res.json(allFiles);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/external-files/serve', (req, res) => {
+    try {
+      const targetRelPath = req.query.path;
+      if (!targetRelPath || typeof targetRelPath !== 'string') {
+        return res.status(400).json({ error: 'ファイルパスが指定されていません' });
+      }
+      const safePath = resolveSafeChildPath(externalFilesDir, targetRelPath);
+      if (!safePath) {
+        return res.status(400).json({ error: '不正なファイルパスが指定されました' });
+      }
+      
+      if (fs.existsSync(safePath) && !fs.statSync(safePath).isDirectory()) {
+        const filename = path.basename(safePath);
+        if (req.query.download === '1') {
+          return res.download(safePath, filename);
+        }
+        res.sendFile(safePath);
+      } else {
+        res.status(404).json({ error: 'ファイルが見つかりません' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/external-files/folder', (req, res) => {
+    try {
+      const { folder } = req.body;
+      if (!folder || typeof folder !== 'string') {
+        return res.status(400).json({ error: 'フォルダ名が指定されていません' });
+      }
+      const safePath = resolveSafeChildPath(externalFilesDir, folder);
+      if (!safePath) {
+        return res.status(400).json({ error: '不正なフォルダ名が指定されました' });
+      }
+      const sanitizedPath = path.relative(path.resolve(externalFilesDir), safePath).replace(/\\/g, '/');
+      if (!fs.existsSync(safePath)) {
+        fs.mkdirSync(safePath, { recursive: true });
+        res.json({ message: 'フォルダを作成しました', path: sanitizedPath });
+      } else {
+        res.status(400).json({ error: '既に同名のフォルダ・ファイルが存在します' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // NAS 施工図PDF サーブ用 API
+  app.get(['/api/sites/drawings/serve', '/api/drawings/serve'], (req, res) => {
+    try {
+      const rawPath = req.query.path;
+      if (!rawPath || typeof rawPath !== 'string') {
+        return res.status(400).json({ error: 'path パラメータが必要です' });
+      }
+
+      const relPath = sanitizeDrawingRelPath(rawPath);
+      if (!relPath) {
+        return res.status(400).json({ error: '有効なファイルパスを指定してください' });
+      }
+
+      const safePath = path.normalize(relPath).replace(/^(\.\.[\/\\])+/, '');
+      const absolutePath = path.join(drawingsBaseDir, safePath);
+
+      if (!absolutePath.startsWith(path.resolve(drawingsBaseDir))) {
+        return res.status(403).json({ error: '許可されていないパスへのアクセスです' });
+      }
+
+      if (!fs.existsSync(absolutePath) || fs.statSync(absolutePath).isDirectory()) {
+        return res.status(404).json({
+          error: '指定された施工図PDFが見つかりませんでした',
+          path: relPath,
+          drawingsBaseDir
+        });
+      }
+
+      const ext = path.extname(absolutePath).toLowerCase();
+      let contentType = 'application/octet-stream';
+      if (ext === '.pdf') contentType = 'application/pdf';
+      else if (ext === '.jpg' || ext === '.jpeg') contentType = 'image/jpeg';
+      else if (ext === '.png') contentType = 'image/png';
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(path.basename(absolutePath))}"`);
+      
+      const stream = fs.createReadStream(absolutePath);
+      stream.pipe(res);
+    } catch (err: any) {
+      res.status(500).json({ error: '施工図PDFの配信に失敗しました', details: err.message });
+    }
+  });
+
+  // NAS 施工図PDF パス検証用 API
+  app.get(['/api/sites/drawings/validate', '/api/drawings/validate'], (req, res) => {
+    try {
+      const rawPath = String(req.query.path || '').trim();
+      if (!rawPath) {
+        return res.status(400).json({ success: false, valid: false, error: 'ファイルパスが指定されていません。' });
+      }
+
+      const normalizedRaw = rawPath.replace(/\\/g, '/');
+      const fileName = normalizedRaw.split('/').pop() || rawPath;
+      const ext = path.extname(fileName).toLowerCase();
+
+      // ① 拡張子チェック (PDF以外は拒否)
+      if (ext !== '.pdf') {
+        return res.status(400).json({
+          success: false,
+          valid: false,
+          error: `【登録エラー】施工図はPDF形式（.pdf）のファイルのみ登録可能です。[対象: ${fileName}]`
+        });
+      }
+
+      // ② 所定のフォルダ (02-施工図PDF) チェック
+      const isWinAbsolutePath = /^(?:\\\\|\/\/|[a-zA-Z]:\/)/i.test(normalizedRaw);
+      if (isWinAbsolutePath && !/02-施工図PDF/i.test(normalizedRaw)) {
+        return res.status(400).json({
+          success: false,
+          valid: false,
+          error: `【登録エラー】所定のフォルダ（02-施工図PDF）以外のファイルは登録できません。[対象: ${fileName}]`
+        });
+      }
+
+      const relPath = sanitizeDrawingRelPath(rawPath);
+      if (!relPath) {
+        return res.status(400).json({
+          success: false,
+          valid: false,
+          error: `【登録エラー】有効な施工図パスを指定してください。[対象: ${rawPath}]`
+        });
+      }
+
+      const safePath = path.normalize(relPath).replace(/^(\.\.[\/\\])+/, '');
+      const absolutePath = path.join(drawingsBaseDir, safePath);
+
+      if (!absolutePath.startsWith(path.resolve(drawingsBaseDir))) {
+        return res.status(403).json({
+          success: false,
+          valid: false,
+          error: `【登録エラー】所定のフォルダ（02-施工図PDF）外のパス指定は許可されていません。`
+        });
+      }
+
+      if (fs.existsSync(absolutePath) && !fs.statSync(absolutePath).isDirectory()) {
+        return res.json({
+          success: true,
+          valid: true,
+          resolvedPath: relPath,
+          fileName: path.basename(absolutePath)
+        });
+      }
+
+      if (!relPath.includes('/')) {
+        let foundPath: string | null = null;
+        function findFileRecursively(dir: string, relPrefix = '') {
+          if (foundPath) return;
+          try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+              const entryRel = relPrefix ? `${relPrefix}/${entry.name}` : entry.name;
+              const fullEntry = path.join(dir, entry.name);
+              if (entry.isDirectory()) {
+                findFileRecursively(fullEntry, entryRel);
+              } else if (entry.isFile() && entry.name.toLowerCase() === fileName.toLowerCase()) {
+                foundPath = entryRel;
+                return;
+              }
+            }
+          } catch (_) {}
+        }
+
+        findFileRecursively(drawingsBaseDir);
+
+        if (foundPath) {
+          return res.json({
+            success: true,
+            valid: true,
+            resolvedPath: foundPath,
+            fileName: path.basename(foundPath)
+          });
+        }
+      }
+
+      return res.status(404).json({
+        success: false,
+        valid: false,
+        error: `【登録エラー】所定のフォルダ（02-施工図PDF）内に指定されたファイルが見つかりません。フォルダ名を含めたパス（例: フォルダ名/ファイル名.pdf）を指定するか、所定フォルダ内に配置してください。[対象: ${fileName}]`
+      });
+
+    } catch (err: any) {
+      return res.status(500).json({
+        success: false,
+        valid: false,
+        error: `施工図検証処理エラー: ${err.message}`
+      });
+    }
+  });
+
+  // 既読状態保存管理
+  const readStatusesPath = path.join(dataDir, 'read-statuses.json');
+  interface StoredReadStatus {
+    userId: string;
+    targetType: 'event' | 'topic' | 'memo' | 'workflow' | 'chat';
+    targetId: string;
+    readAt: string;
+  }
+
+  // ==========================================
+  // OGP (Open Graph Protocol) メタデータ取得 API
+  // ==========================================
+  const ogpCache = new Map<string, { data: any; timestamp: number }>();
+  const OGP_CACHE_TTL = 1000 * 60 * 60; // 1時間キャッシュ
+
+  function decodeHtmlEntities(str: string): string {
+    return str
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#039;/g, "'")
+      .replace(/&#x27;/g, "'")
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)))
+      .trim();
+  }
+
+  function isPrivateHost(hostname: string): boolean {
+    const lower = hostname.toLowerCase();
+    if (
+      lower === 'localhost' ||
+      lower === '127.0.0.1' ||
+      lower === '0.0.0.0' ||
+      lower === '::1' ||
+      lower.endsWith('.local') ||
+      lower.endsWith('.internal')
+    ) {
+      return true;
+    }
+    if (net.isIP(lower) === 4) {
+      const parts = lower.split('.').map(Number);
+      if (parts[0] === 10) return true;
+      if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+      if (parts[0] === 192 && parts[1] === 168) return true;
+      if (parts[0] === 169 && parts[1] === 254) return true;
+      if (parts[0] === 127) return true;
+    }
+    return false;
+  }
+
+  app.get('/api/ogp', async (req, res) => {
+    const rawUrl = req.query.url as string;
+    if (!rawUrl || typeof rawUrl !== 'string') {
+      return res.status(400).json({ error: 'URLが必要です' });
+    }
+
+    let targetUrl = rawUrl.trim();
+    if (!/^https?:\/\//i.test(targetUrl)) {
+      targetUrl = 'https://' + targetUrl;
+    }
+
+    // Check cache
+    const cached = ogpCache.get(targetUrl);
+    if (cached && Date.now() - cached.timestamp < OGP_CACHE_TTL) {
+      return res.json(cached.data);
+    }
+
+    try {
+      const parsedUrl = new URL(targetUrl);
+      const hostname = parsedUrl.hostname;
+
+      if (isPrivateHost(hostname)) {
+        return res.status(400).json({ error: 'プライベートIP・内部ネットワークへのURLアクセスはセキュリティ保護のため禁止されています (SSRF防御)' });
+      }
+
+      // Fetch with timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 4500);
+
+      const response = await fetch(targetUrl, {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+        },
+        redirect: 'follow',
+      });
+      clearTimeout(timeoutId);
+
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('text/html') && !contentType.includes('application/xhtml+xml')) {
+        const result = {
+          url: targetUrl,
+          hostname,
+          title: hostname,
+          description: '',
+          image: contentType.startsWith('image/') ? targetUrl : '',
+          siteName: hostname,
+          favicon: `https://www.google.com/s2/favicons?domain=${hostname}&sz=64`,
+        };
+        ogpCache.set(targetUrl, { data: result, timestamp: Date.now() });
+        return res.json(result);
+      }
+
+      const html = await response.text();
+
+      const getMetaContent = (propertyOrName: string) => {
+        const regex1 = new RegExp(`<meta[^>]+(?:property|name)=["']${propertyOrName}["'][^>]+content=["']([^"']*)["']`, 'i');
+        const regex2 = new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["']${propertyOrName}["']`, 'i');
+        const match = html.match(regex1) || html.match(regex2);
+        return match ? decodeHtmlEntities(match[1]) : '';
+      };
+
+      const titleMatch = html.match(/<title[^>]*>([^<]*)<\/title>/i);
+      const rawTitle = getMetaContent('og:title') || getMetaContent('twitter:title') || (titleMatch ? decodeHtmlEntities(titleMatch[1]) : '') || hostname;
+      const title = rawTitle.replace(/\s+/g, ' ').trim();
+
+      const description = (getMetaContent('og:description') || getMetaContent('twitter:description') || getMetaContent('description') || '').replace(/\s+/g, ' ').trim();
+      
+      let image = getMetaContent('og:image:secure_url') || getMetaContent('og:image') || getMetaContent('twitter:image') || '';
+      if (image && !/^https?:\/\//i.test(image)) {
+        try {
+          image = new URL(image, targetUrl).toString();
+        } catch {
+          // ignore
+        }
+      }
+
+      const siteName = getMetaContent('og:site_name') || hostname;
+
+      let favicon = '';
+      const iconMatch = html.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']*)["']/i) ||
+                         html.match(/<link[^>]+href=["']([^"']*)["'][^>]+rel=["'](?:shortcut )?icon["']/i);
+      if (iconMatch && iconMatch[1]) {
+        try {
+          favicon = new URL(iconMatch[1], targetUrl).toString();
+        } catch {
+          favicon = '';
+        }
+      }
+      if (!favicon) {
+        favicon = `https://www.google.com/s2/favicons?domain=${hostname}&sz=64`;
+      }
+
+      const result = {
+        url: targetUrl,
+        hostname,
+        title,
+        description,
+        image,
+        siteName,
+        favicon,
+      };
+
+      ogpCache.set(targetUrl, { data: result, timestamp: Date.now() });
+      res.json(result);
+    } catch (err: any) {
+      try {
+        const parsedUrl = new URL(targetUrl);
+        const fallback = {
+          url: targetUrl,
+          hostname: parsedUrl.hostname,
+          title: parsedUrl.hostname,
+          description: '',
+          image: '',
+          siteName: parsedUrl.hostname,
+          favicon: `https://www.google.com/s2/favicons?domain=${parsedUrl.hostname}&sz=64`,
+        };
+        ogpCache.set(targetUrl, { data: fallback, timestamp: Date.now() });
+        return res.json(fallback);
+      } catch {
+        return res.status(400).json({ error: '無効なURLです' });
+      }
+    }
+  });
+
+  function loadReadStatuses(): StoredReadStatus[] {
+    if (!fs.existsSync(readStatusesPath)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(readStatusesPath, 'utf8'));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveReadStatuses(items: StoredReadStatus[]) {
+    try {
+      fs.writeFileSync(readStatusesPath, JSON.stringify(items, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save read statuses:', e);
+    }
+  }
+
+  app.get('/api/read-statuses/:userId', (req, res) => {
+    try {
+      const { userId } = req.params;
+      const items = loadReadStatuses();
+      const userItems = items.filter((item) => item.userId === userId);
+
+      const readMap: Record<string, string[]> = {
+        event: [],
+        topic: [],
+        memo: [],
+        workflow: [],
+        chat: [],
+        report: [],
+        project: [],
+      };
+      const chatTimestamps: Record<string, string> = {};
+
+      userItems.forEach((row) => {
+        if (readMap[row.targetType]) {
+          readMap[row.targetType].push(row.targetId);
+        }
+        if (row.targetType === 'chat' && row.readAt) {
+          chatTimestamps[row.targetId] = row.readAt;
+        }
+      });
+
+      res.json({ ...readMap, chatTimestamps });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/read-statuses', (req, res) => {
+    try {
+      const { userId, targetType, targetId, isRead } = req.body;
+      if (!userId || !targetType || !targetId) {
+        return res.status(400).json({ error: 'パラメータが不足しています' });
+      }
+
+      let items = loadReadStatuses();
+      if (isRead !== false) {
+        const existing = items.find((i) => i.userId === userId && i.targetType === targetType && i.targetId === targetId);
+        if (!existing) {
+          items.push({
+            userId,
+            targetType,
+            targetId,
+            readAt: new Date().toISOString(),
+          });
+        } else {
+          existing.readAt = new Date().toISOString();
+        }
+        saveReadStatuses(items);
+      } else {
+        items = items.filter((i) => !(i.userId === userId && i.targetType === targetType && i.targetId === targetId));
+        saveReadStatuses(items);
+      }
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // チャット機能 API (ローカルJSON永続化)
+  // ==========================================
+  const chatRoomsPath = path.join(dataDir, 'chat-rooms.json');
+  const chatQuizzesPath = path.join(dataDir, 'chat-quizzes.json');
+  const chatQuizAnswersPath = path.join(dataDir, 'chat-quiz-answers.json');
+
+  function loadChatRooms(): any[] {
+    if (!fs.existsSync(chatRoomsPath)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(chatRoomsPath, 'utf8'));
+    } catch {
+      return [];
+    }
+  }
+  function saveChatRooms(rooms: any[]) {
+    try {
+      fs.writeFileSync(chatRoomsPath, JSON.stringify(rooms, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save chat rooms:', e);
+    }
+  }
+
+  function enrichLocalMessagesWithQuizzes(messages: any[], viewerUserId: string): any[] {
+    if (!Array.isArray(messages) || messages.length === 0) return messages;
+    const hasQuizMsg = messages.some(
+      (m) => m && (m.type === 'quiz' || m.quizId || (typeof m.id === 'string' && m.id.startsWith('m_quiz_')))
+    );
+    if (!hasQuizMsg) return messages;
+
+    let localQuizzes: any[] = [];
+    let localAnswers: any[] = [];
+    try {
+      if (fs.existsSync(chatQuizzesPath)) {
+        localQuizzes = JSON.parse(fs.readFileSync(chatQuizzesPath, 'utf8'));
+      }
+      if (fs.existsSync(chatQuizAnswersPath)) {
+        localAnswers = JSON.parse(fs.readFileSync(chatQuizAnswersPath, 'utf8'));
+      }
+    } catch (_) {}
+
+    const quizByIdMap = new Map<string, any>();
+    const quizByMsgIdMap = new Map<string, any>();
+    for (const q of (Array.isArray(localQuizzes) ? localQuizzes : [])) {
+      if (q && q.id) {
+        quizByIdMap.set(String(q.id), q);
+        if (q.messageId) quizByMsgIdMap.set(String(q.messageId), q);
+      }
+    }
+
+    const viewerIdStr = viewerUserId ? String(viewerUserId) : '';
+
+    return messages.map((m) => {
+      if (!m || !(m.type === 'quiz' || m.quizId || (typeof m.id === 'string' && m.id.startsWith('m_quiz_')))) {
+        return m;
+      }
+      const quiz =
+        (m.quizId && quizByIdMap.get(String(m.quizId))) ||
+        quizByMsgIdMap.get(String(m.id)) ||
+        quizByIdMap.get(String(m.id)) ||
+        m.quiz;
+      if (!quiz) return m;
+
+      const qId = String(quiz.id);
+      const answers = (Array.isArray(localAnswers) ? localAnswers : []).filter(
+        (a) => a && String(a.quizId) === qId
+      );
+      const options = Array.isArray(quiz.options) ? quiz.options : [];
+      const myAnswer = viewerIdStr ? answers.find((a) => String(a.userId) === viewerIdStr) : null;
+      const hasAnswered = Boolean(myAnswer);
+      const isAuthor = Boolean(viewerIdStr && String(quiz.createdById) === viewerIdStr);
+      const canSeeAnswers = hasAnswered || isAuthor;
+      const totalAnswers = answers.length;
+
+      const results = options.map((opt: any) => {
+        const optAnswers = answers.filter((a) => String(a.selectedOptionId) === String(opt.id));
+        const count = optAnswers.length;
+        const percent = totalAnswers > 0 ? Math.round((count / totalAnswers) * 100) : 0;
+        const voters = optAnswers.map((a) => ({
+          userId: String(a.userId),
+          userName: a.userName || 'メンバー',
+          userAvatar: a.userAvatar || '',
+          userDepartment: a.userDepartment || '',
+          answeredAt: String(a.answeredAt || ''),
+        }));
+        return {
+          id: opt.id,
+          text: opt.text,
+          count: canSeeAnswers ? count : 0,
+          percent: canSeeAnswers ? percent : 0,
+          voters: canSeeAnswers ? voters : [],
+        };
+      });
+
+      return {
+        ...m,
+        type: 'quiz',
+        quizId: qId,
+        quiz: {
+          id: qId,
+          messageId: String(quiz.messageId || m.id || ''),
+          roomId: String(quiz.roomId || m.roomId || ''),
+          question: quiz.question || '',
+          options,
+          correctOptionId: canSeeAnswers ? (quiz.correctOptionId || null) : null,
+          isSurvey: Boolean(quiz.isSurvey),
+          explanation: canSeeAnswers ? (quiz.explanation || '') : null,
+          createdById: String(quiz.createdById || ''),
+          createdByName: quiz.createdByName || '出題者',
+          createdAt: String(quiz.createdAt || m.createdAt || ''),
+          hasAnswered,
+          myAnswerOptionId: myAnswer ? String(myAnswer.selectedOptionId) : null,
+          totalAnswers,
+          results: canSeeAnswers
+            ? results
+            : results.map((r: any) => ({ id: r.id, text: r.text, count: 0, percent: 0, voters: [] })),
+          viewerUserId: viewerIdStr,
+        },
+      };
+    });
+  }
+
+  app.get(['/api/chats', '/api/chats/rooms'], (req, res) => {
+    try {
+      const viewerUserId = req.query.userId ? String(req.query.userId) : '';
+      const allMessages = req.query.allMessages === 'true';
+      const parsedLimit = parseInt(String(req.query.msgLimit || '50'), 10);
+      const msgLimit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 500) : 50;
+
+      const rooms = loadChatRooms().map((r: any) => {
+        const allMsgs = Array.isArray(r.messages) ? r.messages : [];
+        const totalMessagesCount = allMsgs.length;
+        const slicedMsgs = allMessages ? allMsgs : allMsgs.slice(-msgLimit);
+        const enrichedMsgs = enrichLocalMessagesWithQuizzes(slicedMsgs, viewerUserId);
+        return {
+          ...r,
+          messages: enrichedMsgs,
+          totalMessagesCount,
+          hasMoreMessages: totalMessagesCount > slicedMsgs.length
+        };
+      });
+      res.json(rooms);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get(['/api/chats/:roomId/messages', '/api/chats/rooms/:roomId/messages'], (req, res) => {
+    try {
+      const { roomId } = req.params;
+      const beforeStr = req.query.before ? String(req.query.before) : null;
+      const viewerUserId = req.query.userId ? String(req.query.userId) : '';
+      const parsedLimit = parseInt(String(req.query.limit || '50'), 10);
+      const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 200) : 50;
+
+      const rooms = loadChatRooms();
+      const room = rooms.find((r: any) => String(r.id) === String(roomId));
+      if (!room || !Array.isArray(room.messages)) {
+        return res.json({ roomId: String(roomId), messages: [], hasMore: false });
+      }
+
+      const beforeTime = beforeStr ? new Date(beforeStr).getTime() : NaN;
+      const filtered = !isNaN(beforeTime)
+        ? room.messages.filter((m: any) => new Date(m.createdAt || 0).getTime() < beforeTime)
+        : room.messages;
+
+      const hasMore = filtered.length > limit;
+      const sliced = hasMore ? filtered.slice(filtered.length - limit) : filtered;
+      const messages = enrichLocalMessagesWithQuizzes(sliced, viewerUserId);
+
+      res.json({
+        roomId: String(roomId),
+        messages,
+        hasMore
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post(['/api/chats/rooms', '/api/chats/room'], (req, res) => {
+    try {
+      const { id, name, type, avatarUrl, participants, adminIds } = req.body;
+      const rooms = loadChatRooms();
+      const roomId = id || `c_${Date.now()}`;
+      const newRoom = {
+        id: roomId,
+        name: name || (type === 'dm' ? 'ダイレクトトーク' : 'グループトーク'),
+        type: type || 'group',
+        avatarUrl: avatarUrl || null,
+        lastMessage: '',
+        updatedAt: new Date().toISOString(),
+        lastUpdated: new Date().toISOString(),
+        participants: Array.isArray(participants) ? participants : [],
+        adminIds: Array.isArray(adminIds) ? adminIds : [],
+        messages: []
+      };
+      rooms.unshift(newRoom);
+      saveChatRooms(rooms);
+      res.status(201).json({ success: true, id: roomId, message: 'チャットルーム作成完了' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post(['/api/chats', '/api/chats/message'], (req, res) => {
+    try {
+      const { senderId, roomId, message, content, attachments, roomName, roomType, participants, type, imageUrl, thumbnailUrl, images, stampId, stampText, stampCategory, adminIds } = req.body;
+      const msgContent = message || content || '';
+      const targetRoomId = String(roomId || 'r1');
+      const rooms = loadChatRooms();
+      let room = rooms.find((r) => String(r.id) === targetRoomId);
+
+      if (!room) {
+        room = {
+          id: targetRoomId,
+          name: roomName || (roomType === 'dm' ? 'ダイレクトトーク' : '新規グループトーク'),
+          type: roomType || 'group',
+          avatarUrl: req.body.avatarUrl || req.body.roomAvatarUrl || null,
+          lastMessage: '',
+          updatedAt: new Date().toISOString(),
+          lastUpdated: new Date().toISOString(),
+          participants: Array.isArray(participants) ? participants : [],
+          adminIds: Array.isArray(adminIds) ? adminIds : [],
+          messages: []
+        };
+        rooms.push(room);
+      }
+
+      const msgId = req.body.id || `c-${Date.now()}`;
+      const nowIso = new Date().toISOString();
+      const newMsg = {
+        id: msgId,
+        roomId: targetRoomId,
+        sender: {
+          id: senderId || 'u1',
+          name: req.body.senderName || 'ユーザー',
+          avatarUrl: req.body.senderAvatar || '',
+          department: req.body.senderDepartment || ''
+        },
+        content: msgContent,
+        createdAt: nowIso,
+        type: type || 'text',
+        imageUrl: imageUrl || null,
+        thumbnailUrl: thumbnailUrl || null,
+        images: Array.isArray(images) ? images : (imageUrl && thumbnailUrl ? [{ url: imageUrl, thumbnailUrl }] : null),
+        stampId: stampId || null,
+        stampText: stampText || null,
+        stampCategory: stampCategory || null,
+        attachments: Array.isArray(attachments) ? attachments : [],
+        viewers: senderId ? [{ user: { id: String(senderId), name: req.body.senderName || 'ユーザー', avatarUrl: req.body.senderAvatar || '', department: req.body.senderDepartment || '' }, viewedAt: nowIso }] : []
+      };
+
+      if (!Array.isArray(room.messages)) {
+        room.messages = [];
+      }
+      room.messages.push(newMsg);
+      room.lastMessage = msgContent;
+      room.updatedAt = nowIso;
+      room.lastUpdated = nowIso;
+
+      saveChatRooms(rooms);
+      res.status(201).json({ id: msgId, message: 'メッセージ送信完了' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post(['/api/chats/:roomId/viewers/batch', '/api/chats/messages/viewers/batch'], (req, res) => {
+    try {
+      const roomId = req.params.roomId || req.body.roomId;
+      const { messageIds, user } = req.body;
+      if (!user || !user.id) return res.status(400).json({ success: false, error: 'User is required' });
+
+      const rooms = loadChatRooms();
+      const targetIdSet = Array.isArray(messageIds) && messageIds.length > 0
+        ? new Set(messageIds.map((id: any) => String(id)))
+        : null;
+      const userIdStr = String(user.id);
+      const nowIso = new Date().toISOString();
+      let updatedCount = 0;
+
+      for (const room of rooms) {
+        if (roomId && String(room.id) !== String(roomId)) continue;
+        if (!Array.isArray(room.messages)) continue;
+        for (const msg of room.messages) {
+          if (targetIdSet && !targetIdSet.has(String(msg.id))) continue;
+          if (!Array.isArray(msg.viewers)) msg.viewers = [];
+          const exists = msg.viewers.some((v: any) => String(v?.user?.id || v?.userId || v?.id || '') === userIdStr);
+          if (!exists) {
+            msg.viewers.push({ user: { ...user, id: userIdStr }, viewedAt: nowIso });
+            updatedCount++;
+          }
+        }
+      }
+
+      if (updatedCount > 0) {
+        saveChatRooms(rooms);
+      }
+      res.json({ success: true, updatedCount, viewedAt: nowIso });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.post(['/api/chats/messages/:messageId/viewers', '/api/chats/messages/:messageId/viewer'], (req, res) => {
+    try {
+      const { messageId } = req.params;
+      const { user } = req.body;
+      if (!user || !user.id) return res.status(400).json({ success: false, error: 'User is required' });
+
+      const rooms = loadChatRooms();
+      let updated = false;
+      let currentViewers: any[] = [];
+
+      for (const room of rooms) {
+        if (Array.isArray(room.messages)) {
+          const msg = room.messages.find((m: any) => String(m.id) === String(messageId));
+          if (msg) {
+            if (!Array.isArray(msg.viewers)) msg.viewers = [];
+            const exists = msg.viewers.some((v: any) => String(v?.user?.id || v?.userId || v?.id || '') === String(user.id));
+            if (!exists) {
+              msg.viewers.push({ user: { ...user, id: String(user.id) }, viewedAt: new Date().toISOString() });
+              updated = true;
+            }
+            currentViewers = msg.viewers;
+            break;
+          }
+        }
+      }
+
+      if (updated) {
+        saveChatRooms(rooms);
+      }
+      res.json({ success: true, viewers: currentViewers });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/chats/:roomId', (req, res) => {
+    try {
+      const { roomId } = req.params;
+      const { name, avatarUrl, participants, adminIds } = req.body;
+      const rooms = loadChatRooms();
+      const room = rooms.find((r) => String(r.id) === String(roomId));
+
+      if (room) {
+        if (name !== undefined) room.name = name;
+        if (avatarUrl !== undefined) room.avatarUrl = avatarUrl;
+        if (participants !== undefined) room.participants = participants;
+        if (adminIds !== undefined) room.adminIds = adminIds;
+        room.updatedAt = new Date().toISOString();
+        room.lastUpdated = new Date().toISOString();
+        saveChatRooms(rooms);
+      } else {
+        const newRoom = {
+          id: String(roomId),
+          name: name || '新規グループトーク',
+          type: 'group',
+          avatarUrl: avatarUrl || null,
+          lastMessage: '',
+          updatedAt: new Date().toISOString(),
+          lastUpdated: new Date().toISOString(),
+          participants: Array.isArray(participants) ? participants : [],
+          adminIds: Array.isArray(adminIds) ? adminIds : [],
+          messages: Array.isArray(req.body.messages) ? req.body.messages : []
+        };
+        rooms.unshift(newRoom);
+        saveChatRooms(rooms);
+      }
+      res.json({ success: true, message: 'チャットルーム情報を更新しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/chats/:roomId', (req, res) => {
+    try {
+      const { roomId } = req.params;
+      let rooms = loadChatRooms();
+      rooms = rooms.filter((r) => String(r.id) !== String(roomId));
+      saveChatRooms(rooms);
+      res.json({ success: true, message: 'チャットルームとメッセージを削除しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/chats/messages/:messageId', (req, res) => {
+    try {
+      const { messageId } = req.params;
+      const rooms = loadChatRooms();
+      for (const room of rooms) {
+        if (Array.isArray(room.messages)) {
+          const idx = room.messages.findIndex((m: any) => String(m.id) === String(messageId));
+          if (idx !== -1) {
+            room.messages.splice(idx, 1);
+            room.lastMessage = room.messages.length > 0 ? room.messages[room.messages.length - 1].content : '';
+            room.updatedAt = new Date().toISOString();
+            room.lastUpdated = new Date().toISOString();
+            break;
+          }
+        }
+      }
+      saveChatRooms(rooms);
+      res.json({ success: true, message: 'メッセージを削除しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete('/api/external-files', (req, res) => {
+    try {
+      const targetRelPath = req.query.path;
+      if (!targetRelPath || typeof targetRelPath !== 'string') {
+        return res.status(400).json({ error: 'ファイルパスが指定されていません' });
+      }
+      const safePath = resolveSafeChildPath(externalFilesDir, targetRelPath);
+      if (!safePath || path.resolve(safePath) === path.resolve(externalFilesDir)) {
+        return res.status(400).json({ error: '不正なパスまたはルートディレクトリは削除できません。' });
+      }
+      
+      if (fs.existsSync(safePath)) {
+        const stat = fs.statSync(safePath);
+        if (stat.isDirectory()) {
+          if (typeof fs.rmSync === 'function') {
+            fs.rmSync(safePath, { recursive: true, force: true });
+          } else {
+            fs.rmdirSync(safePath, { recursive: true });
+          }
+        } else {
+          fs.unlinkSync(safePath);
+        }
+        res.json({ message: '削除に成功しました' });
+      } else {
+        res.status(404).json({ error: 'ファイルが見つかりません' });
+      }
+    } catch (err: any) {
+      console.error('ファイル削除エラー:', err);
+      res.status(500).json({ error: 'ファイル削除処理中にエラーが発生しました: ' + err.message });
+    }
+  });
+
+  // ==========================================
+  // 点検スケジューラー: 下書き保存・自動保存・翌月繰越 API
+  // ==========================================
+  const inspectionDraftsPath = path.join(dataDir, 'inspection_drafts.json');
+
+  interface StoredInspectionDraft {
+    targetYearMonth: string; // 'YYYY-MM'
+    items: any[];
+    lastSavedAt: string;     // ISO string
+    savedByUserId?: string;
+    savedByUserName?: string;
+  }
+
+  function loadInspectionDrafts(): StoredInspectionDraft[] {
+    if (!fs.existsSync(inspectionDraftsPath)) return [];
+    try {
+      return JSON.parse(fs.readFileSync(inspectionDraftsPath, 'utf8'));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveInspectionDrafts(drafts: StoredInspectionDraft[]) {
+    try {
+      fs.writeFileSync(inspectionDraftsPath, JSON.stringify(drafts, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save inspection drafts:', e);
+    }
+  }
+
+  function getPreviousYearMonth(yearMonthStr: string): string {
+    if (!yearMonthStr) return '';
+    const [ymPart, ...suffixParts] = String(yearMonthStr).split('_');
+    const suffix = suffixParts.length > 0 ? '_' + suffixParts.join('_') : '';
+
+    const [y, m] = ymPart.split('-').map(Number);
+    if (!y || !m) return '';
+    const date = new Date(y, m - 2, 1);
+    const prevY = date.getFullYear();
+    const prevM = String(date.getMonth() + 1).padStart(2, '0');
+    return `${prevY}-${prevM}${suffix}`;
+  }
+
+  // 指定年月の下書き保存状態取得 (クエリ, パス, ヘッダー, フォールバック対応)
+  app.get(['/api/inspection/drafts', '/api/inspection/drafts/:targetYearMonth'], (req, res) => {
+    try {
+      const targetYearMonth = (req.params.targetYearMonth || req.query.targetYearMonth || req.headers['x-target-year-month'] || (req.body && req.body.targetYearMonth) || new Date().toISOString().slice(0, 7)) as string;
+
+      const drafts = loadInspectionDrafts();
+      const draft = drafts.find((d) => d.targetYearMonth === targetYearMonth);
+
+      if (!draft) {
+        return res.json({
+          exists: false,
+          targetYearMonth,
+          items: [],
+          lastSavedAt: null,
+          savedByUserId: null,
+          savedByUserName: null,
+          allAvailableMonths: drafts.map((d) => d.targetYearMonth)
+        });
+      }
+
+      res.json({
+        exists: true,
+        targetYearMonth: draft.targetYearMonth,
+        items: draft.items || [],
+        lastSavedAt: draft.lastSavedAt,
+        savedByUserId: draft.savedByUserId,
+        savedByUserName: draft.savedByUserName,
+        allAvailableMonths: drafts.map((d) => d.targetYearMonth),
+        storage: 'file'
+      });
+    } catch (err: any) {
+      console.error('Get inspection draft error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 下書き自動保存・一時保存
+  app.post(['/api/inspection/drafts', '/api/inspection/drafts/:targetYearMonth'], (req, res) => {
+    try {
+      const targetYearMonth = (req.body?.targetYearMonth || req.params?.targetYearMonth || req.query?.targetYearMonth || req.headers['x-target-year-month'] || new Date().toISOString().slice(0, 7)) as string;
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+      const savedByUserId = req.body?.savedByUserId || null;
+      const savedByUserName = req.body?.savedByUserName || null;
+
+      const drafts = loadInspectionDrafts();
+      const nowIso = req.body?.lastSavedAt || new Date().toISOString();
+
+      const existingIndex = drafts.findIndex((d) => d.targetYearMonth === targetYearMonth);
+      const newDraft: StoredInspectionDraft = {
+        targetYearMonth,
+        items,
+        lastSavedAt: nowIso,
+        savedByUserId,
+        savedByUserName
+      };
+
+      if (existingIndex >= 0) {
+        drafts[existingIndex] = newDraft;
+      } else {
+        drafts.push(newDraft);
+      }
+
+      saveInspectionDrafts(drafts);
+
+      res.json({
+        success: true,
+        targetYearMonth,
+        itemCount: items.length,
+        lastSavedAt: nowIso,
+        savedByUserName
+      });
+    } catch (err: any) {
+      console.error('Save inspection draft error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 指定年月の下書きクリア
+  app.delete(['/api/inspection/drafts', '/api/inspection/drafts/:targetYearMonth'], (req, res) => {
+    try {
+      const targetYearMonth = (req.params.targetYearMonth || req.query.targetYearMonth || req.headers['x-target-year-month'] || req.body?.targetYearMonth) as string;
+      if (!targetYearMonth) {
+        return res.json({ success: true, message: '対象年月なし' });
+      }
+
+      let drafts = loadInspectionDrafts();
+      drafts = drafts.filter((d) => d.targetYearMonth !== targetYearMonth);
+      saveInspectionDrafts(drafts);
+
+      res.json({ success: true, message: `${targetYearMonth} の下書きをクリアしました。` });
+    } catch (err: any) {
+      console.error('Delete inspection draft error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 前月からの「翌月繰越 (carried_over)」アイテムの自動取得 API
+  app.get(['/api/inspection/carry-overs', '/api/inspection/carry-overs/:targetYearMonth'], (req, res) => {
+    try {
+      const targetYearMonth = (req.params.targetYearMonth || req.query.targetYearMonth || req.headers['x-target-year-month'] || (req.body && req.body.targetYearMonth) || new Date().toISOString().slice(0, 7)) as string;
+
+      const prevMonth = getPreviousYearMonth(targetYearMonth);
+      if (!prevMonth) {
+        return res.json({ currentMonth: targetYearMonth, prevMonth: '', carriedOverCount: 0, carriedOverItems: [] });
+      }
+
+      const drafts = loadInspectionDrafts();
+      const prevDraft = drafts.find((d) => d.targetYearMonth === prevMonth);
+
+      if (!prevDraft || !Array.isArray(prevDraft.items)) {
+        return res.json({ currentMonth: targetYearMonth, prevMonth, carriedOverCount: 0, carriedOverItems: [] });
+      }
+
+      // 前月のアイテムのうち status が 'carried_over' のものを抽出
+      const carriedOverItems = prevDraft.items.filter((item: any) => item.status === 'carried_over');
+
+      res.json({
+        currentMonth: targetYearMonth,
+        prevMonth,
+        carriedOverCount: carriedOverItems.length,
+        carriedOverItems: carriedOverItems.map((item: any) => ({
+          ...item,
+          // 当月用としてステータスを pending にリセットし、繰越元年月を記録
+          status: 'pending',
+          targetYearMonth: targetYearMonth,
+          carriedOverFrom: prevMonth,
+          assignedDate: undefined,
+          assignedStartTime: undefined,
+          assignedEndTime: undefined
+        }))
+      });
+    } catch (err: any) {
+      console.error('Get carry-over items error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 通知 (Notifications) API & ヘルパー
+  // ==========================================
+  const notificationsPath = path.join(dataDir, 'notifications.json');
+
+  interface StoredNotification {
+    id: string;
+    user_id: string; // 通知先ユーザーID
+    sender_id?: string; // 通知元・作成者ユーザーID
+    type: string; // 'work_report' | 'work_report_submit' | 'work_report_review' | 'workflow' | 'memo' | etc.
+    title: string;
+    contents?: string;
+    target_id?: string; // 関連ID (週報ID等)
+    is_read: number; // 0: 未読, 1: 既読 (bit互換)
+    created_at: string; // ISO string / datetimeoffset
+    // 互換用プロパティ
+    userId?: string;
+    senderId?: string;
+    senderName?: string;
+    senderAvatar?: string;
+    content?: string;
+    targetId?: string;
+    isRead?: boolean;
+    createdAt?: string;
+  }
+
+  function loadNotifications(): StoredNotification[] {
+    if (!fs.existsSync(notificationsPath)) {
+      return [];
+    }
+    try {
+      return JSON.parse(fs.readFileSync(notificationsPath, 'utf8'));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveNotifications(items: StoredNotification[]) {
+    try {
+      fs.writeFileSync(notificationsPath, JSON.stringify(items, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save notifications:', e);
+    }
+  }
+
+  function createNotification(payload: {
+    user_id: string;
+    sender_id?: string;
+    type: string;
+    title: string;
+    contents?: string;
+    target_id?: string;
+    sender_name?: string;
+  }): StoredNotification {
+    const list = loadNotifications();
+    const nowIso = new Date().toISOString();
+    const newNotif: StoredNotification = {
+      id: `notif_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      user_id: String(payload.user_id),
+      sender_id: payload.sender_id ? String(payload.sender_id) : undefined,
+      type: payload.type,
+      title: payload.title,
+      contents: payload.contents || '',
+      target_id: payload.target_id || undefined,
+      is_read: 0,
+      created_at: nowIso,
+      // 互換用
+      userId: String(payload.user_id),
+      senderId: payload.sender_id ? String(payload.sender_id) : undefined,
+      senderName: payload.sender_name,
+      content: payload.contents || '',
+      targetId: payload.target_id || undefined,
+      isRead: false,
+      createdAt: nowIso,
+    };
+    list.unshift(newNotif);
+    saveNotifications(list);
+    return newNotif;
+  }
+
+  // 通知一覧取得 API
+  app.get(['/api/notifications', '/api/notifications/:userId'], (req, res) => {
+    try {
+      let list = loadNotifications();
+      const targetUserId = req.params.userId || req.query.userId || req.query.user_id;
+
+      if (targetUserId) {
+        list = list.filter(n => (n.user_id === String(targetUserId) || n.userId === String(targetUserId)));
+      }
+
+      // 未読優先、作成日時降順
+      list.sort((a, b) => {
+        const timeA = new Date(a.created_at || a.createdAt || 0).getTime();
+        const timeB = new Date(b.created_at || b.createdAt || 0).getTime();
+        return timeB - timeA;
+      });
+
+      res.json(list.map(n => ({
+        ...n,
+        userId: n.user_id || n.userId,
+        senderId: n.sender_id || n.senderId,
+        content: n.contents || n.content,
+        targetId: n.target_id || n.targetId,
+        isRead: Boolean(n.is_read || n.isRead),
+        createdAt: n.created_at || n.createdAt
+      })));
+    } catch (err: any) {
+      console.error('Get notifications error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 通知作成 API
+  app.post('/api/notifications', (req, res) => {
+    try {
+      const data = req.body || {};
+      const user_id = data.user_id || data.userId;
+      if (!user_id) {
+        return res.status(400).json({ error: 'user_id is required' });
+      }
+
+      const notif = createNotification({
+        user_id,
+        sender_id: data.sender_id || data.senderId,
+        type: data.type || 'system',
+        title: data.title || '通知',
+        contents: data.contents || data.content || '',
+        target_id: data.target_id || data.targetId,
+        sender_name: data.sender_name || data.senderName
+      });
+
+      res.status(201).json({ success: true, notification: notif });
+    } catch (err: any) {
+      console.error('Create notification error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 通知既読化 API
+  app.put(['/api/notifications/:id/read', '/api/notifications/:id'], (req, res) => {
+    try {
+      const { id } = req.params;
+      const list = loadNotifications();
+      const idx = list.findIndex(n => n.id === id);
+      if (idx !== -1) {
+        list[idx].is_read = 1;
+        list[idx].isRead = true;
+        saveNotifications(list);
+      }
+      res.json({ success: true, message: '既読に更新しました' });
+    } catch (err: any) {
+      console.error('Mark notification read error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+  app.post('/api/notifications/:id/read', (req, res) => {
+    try {
+      const { id } = req.params;
+      const list = loadNotifications();
+      const idx = list.findIndex(n => n.id === id);
+      if (idx !== -1) {
+        list[idx].is_read = 1;
+        list[idx].isRead = true;
+        saveNotifications(list);
+      }
+      res.json({ success: true, message: '既読に更新しました' });
+    } catch (err: any) {
+      console.error('Mark notification read error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 全件既読化 API
+  app.post('/api/notifications/mark-all-read', (req, res) => {
+    try {
+      const targetUserId = req.body?.user_id || req.body?.userId || req.query.userId;
+      const list = loadNotifications();
+      list.forEach(n => {
+        if (!targetUserId || n.user_id === String(targetUserId) || n.userId === String(targetUserId)) {
+          n.is_read = 1;
+          n.isRead = true;
+        }
+      });
+      saveNotifications(list);
+      res.json({ success: true, message: 'すべての通知を既読にしました' });
+    } catch (err: any) {
+      console.error('Mark all notifications read error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 通知削除 API
+  app.delete('/api/notifications/:id', (req, res) => {
+    try {
+      const { id } = req.params;
+      let list = loadNotifications();
+      const prevCount = list.length;
+      list = list.filter(n => n.id !== id);
+      saveNotifications(list);
+      res.json({ success: true, deleted: prevCount - list.length });
+    } catch (err: any) {
+      console.error('Delete notification error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // セキュア・パスワードハッシュ化 (scrypt) & 認証ヘルパー
+  // ==========================================
+  function hashPassword(password: string): string {
+    if (!password) return '';
+    if (password.startsWith('scrypt:16384:')) return password;
+    const salt = crypto.randomBytes(16).toString('hex');
+    const derivedKey = crypto.scryptSync(password, salt, 64, { N: 16384, r: 8, p: 1 });
+    return `scrypt:16384:${salt}:${derivedKey.toString('hex')}`;
+  }
+
+  function verifyPassword(passwordInput: string, storedHashOrPlain: string): { isValid: boolean; needsRehash: boolean } {
+    if (!storedHashOrPlain || !passwordInput) return { isValid: false, needsRehash: false };
+    if (storedHashOrPlain.startsWith('scrypt:16384:')) {
+      const parts = storedHashOrPlain.split(':');
+      if (parts.length === 4) {
+        const salt = parts[2];
+        const originalHashHex = parts[3];
+        const testHash = crypto.scryptSync(passwordInput, salt, 64, { N: 16384, r: 8, p: 1 });
+        try {
+          const isValid = crypto.timingSafeEqual(Buffer.from(originalHashHex, 'hex'), testHash);
+          return { isValid, needsRehash: false };
+        } catch (_) {
+          return { isValid: false, needsRehash: false };
+        }
+      }
+    }
+    const isPlainMatch = (passwordInput === storedHashOrPlain);
+    return { isValid: isPlainMatch, needsRehash: isPlainMatch };
+  }
+
+  function sanitizeUserForResponse(user: any): any {
+    if (!user) return user;
+    const copy = { ...user };
+
+    // パスワードが未設定、またはデフォルト（'test'）、あるいは初回ログイン変更要求が有効かチェック
+    const rawPw = user.password || '';
+    const isTestPw = !rawPw || rawPw === 'test' || verifyPassword('test', rawPw).isValid;
+    const isPasswordDefault = isTestPw || user.mustChangePassword === true || user.isPasswordDefault === true;
+
+    delete copy.password;
+    delete copy.passwordHash;
+    return {
+      ...copy,
+      passwordMasked: '••••••••',
+      isPasswordDefault: isPasswordDefault
+    };
+  }
+
+  // サーバーサイドログイン認証 API（試行制限＋暗号論的セッショントークン発行）
+  app.post(['/api/auth/login', '/api/auth/login/', '/api/login', '/api/login/'], (req, res) => {
+    try {
+      const { loginId, password } = req.body || {};
+      if (!loginId || !password) {
+        return res.status(400).json({ error: 'ユーザーIDとパスワードを入力してください。' });
+      }
+
+      // ログイン試行制限チェック（アカウント＋IP単位: 5回連続失敗で15分ロック）
+      const rateLimit = checkLoginRateLimit(req, loginId);
+      if (rateLimit.blocked) {
+        return res.status(429).json({
+          error: rateLimit.message,
+          retryAfterSeconds: rateLimit.retryAfterSeconds
+        });
+      }
+
+      const trimmedId = String(loginId).trim().toLowerCase();
+      const users = loadUsers();
+      const matchedIndex = users.findIndex((u: any) => {
+        const uLoginId = (u.loginId || '').trim().toLowerCase();
+        const uEmail = (u.email || '').trim().toLowerCase();
+        const uEmailPrefix = uEmail.includes('@') ? uEmail.split('@')[0] : '';
+        const uMobile = (u.mobileEmail || '').trim().toLowerCase();
+        const uMobilePrefix = uMobile.includes('@') ? uMobile.split('@')[0] : '';
+        const uId = String(u.id || '').trim().toLowerCase();
+        const uName = String(u.name || '').trim().toLowerCase();
+        return (
+          (uLoginId && uLoginId === trimmedId) ||
+          (uEmail && uEmail === trimmedId) ||
+          (uEmailPrefix && uEmailPrefix === trimmedId) ||
+          (uMobile && uMobile === trimmedId) ||
+          (uMobilePrefix && uMobilePrefix === trimmedId) ||
+          (uId && uId === trimmedId) ||
+          (uName && uName === trimmedId)
+        );
+      });
+
+      if (matchedIndex === -1) {
+        recordLoginAttempt(req, loginId, false);
+        return res.status(401).json({ error: 'ユーザーIDまたはパスワードが正しくありません。' });
+      }
+
+      const user = users[matchedIndex];
+      const authResult = verifyPassword(String(password).trim(), user.password);
+
+      if (!authResult.isValid) {
+        recordLoginAttempt(req, loginId, false);
+        return res.status(401).json({ error: 'ユーザーIDまたはパスワードが正しくありません。' });
+      }
+
+      recordLoginAttempt(req, loginId, true);
+
+      // 平文マッチの場合は即座にハッシュ値へアップグレード更新
+      if (authResult.needsRehash) {
+        user.password = hashPassword(String(password).trim());
+        users[matchedIndex] = user;
+        saveUsers(users);
+      }
+
+      const { token, expiresAt } = issueSessionToken(user);
+
+      res.json({
+        success: true,
+        message: 'ログインに成功しました。',
+        token,
+        expiresAt,
+        user: sanitizeUserForResponse(user)
+      });
+    } catch (err: any) {
+      console.error('[Auth] Login error:', err);
+      res.status(500).json({ error: 'ログイン処理中にエラーが発生しました。' });
+    }
+  });
+
+  // ログアウト API（サーバー側セッショントークン破棄）
+  app.post(['/api/auth/logout', '/api/auth/logout/', '/api/logout', '/api/logout/'], (req, res) => {
+    try {
+      const rawToken = extractTokenFromRequest(req);
+      if (rawToken) {
+        revokeSessionToken(rawToken);
+      }
+      res.json({ success: true, message: 'ログアウトしました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  const usersPath = path.join(dataDir, 'users.json');
+
+  // 初期管理者は環境変数（INITIAL_ADMIN_LOGIN_ID / INITIAL_ADMIN_PASSWORD）からのみ初回作成（初回ログイン時パスワード変更必須）
+  function buildInitialAdminFromEnv(): any[] {
+    const initLoginId = String(process.env.INITIAL_ADMIN_LOGIN_ID || '').trim();
+    const initPassword = String(process.env.INITIAL_ADMIN_PASSWORD || '').trim();
+    const initName = String(process.env.INITIAL_ADMIN_NAME || '初期管理者').trim();
+    if (!initLoginId || !initPassword) {
+      return [];
+    }
+    return [
+      {
+        id: 'admin-init',
+        loginId: initLoginId,
+        password: hashPassword(initPassword),
+        name: initName,
+        office: '本社',
+        division: '管理部',
+        position: '管理者',
+        department: '本社 管理部 管理者',
+        email: '',
+        avatarUrl: '',
+        isAdmin: true,
+        role: 'admin',
+        mustChangePassword: true
+      }
+    ];
+  }
+
+  function loadUsers(): any[] {
+    let rawUsers: any[] = [];
+    if (!fs.existsSync(usersPath)) {
+      rawUsers = buildInitialAdminFromEnv();
+      if (rawUsers.length > 0) {
+        try {
+          fs.writeFileSync(usersPath, JSON.stringify(rawUsers, null, 2), 'utf8');
+          console.log('[Security] Initial admin user created from environment variables (mustChangePassword=true).');
+        } catch (e) {
+          console.error('[Security] Failed to write initial admin user:', e);
+        }
+      }
+    } else {
+      try {
+        const data = JSON.parse(fs.readFileSync(usersPath, 'utf8'));
+        rawUsers = (Array.isArray(data) && data.length > 0) ? data : buildInitialAdminFromEnv();
+      } catch (e) {
+        rawUsers = [];
+      }
+    }
+
+    // 自動一括ハッシュ化マイグレーション (平文パスワードを安全なscryptハッシュ値へ自動アップグレード)
+    let hasUnhashed = false;
+    const migratedUsers = rawUsers.map((u: any) => {
+      if (u.password && !String(u.password).startsWith('scrypt:16384:')) {
+        hasUnhashed = true;
+        return { ...u, password: hashPassword(String(u.password)) };
+      }
+      return u;
+    });
+
+    if (hasUnhashed) {
+      try {
+        fs.writeFileSync(usersPath, JSON.stringify(migratedUsers, null, 2), 'utf8');
+        console.log('[Security] Unhashed user passwords successfully migrated to scrypt hashes.');
+      } catch (e) {
+        console.error('[Security] Failed to save migrated user passwords:', e);
+      }
+    }
+
+    return migratedUsers;
+  }
+
+  function saveUsers(users: any[]) {
+    fs.writeFileSync(usersPath, JSON.stringify(users, null, 2), 'utf8');
+  }
+
+  // サーバー起動時に即座に users.json の平文パスワード一括 scrypt ハッシュ化移行を実行（ログインを待たない）
+  loadUsers();
+
+  // ユーザー一覧取得 API (sortOrder 昇順、名前 昇順 / 平文パスワード非開示)
+  app.get(['/api/users', '/api/users/'], (req, res) => {
+    try {
+      const users = loadUsers();
+      const sortedUsers = [...users].sort((a: any, b: any) => {
+        const orderA = a.sortOrder !== undefined && a.sortOrder !== null ? Number(a.sortOrder) : 999999;
+        const orderB = b.sortOrder !== undefined && b.sortOrder !== null ? Number(b.sortOrder) : 999999;
+        if (orderA !== orderB) return orderA - orderB;
+        return (a.name || '').localeCompare(b.name || '', 'ja');
+      });
+      res.json(sortedUsers.map(sanitizeUserForResponse));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ユーザー表示順の一括更新 API
+  const handleUsersReorder = (req: any, res: any) => {
+    try {
+      const body = req.body || {};
+      const orders = Array.isArray(body) 
+        ? body 
+        : (Array.isArray(body.userOrders) ? body.userOrders : (Array.isArray(body.orders) ? body.orders : []));
+      
+      if (!orders || orders.length === 0) {
+        return res.status(400).json({ error: '並び順データ (userOrders) が配列で指定されていません。' });
+      }
+
+      const users = loadUsers();
+      const orderMap = new Map<string, number | null>();
+      for (const item of orders) {
+        if (!item.id) continue;
+        const sOrder = (item.sortOrder !== undefined && item.sortOrder !== null && item.sortOrder !== '')
+          ? parseInt(item.sortOrder, 10)
+          : null;
+        orderMap.set(String(item.id), sOrder);
+      }
+
+      users.forEach((u: any) => {
+        if (orderMap.has(String(u.id))) {
+          u.sortOrder = orderMap.get(String(u.id));
+        }
+      });
+
+      saveUsers(users);
+      res.json({ success: true, count: orders.length, message: 'ユーザーの並び順を更新しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  app.put(['/api/users/reorder', '/api/users/reorder/'], handleUsersReorder);
+  app.post(['/api/users/reorder', '/api/users/reorder/'], handleUsersReorder);
+
+  // 緊急安否確認ワンタップ回答用 最小限プロフィール取得 API (氏名・所属のみ)
+  app.get(['/api/users/guest-profile/:id', '/api/users/guest-profile/:id/'], (req, res) => {
+    try {
+      const targetId = String(req.params.id || '').trim();
+      const users = loadUsers();
+      const user = users.find((u: any) => String(u.id) === targetId);
+      if (!user) return res.status(404).json({ error: '対象ユーザーが見つかりません' });
+      res.json({
+        id: String(user.id),
+        name: user.name || '',
+        office: user.office || '',
+        division: user.division || user.department || ''
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 単一ユーザー取得 API (平文パスワード非開示)
+  app.get('/api/users/:id', (req, res) => {
+    try {
+      const users = loadUsers();
+      const user = users.find((u: any) => u.id === req.params.id);
+      if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+      res.json(sanitizeUserForResponse(user));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ユーザー保存・更新 API (POST / PUT)
+  app.post(['/api/users', '/api/users/'], (req, res) => {
+    try {
+      const u = { ...req.body };
+      if (!u || !u.id) {
+        return res.status(400).json({ error: 'ユーザーIDが必要です' });
+      }
+      const users = loadUsers();
+      const idx = users.findIndex((item: any) => item.id === u.id);
+
+      if (u.password && u.password !== '••••••••' && !u.password.startsWith('scrypt:16384:')) {
+        u.password = hashPassword(u.password);
+      } else if (idx >= 0 && (!u.password || u.password === '••••••••')) {
+        u.password = users[idx].password; // 既存ハッシュ維持
+      }
+
+      if (idx >= 0) {
+        users[idx] = { ...users[idx], ...u };
+      } else {
+        if (!u.password) {
+          u.password = hashPassword(crypto.randomBytes(16).toString('hex'));
+          if (u.mustChangePassword === undefined) u.mustChangePassword = true;
+        }
+        users.push(u);
+      }
+      saveUsers(users);
+      const savedUser = users[idx >= 0 ? idx : users.length - 1];
+      updateSessionsForUser(savedUser);
+      res.json({ success: true, user: sanitizeUserForResponse(savedUser) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.put('/api/users/:id', (req, res) => {
+    try {
+      const u = { ...req.body };
+      u.id = req.params.id;
+      const users = loadUsers();
+      const idx = users.findIndex((item: any) => item.id === u.id);
+
+      if (u.password && u.password !== '••••••••' && !u.password.startsWith('scrypt:16384:')) {
+        u.password = hashPassword(u.password);
+      } else if (idx >= 0 && (!u.password || u.password === '••••••••')) {
+        u.password = users[idx].password; // 既存ハッシュ維持
+      }
+
+      if (idx >= 0) {
+        users[idx] = { ...users[idx], ...u };
+      } else {
+        if (!u.password) {
+          u.password = hashPassword(crypto.randomBytes(16).toString('hex'));
+          if (u.mustChangePassword === undefined) u.mustChangePassword = true;
+        }
+        users.push(u);
+      }
+      saveUsers(users);
+      const savedUser = users[idx >= 0 ? idx : users.length - 1];
+      updateSessionsForUser(savedUser);
+      res.json({ success: true, user: sanitizeUserForResponse(savedUser) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete(['/api/users/:id', '/api/users/:id/'], (req, res) => {
+    try {
+      const userId = req.params.id;
+      const users = loadUsers();
+      const filtered = users.filter((u: any) => String(u.id) !== userId && String(u.loginId) !== userId);
+      saveUsers(filtered);
+      revokeAllSessionsForUser(userId);
+      res.json({ success: true, message: 'ユーザーを削除しました', deletedId: userId });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 個人設定・通知設定の保存 API (PUT & POST 両対応 / 部分マージ対応)
+  const handlePreferencesUpdate = (req: any, res: any) => {
+    try {
+      const userId = req.params.id;
+      const body = req.body || {};
+      const incomingPrefs = (body.preferences && typeof body.preferences === 'object') ? body.preferences : body;
+
+      const users = loadUsers();
+      const idx = users.findIndex((item: any) => item.id === userId);
+      let currentPrefs: any = {};
+      if (idx >= 0 && users[idx].preferences) {
+        currentPrefs = { ...users[idx].preferences };
+      }
+
+      const mergedPrefs = {
+        ...currentPrefs,
+        ...incomingPrefs,
+        emailNotifications: {
+          ...(currentPrefs.emailNotifications || {}),
+          ...(incomingPrefs.emailNotifications || {})
+        }
+      };
+
+      if (idx >= 0) {
+        users[idx].preferences = mergedPrefs;
+        saveUsers(users);
+      } else {
+        const newUser = { id: userId, preferences: mergedPrefs };
+        users.push(newUser);
+        saveUsers(users);
+      }
+      res.json({ success: true, preferences: mergedPrefs, message: '個人設定・通知設定を保存しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  app.put(['/api/users/:id/preferences', '/api/users/:id/settings', '/api/users/:id/notification-settings'], handlePreferencesUpdate);
+  app.post(['/api/users/:id/preferences', '/api/users/:id/settings', '/api/users/:id/notification-settings'], handlePreferencesUpdate);
+
+  // ==========================================
+  // 個人メールアドレス AES-256-GCM 暗号化 & 管理 API（固定文字列フォールバック廃止・環境変数必須化）
+  // ==========================================
+  const EMAIL_ENCRYPTION_SECRET = (process.env.PERSONAL_EMAIL_SECRET_KEY || '').trim();
+  if (!EMAIL_ENCRYPTION_SECRET) {
+    console.error('[Security Fatal] 環境変数 PERSONAL_EMAIL_SECRET_KEY が設定されていません。サーバーを起動できません。');
+    throw new Error('PERSONAL_EMAIL_SECRET_KEY environment variable is required.');
+  }
+  const ENCRYPTION_KEY = crypto.createHash('sha256').update(EMAIL_ENCRYPTION_SECRET, 'utf8').digest();
+  const OLD_EMAIL_ENCRYPTION_SECRET = (process.env.OLD_PERSONAL_EMAIL_SECRET_KEY || process.env.LEGACY_PERSONAL_EMAIL_SECRET_KEY || '').trim();
+  const OLD_ENCRYPTION_KEY = OLD_EMAIL_ENCRYPTION_SECRET
+    ? crypto.createHash('sha256').update(OLD_EMAIL_ENCRYPTION_SECRET, 'utf8').digest()
+    : null;
+
+  function encryptText(plainText: string): string {
+    if (!plainText) return '';
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+    let encrypted = cipher.update(plainText, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    return `${iv.toString('hex')}:${authTag}:${encrypted}`;
+  }
+
+  function decryptTextWithKey(cipherText: string, keyBuf: Buffer): string {
+    if (!cipherText || !cipherText.includes(':') || !keyBuf) return '';
+    try {
+      const parts = cipherText.split(':');
+      if (parts.length !== 3) return '';
+      const [ivHex, authTagHex, encryptedHex] = parts;
+      const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, Buffer.from(ivHex, 'hex'));
+      decipher.setAuthTag(Buffer.from(authTagHex, 'hex'));
+      let decrypted = decipher.update(encryptedHex, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    } catch {
+      return '';
+    }
+  }
+
+  function decryptText(cipherText: string): string {
+    const primary = decryptTextWithKey(cipherText, ENCRYPTION_KEY);
+    if (primary) return primary;
+    if (OLD_ENCRYPTION_KEY) {
+      return decryptTextWithKey(cipherText, OLD_ENCRYPTION_KEY);
+    }
+    return '';
+  }
+
+  function maskEmail(email: string): string {
+    if (!email || !email.includes('@')) return '';
+    const [local, domain] = email.split('@');
+    const visible = local.slice(0, 2);
+    const maskedLocal = visible + '***';
+    return `${maskedLocal}@${domain}`;
+  }
+
+  // 旧鍵で暗号化された個人メールアドレスを新鍵で一括再暗号化するマイグレーション
+  function migrateLocalPersonalEmailEncryption() {
+    try {
+      const users = loadUsers();
+      let updatedCount = 0;
+      const migrated = users.map((u: any) => {
+        const enc = u.personalEmailEncrypted || u.personal_email_encrypted;
+        if (!enc || typeof enc !== 'string' || !enc.includes(':')) return u;
+        if (decryptTextWithKey(enc, ENCRYPTION_KEY)) return u;
+        if (OLD_ENCRYPTION_KEY) {
+          const plain = decryptTextWithKey(enc, OLD_ENCRYPTION_KEY);
+          if (plain) {
+            const reEnc = encryptText(plain);
+            const masked = maskEmail(plain);
+            updatedCount++;
+            return {
+              ...u,
+              personalEmailEncrypted: reEnc,
+              personal_email_encrypted: reEnc,
+              personalEmailMasked: masked,
+              personal_email_masked: masked
+            };
+          }
+        }
+        return u;
+      });
+      if (updatedCount > 0) {
+        saveUsers(migrated);
+        console.log(`[Security Migration] users.json 内の個人メール暗号化データ ${updatedCount} 件を新しい秘密鍵で再暗号化しました。`);
+      }
+    } catch (e: any) {
+      console.warn('[Security Migration] users.json 再暗号化チェック警告:', e.message);
+    }
+  }
+  migrateLocalPersonalEmailEncryption();
+
+  // 個人メールアドレスの安全な登録・更新 API (平文は一切保存せず、暗号化文字列とマスク文字列のみ保存)
+  app.post('/api/users/:id/personal-email', (req, res) => {
+    try {
+      const userId = req.params.id;
+      const { personalEmail } = req.body || {};
+      const users = loadUsers();
+      const idx = users.findIndex((item: any) => item.id === userId);
+
+      if (idx === -1) {
+        return res.status(404).json({ error: 'ユーザーが見つかりません' });
+      }
+
+      if (!personalEmail) {
+        // 削除リクエスト
+        users[idx].personalEmailEncrypted = undefined;
+        users[idx].personalEmailMasked = undefined;
+        saveUsers(users);
+        return res.json({
+          success: true,
+          message: '個人メールアドレスの登録を解除しました。',
+          personalEmailMasked: undefined,
+          user: users[idx]
+        });
+      }
+
+      const emailTrimmed = String(personalEmail).trim();
+      if (!emailTrimmed.includes('@') || !emailTrimmed.includes('.')) {
+        return res.status(400).json({ error: '有効なメールアドレス形式で入力してください。' });
+      }
+
+      const encrypted = encryptText(emailTrimmed);
+      const masked = maskEmail(emailTrimmed);
+
+      users[idx].personalEmailEncrypted = encrypted;
+      users[idx].personalEmailMasked = masked;
+      saveUsers(users);
+
+      res.json({
+        success: true,
+        message: '個人メールアドレスを暗号化して安全に保存しました。',
+        personalEmailMasked: masked,
+        user: users[idx]
+      });
+    } catch (err: any) {
+      console.error('[PersonalEmail] Save error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 個人メールアドレス宛テストメール送信 API (暗号化されたアドレスをメモリ上でのみ復号して送信)
+  app.post('/api/users/:id/personal-email/test', async (req, res) => {
+    try {
+      const userId = req.params.id;
+      const users = loadUsers();
+      const user = users.find((u: any) => u.id === userId);
+
+      if (!user) {
+        return res.status(404).json({ error: 'ユーザーが見つかりません' });
+      }
+
+      let targetEmail = '';
+      if (req.body?.personalEmail) {
+        targetEmail = String(req.body.personalEmail).trim();
+      } else if (user.personalEmailEncrypted) {
+        targetEmail = decryptText(user.personalEmailEncrypted);
+      }
+
+      if (!targetEmail) {
+        return res.status(400).json({ error: 'テスト送信先の個人メールアドレスが登録されていないか、復号できませんでした。' });
+      }
+
+      const nowStr = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const subject = '【安否確認テスト】緊急連絡先メール疎通確認';
+      const text = `${user.name} 様\n\n寺岡オートドアSNS 安否確認システムからの緊急連絡先メール通知テストです。\n\n本メールは、緊急安否確認が発動された際にご登録の個人メールアドレスへ確実に通知が届くかをテストするために配信されています。\n\n送信日時: ${nowStr}\n対象ユーザー: ${user.name} (${user.office || ''} ${user.division || ''})`;
+      const html = `
+        <div style="font-family: sans-serif; padding: 24px; line-height: 1.6; color: #1e293b; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 12px; background-color: #ffffff;">
+          <div style="background-color: #dc2626; color: #ffffff; padding: 12px 16px; border-radius: 8px 8px 0 0; margin: -24px -24px 20px -24px;">
+            <h2 style="margin: 0; font-size: 18px; font-weight: 600;">🚨 安否確認 緊急連絡先メールテスト</h2>
+          </div>
+          <p style="font-size: 15px; font-weight: 600; color: #0f172a;">${user.name} 様</p>
+          <p>寺岡オートドアSNS 安否確認システムからの緊急連絡先メール通知テストです。</p>
+          <p>このメールが届いている場合、暗号化保存された個人メールアドレスへの安否確認通知経路は正常に機能しています。</p>
+          <div style="background-color: #fef2f2; padding: 16px; border-radius: 8px; border: 1px solid #fecaca; margin: 20px 0;">
+            <p style="margin: 0 0 8px 0; font-size: 13px; font-weight: 600; color: #991b1b;">【通知配信詳細】</p>
+            <ul style="margin: 0; padding-left: 20px; font-size: 13px; color: #7f1d1d;">
+              <li><b>送信日時:</b> ${nowStr}</li>
+              <li><b>対象社員:</b> ${user.name} 様</li>
+              <li><b>所属:</b> ${user.office || '全社'} / ${user.division || '全部署'}</li>
+            </ul>
+          </div>
+          <p style="font-size: 12px; color: #94a3b8; margin-bottom: 0;">※個人メールアドレスは AES-256-GCM で強固に暗号化されており、管理者画面やデータベース上でも平文は表示・保存されません。</p>
+        </div>
+      `;
+
+      const info = await sendEmailNotification({ to: targetEmail, subject, text, html });
+      res.json({
+        success: true,
+        message: `${maskEmail(targetEmail)} へテストメールを正常に送信しました。`,
+        messageId: info.messageId
+      });
+    } catch (err: any) {
+      console.error('[PersonalEmail] Test send error:', err);
+      res.status(500).json({ error: err.message || 'テストメールの送信に失敗しました。' });
+    }
+  });
+
+  // ==========================================
+  // ユーザー招待 & パスワード設定依頼 API
+  // ==========================================
+  const invitationsPath = path.join(dataDir, 'invitations.json');
+  function loadInvitations(): any[] {
+    if (!fs.existsSync(invitationsPath)) return [];
+    try {
+      const data = JSON.parse(fs.readFileSync(invitationsPath, 'utf8'));
+      return Array.isArray(data) ? data : [];
+    } catch {
+      return [];
+    }
+  }
+  function saveInvitations(invitations: any[]) {
+    try {
+      fs.writeFileSync(invitationsPath, JSON.stringify(invitations, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save invitations:', e);
+    }
+  }
+
+  // 1. ユーザー一括招待 API
+  app.post(['/api/invitations', '/api/invitations/', '/api/invitations/send', '/api/users/invite', '/api/users/invite/'], async (req, res) => {
+    try {
+      const {
+        emails,
+        role = 'user',
+        officeId = '',
+        office = '',
+        divisionId = '',
+        division = '',
+        positionId = '',
+        position = '',
+        department = '',
+        expiresInDays = 7,
+        createdByName = '管理者',
+        baseUrl
+      } = req.body || {};
+
+      let emailList: string[] = [];
+      if (Array.isArray(emails)) {
+        emailList = emails;
+      } else if (typeof emails === 'string') {
+        emailList = emails.split(/[\n,;]+/).map((e: string) => e.trim()).filter((e: string) => e.length > 0);
+      }
+
+      const validEmails = Array.from(new Set(
+        emailList.map((e: string) => e.toLowerCase().trim()).filter((e: string) => e.includes('@') && e.includes('.'))
+      ));
+
+      if (validEmails.length === 0) {
+        return res.status(400).json({ error: '有効な招待先メールアドレスを1件以上指定してください。' });
+      }
+
+      const appBaseUrl = baseUrl || process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po/';
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + (Number(expiresInDays) || 7) * 24 * 60 * 60 * 1000).toISOString();
+      const existingInvitations = loadInvitations();
+      const createdInvitations: any[] = [];
+      const mailResults: any[] = [];
+
+      for (const email of validEmails) {
+        const token = crypto.randomBytes(24).toString('hex');
+        const invId = `inv_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const deptString = department || [office, division, position].filter(Boolean).join(' ');
+
+        const newInv = {
+          id: invId,
+          email,
+          token,
+          role: role === 'admin' ? 'admin' : 'user',
+          officeId: officeId || undefined,
+          office: office || '',
+          divisionId: divisionId || undefined,
+          division: division || '',
+          positionId: positionId || undefined,
+          position: position || '',
+          department: deptString,
+          expiresAt,
+          status: 'pending',
+          createdAt: now.toISOString(),
+          createdByName: createdByName || '管理者'
+        };
+
+        existingInvitations.forEach((inv: any) => {
+          if (inv.email.toLowerCase() === email.toLowerCase() && inv.status === 'pending') {
+            inv.status = 'revoked';
+            inv.revokedAt = now.toISOString();
+          }
+        });
+
+        existingInvitations.unshift(newInv);
+        createdInvitations.push(newInv);
+
+        const inviteUrl = `${appBaseUrl}${appBaseUrl.includes('?') ? '&' : '?'}mode=invite&token=${token}`;
+        const subject = `【TERANAGO SNS】社内ポータルへの招待が届きました`;
+        const text = `${email} 様\n\n${createdByName}様より、TERANAGO 社内SNS・グループウェアへの招待が届いています。\n以下のリンクを開き、アカウントの初期設定（氏名・パスワード設定等）を完了してください。\n\n▼ アカウント初期登録URL:\n${inviteUrl}\n\n※有効期限: ${new Date(expiresAt).toLocaleDateString('ja-JP')} まで\n※心当たりのない場合は本メールを破棄してください。`;
+        
+        const html = `
+          <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; background: #ffffff;">
+            <div style="background: linear-gradient(135deg, #4f46e5 0%, #3b82f6 100%); color: #ffffff; padding: 24px; text-align: center;">
+              <h2 style="margin: 0; font-size: 20px; font-weight: 700;">TERANAGO 社内ポータルへようこそ</h2>
+              <p style="margin: 6px 0 0 0; font-size: 13px; opacity: 0.9;">メンバー招待のお知らせ</p>
+            </div>
+            <div style="padding: 24px; color: #334155; line-height: 1.6; font-size: 14px;">
+              <p style="margin-top: 0;"><b>${email}</b> 様</p>
+              <p><b>${createdByName}</b> 様より、社内SNS・グループウェアへの招待が届きました。</p>
+              <p>下のボタンをクリックして、氏名やログインパスワード等の必須項目を設定し、アカウントを開設してください。</p>
+              <div style="text-align: center; margin: 28px 0;">
+                <a href="${inviteUrl}" style="display: inline-block; background-color: #4f46e5; color: #ffffff; font-weight: bold; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px;">
+                  👉 アカウントを登録して参加する
+                </a>
+              </div>
+              <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; font-size: 12px; color: #64748b;">
+                <p style="margin: 0 0 4px 0;"><b>ボタンが開けない場合:</b> 以下のURLをブラウザに直接貼り付けてください。</p>
+                <p style="margin: 0; word-break: break-all; color: #4f46e5;">${inviteUrl}</p>
+                <p style="margin: 8px 0 0 0; color: #e11d48;">※有効期限: <b>${new Date(expiresAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}</b> まで</p>
+              </div>
+            </div>
+          </div>
+        `;
+
+        try {
+          const mailRes = await sendEmailNotification({ to: email, subject, text, html });
+          mailResults.push({ email, success: true, messageId: mailRes?.messageId });
+        } catch (err: any) {
+          mailResults.push({ email, success: false, error: err.message });
+        }
+      }
+
+      saveInvitations(existingInvitations);
+
+      res.json({
+        success: true,
+        message: `${createdInvitations.length}件の招待を送信しました。`,
+        sentCount: createdInvitations.length,
+        invitations: createdInvitations,
+        mailResults
+      });
+    } catch (err: any) {
+      console.error('[Users] Invite error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 2. 招待一覧取得 API
+  app.get(['/api/invitations', '/api/invitations/', '/api/users/invitations', '/api/users/invitations/'], (req, res) => {
+    try {
+      const list = loadInvitations();
+      const users = loadUsers();
+      const registeredEmails = new Set(users.map((u: any) => (u.email || '').toLowerCase().trim()).filter(Boolean));
+      const now = Date.now();
+      let hasChanges = false;
+
+      const mapped = list.map((inv: any) => {
+        let currentStatus = inv.status;
+        const invEmail = (inv.email || '').toLowerCase().trim();
+        if (currentStatus === 'pending' && registeredEmails.has(invEmail)) {
+          currentStatus = 'accepted';
+          inv.status = 'accepted';
+          hasChanges = true;
+        } else if (currentStatus === 'pending' && new Date(inv.expiresAt).getTime() < now) {
+          currentStatus = 'expired';
+        }
+        return { ...inv, status: currentStatus };
+      });
+
+      if (hasChanges) {
+        saveInvitations(list);
+      }
+      res.json(mapped);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 3. 招待取消・削除 API
+  app.post(['/api/invitations/:id/cancel', '/api/invitations/:id/cancel/', '/api/users/invitations/:id/cancel', '/api/users/invitations/:id/cancel/'], (req, res) => {
+    try {
+      const list = loadInvitations();
+      const target = list.find((i: any) => i.id === req.params.id);
+      if (!target) return res.status(404).json({ error: '招待が見つかりません' });
+      target.status = 'revoked';
+      target.revokedAt = new Date().toISOString();
+      saveInvitations(list);
+      res.json({ success: true, message: '招待を取り消しました', invitation: target });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.delete(['/api/invitations/:id', '/api/invitations/:id/', '/api/users/invitations/:id', '/api/users/invitations/:id/'], (req, res) => {
+    try {
+      const isPermanent = req.query.permanent === 'true' || req.query.hard === 'true';
+      const list = loadInvitations();
+      if (isPermanent) {
+        const updatedList = list.filter((i: any) => i.id !== req.params.id);
+        saveInvitations(updatedList);
+        return res.json({ success: true, message: '招待履歴を完全に削除しました', deletedId: req.params.id });
+      }
+
+      const target = list.find((i: any) => i.id === req.params.id);
+      if (target) {
+        target.status = 'revoked';
+        target.revokedAt = new Date().toISOString();
+        saveInvitations(list);
+      }
+      res.json({ success: true, message: '招待を取り消しました' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 4. 招待再送 API
+  app.post(['/api/invitations/:id/resend', '/api/invitations/:id/resend/', '/api/users/invitations/:id/resend', '/api/users/invitations/:id/resend/'], async (req, res) => {
+    try {
+      const list = loadInvitations();
+      const target = list.find((i: any) => i.id === req.params.id);
+      if (!target) return res.status(404).json({ error: '招待が見つかりません' });
+
+      const appBaseUrl = req.body?.baseUrl || process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po/';
+      const now = new Date();
+      const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      const token = crypto.randomBytes(24).toString('hex');
+
+      target.token = token;
+      target.expiresAt = expiresAt;
+      target.status = 'pending';
+      target.updatedAt = now.toISOString();
+      saveInvitations(list);
+
+      const inviteUrl = `${appBaseUrl}${appBaseUrl.includes('?') ? '&' : '?'}mode=invite&token=${token}`;
+      const subject = `【再送】【TERANAGO SNS】社内ポータルへの招待が届きました`;
+      const text = `${target.email} 様\n\nTERANAGO 社内SNS・グループウェアへの招待リンクを再送いたします。\n以下のリンクを開き、アカウント初期設定を完了してください。\n\n▼ アカウント初期登録URL:\n${inviteUrl}\n\n※有効期限: ${new Date(expiresAt).toLocaleDateString('ja-JP')} まで`;
+      const html = `
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; background: #ffffff;">
+          <div style="background: linear-gradient(135deg, #4f46e5 0%, #3b82f6 100%); color: #ffffff; padding: 24px; text-align: center;">
+            <h2 style="margin: 0; font-size: 20px; font-weight: 700;">【再送】TERANAGO 社内ポータルへの招待</h2>
+          </div>
+          <div style="padding: 24px; color: #334155; line-height: 1.6; font-size: 14px;">
+            <p><b>${target.email}</b> 様</p>
+            <p>社内SNS・グループウェアへの招待リンクを再送いたします。下のボタンより登録を完了してください。</p>
+            <div style="text-align: center; margin: 28px 0;">
+              <a href="${inviteUrl}" style="display: inline-block; background-color: #4f46e5; color: #ffffff; font-weight: bold; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px;">
+                👉 アカウントを登録して参加する
+              </a>
+            </div>
+            <p style="font-size: 12px; color: #64748b;">有効期限: <b>${new Date(expiresAt).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}</b> まで</p>
+          </div>
+        </div>
+      `;
+
+      await sendEmailNotification({ to: target.email, subject, text, html });
+
+      res.json({ success: true, message: '招待メールを再送しました', invitation: target });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 5. 招待トークン検証 API
+  app.get(['/api/invitations/verify', '/api/invitations/verify/', '/api/users/invite/verify', '/api/users/invite/verify/'], (req, res) => {
+    try {
+      const token = req.query.token || req.query.t;
+      if (!token) return res.status(400).json({ error: 'トークンが指定されていません' });
+
+      const list = loadInvitations();
+      const target = list.find((i: any) => i.token === token);
+
+      if (!target) return res.status(404).json({ error: '無効な招待リンクです。' });
+      if (target.status === 'accepted') return res.status(400).json({ error: 'この招待はすでに登録が完了しています。' });
+      if (target.status === 'revoked') return res.status(400).json({ error: 'この招待リンクは管理者により取り消されました。' });
+      if (new Date(target.expiresAt).getTime() < Date.now()) {
+        target.status = 'expired';
+        saveInvitations(list);
+        return res.status(400).json({ error: '招待リンクの有効期限が切れています。' });
+      }
+
+      res.json({
+        success: true,
+        invitation: {
+          id: target.id,
+          email: target.email,
+          role: target.role || 'user',
+          officeId: target.officeId || undefined,
+          office: target.office || '',
+          divisionId: target.divisionId || undefined,
+          division: target.division || '',
+          positionId: target.positionId || undefined,
+          position: target.position || '',
+          department: target.department || '',
+          expiresAt: target.expiresAt
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 6. 招待からの登録完了 API
+  app.post(['/api/invitations/complete', '/api/invitations/complete/', '/api/users/invite/complete', '/api/users/invite/complete/'], (req, res) => {
+    try {
+      const {
+        token,
+        name,
+        kanaName,
+        loginId,
+        password,
+        officeId,
+        office,
+        divisionId,
+        division,
+        positionId,
+        position,
+        avatarUrl,
+        mobileEmail,
+        mobilePhone,
+        phoneExtension
+      } = req.body || {};
+
+      if (!token) return res.status(400).json({ error: '招待トークンが必要です' });
+      if (!name || !name.trim()) return res.status(400).json({ error: '氏名は必須です' });
+      if (!password || password.length < 4) return res.status(400).json({ error: 'パスワードは4文字以上で入力してください' });
+
+      const list = loadInvitations();
+      const inv = list.find((i: any) => i.token === token);
+
+      if (!inv || inv.status !== 'pending') {
+        return res.status(400).json({ error: '招待リンクが無効または既に使用されています' });
+      }
+      if (new Date(inv.expiresAt).getTime() < Date.now()) {
+        return res.status(400).json({ error: '招待リンクの有効期限が切れています' });
+      }
+
+      const users = loadUsers();
+      const newUserId = `u-${Date.now()}`;
+      const finalLoginId = (loginId || '').trim() || inv.email.split('@')[0] || `user_${Date.now().toString().slice(-4)}`;
+      const finalOfficeId = officeId || inv.officeId || undefined;
+      const finalOffice = office || inv.office || '';
+      const finalDivisionId = divisionId || inv.divisionId || undefined;
+      const finalDivision = division || inv.division || '';
+      const finalPositionId = positionId || inv.positionId || undefined;
+      const finalPosition = position || inv.position || '';
+      const deptString = [finalOffice, finalDivision, finalPosition].filter(Boolean).join(' ') || inv.department || '未設定';
+      const finalRole = inv.role || 'user';
+      const isAdmin = finalRole === 'admin';
+
+      const userObj = {
+        id: newUserId,
+        loginId: finalLoginId,
+        password: hashPassword(password),
+        name: name.trim(),
+        kanaName: (kanaName || '').trim(),
+        department: deptString,
+        officeId: finalOfficeId,
+        office: finalOffice,
+        divisionId: finalDivisionId,
+        division: finalDivision,
+        positionId: finalPositionId,
+        position: finalPosition,
+        role: finalRole,
+        isAdmin,
+        avatarUrl: avatarUrl || '',
+        email: inv.email,
+        mobileEmail: (mobileEmail || '').trim(),
+        mobilePhone: (mobilePhone || '').trim(),
+        phoneExtension: (phoneExtension || '').trim(),
+        phone: (mobilePhone || '').trim() || '',
+        mustChangePassword: false,
+        roles: [finalRole],
+        preferences: {
+          roles: [finalRole],
+          invitedAt: new Date().toISOString(),
+          kanaName: (kanaName || '').trim(),
+          email: inv.email,
+          mobileEmail: (mobileEmail || '').trim(),
+          mobilePhone: (mobilePhone || '').trim(),
+          phoneExtension: (phoneExtension || '').trim(),
+          phone: (mobilePhone || '').trim() || ''
+        }
+      };
+
+      users.push(userObj);
+      saveUsers(users);
+
+      inv.status = 'accepted';
+      inv.acceptedAt = new Date().toISOString();
+      inv.acceptedUserId = newUserId;
+      saveInvitations(list);
+
+      res.json({
+        success: true,
+        message: 'アカウント登録が完了しました。',
+        user: sanitizeUserForResponse(userObj)
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 7. パスワード設定依頼メール送信 API
+  app.post([
+    '/api/passwords/request-reset',
+    '/api/passwords/request-reset/',
+    '/api/passwords/request-reset/:id',
+    '/api/users/:id/request-password-reset',
+    '/api/users/:id/request-password-reset/'
+  ], async (req, res) => {
+    try {
+      const userId = req.params.id || req.body?.userId;
+      const { baseUrl, senderName = '管理者', expiresInDays } = req.body || {};
+      const parsedDays = Number(expiresInDays);
+      const validDays = Number.isFinite(parsedDays) && parsedDays >= 1 && parsedDays <= 30
+        ? Math.floor(parsedDays)
+        : 7;
+      const expiresLabel = validDays === 1 ? '24時間以内' : validDays === 7 ? '7日間（1週間以内）' : `${validDays}日間以内`;
+
+      const users = loadUsers();
+      const user = users.find((u: any) => u.id === userId);
+
+      if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+      const targetEmail = user.email || user.mobileEmail;
+
+      if (!targetEmail || !targetEmail.includes('@')) {
+        return res.status(400).json({ error: 'このユーザーにはメールアドレスが登録されていません。' });
+      }
+
+      const token = crypto.randomBytes(24).toString('hex');
+      const expiresAtDate = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000);
+      const expiresAt = expiresAtDate.toISOString();
+      const expiresJstStr = new Intl.DateTimeFormat('ja-JP', {
+        timeZone: 'Asia/Tokyo',
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      }).format(expiresAtDate) + ' (JST)';
+
+      if (!user.preferences) user.preferences = {};
+      user.preferences.resetPasswordToken = token;
+      user.preferences.resetPasswordExpires = expiresAt;
+      user.mustChangePassword = true;
+      user.preferences.mustChangePassword = true;
+      saveUsers(users);
+
+      const appBaseUrl = baseUrl || process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po/';
+      const resetUrl = `${appBaseUrl}${appBaseUrl.includes('?') ? '&' : '?'}mode=reset-password&token=${token}`;
+
+      const subject = `【TERANAGO SNS】パスワード設定のお願い`;
+      const text = `${user.name} 様\n\n${senderName}様より、TERANAGO 社内SNS・グループウェアのパスワード設定依頼が届いています。\n以下のリンクを開き、新しいパスワードを設定してください。\n\n▼ パスワード設定URL:\n${resetUrl}\n\n※有効期限: ${expiresLabel}（${expiresJstStr} まで）\n※心当たりのない場合は管理者までご連絡ください。`;
+      const html = `
+        <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; background: #ffffff;">
+          <div style="background: linear-gradient(135deg, #4f46e5 0%, #3b82f6 100%); color: #ffffff; padding: 24px; text-align: center;">
+            <h2 style="margin: 0; font-size: 20px; font-weight: 700;">パスワード設定のお願い</h2>
+            <p style="margin: 6px 0 0 0; font-size: 13px; opacity: 0.9;">TERANAGO 社内ポータル</p>
+          </div>
+          <div style="padding: 24px; color: #334155; line-height: 1.6; font-size: 14px;">
+            <p><b>${user.name}</b> 様</p>
+            <p>管理者（${senderName}）より、パスワード設定の依頼が届いています。</p>
+            <p>下のボタンをクリックして、新しいパスワードを設定してください。</p>
+            <div style="text-align: center; margin: 28px 0;">
+              <a href="${resetUrl}" style="display: inline-block; background-color: #4f46e5; color: #ffffff; font-weight: bold; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px;">
+                🔑 新しいパスワードを設定する
+              </a>
+            </div>
+            <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; font-size: 12px; color: #64748b;">
+              <p style="margin: 0 0 4px 0;"><b>ボタンが開けない場合:</b> 以下のURLをブラウザに貼り付けてください。</p>
+              <p style="margin: 0; word-break: break-all; color: #4f46e5;">${resetUrl}</p>
+              <p style="margin: 8px 0 0 0; color: #e11d48;">※有効期限: <b>${expiresLabel}</b>（${expiresJstStr} まで）</p>
+            </div>
+          </div>
+        </div>
+      `;
+
+      await sendEmailNotification({ to: targetEmail, subject, text, html });
+
+      res.json({
+        success: true,
+        message: `${user.name} 様（${targetEmail}）へパスワード設定案内メールを送信しました。（有効期限: ${expiresLabel}）`,
+        targetEmail,
+        expiresInDays: validDays,
+        expiresAt
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 7-2. パスワード未設定ユーザーへ一括パスワード設定依頼メール送信 API
+  app.post([
+    '/api/passwords/request-reset-bulk',
+    '/api/passwords/request-reset-bulk/',
+    '/api/users/request-password-reset-bulk',
+    '/api/users/request-password-reset-bulk/'
+  ], async (req, res) => {
+    try {
+      const { senderName = '管理者', baseUrl, expiresInDays } = req.body || {};
+      const parsedDays = Number(expiresInDays);
+      const validDays = Number.isFinite(parsedDays) && parsedDays >= 1 && parsedDays <= 30
+        ? Math.floor(parsedDays)
+        : 7;
+      const expiresLabel = validDays === 1 ? '24時間以内' : validDays === 7 ? '7日間（1週間以内）' : `${validDays}日間以内`;
+
+      const users = loadUsers();
+      let sentCount = 0;
+      let skippedCount = 0;
+      const sentUsers: string[] = [];
+
+      for (const user of users) {
+        const rawPw = user.password || '';
+        const isTestPw = !rawPw || rawPw === 'test' || verifyPassword('test', rawPw).isValid;
+        const isPasswordDefault = isTestPw || user.mustChangePassword === true || user.isPasswordDefault === true;
+
+        const targetEmail = (user.mobileEmail || user.email || '').trim();
+
+        if (isPasswordDefault && targetEmail && targetEmail.includes('@')) {
+          const token = crypto.randomBytes(24).toString('hex');
+          const expiresAtDate = new Date(Date.now() + validDays * 24 * 60 * 60 * 1000);
+          const expiresAt = expiresAtDate.toISOString();
+          const expiresJstStr = new Intl.DateTimeFormat('ja-JP', {
+            timeZone: 'Asia/Tokyo',
+            year: 'numeric',
+            month: 'numeric',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+          }).format(expiresAtDate) + ' (JST)';
+
+          if (!user.preferences) user.preferences = {};
+          user.preferences.resetPasswordToken = token;
+          user.preferences.resetPasswordExpires = expiresAt;
+          user.mustChangePassword = true;
+          user.preferences.mustChangePassword = true;
+
+          const appBaseUrl = baseUrl || process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po/';
+          const resetUrl = `${appBaseUrl}${appBaseUrl.includes('?') ? '&' : '?'}mode=reset-password&token=${token}`;
+
+          const subject = `【TERANAGO SNS】パスワード設定のお願い`;
+          const text = `${user.name} 様\n\n${senderName}様より、TERANAGO 社内SNS・グループウェアのパスワード設定依頼が届いています。\n以下のリンクを開き、新しいパスワードを設定してください。\n\n▼ パスワード設定URL:\n${resetUrl}\n\n※有効期限: ${expiresLabel}（${expiresJstStr} まで）\n※心当たりのない場合は管理者までご連絡ください。`;
+          const html = `
+            <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; background: #ffffff;">
+              <div style="background: linear-gradient(135deg, #e11d48 0%, #4f46e5 100%); color: #ffffff; padding: 24px; text-align: center;">
+                <h2 style="margin: 0; font-size: 20px; font-weight: 700;">パスワード設定のお願い</h2>
+                <p style="margin: 6px 0 0 0; font-size: 13px; opacity: 0.9;">TERANAGO 社内ポータル</p>
+              </div>
+              <div style="padding: 24px; color: #334155; line-height: 1.6; font-size: 14px;">
+                <p><b>${user.name}</b> 様</p>
+                <p>管理者（${senderName}）より、パスワード設定の依頼が届いています。</p>
+                <p>下のボタンをクリックして、新しいパスワードを設定してください。</p>
+                <div style="text-align: center; margin: 28px 0;">
+                  <a href="${resetUrl}" style="display: inline-block; background-color: #e11d48; color: #ffffff; font-weight: bold; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px;">
+                    🔑 新しいパスワードを設定する
+                  </a>
+                </div>
+                <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; font-size: 12px; color: #64748b;">
+                  <p style="margin: 0 0 4px 0;"><b>ボタンが開けない場合:</b> 以下のURLをブラウザに貼り付けてください。</p>
+                  <p style="margin: 0; word-break: break-all; color: #4f46e5;">${resetUrl}</p>
+                  <p style="margin: 8px 0 0 0; color: #e11d48;">※有効期限: <b>${expiresLabel}</b>（${expiresJstStr} まで）</p>
+                </div>
+              </div>
+            </div>
+          `;
+
+          try {
+            await sendEmailNotification({ to: targetEmail, subject, text, html });
+            sentCount++;
+            sentUsers.push(`${user.name} (${targetEmail})`);
+          } catch (e) {
+            console.error(`[Bulk Reset] Failed to send to ${user.name}:`, e);
+          }
+        } else if (isPasswordDefault) {
+          skippedCount++;
+        }
+      }
+
+      saveUsers(users);
+      res.json({
+        success: true,
+        sentCount,
+        skippedCount,
+        expiresInDays: validDays,
+        message: `${sentCount}名に一括パスワード設定依頼メールを送信しました。（有効期限: ${expiresLabel}）` + (skippedCount > 0 ? ` (${skippedCount}名はメールアドレス未設定のためスキップされました)` : ''),
+        sentUsers
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 8. パスワード再設定トークン検証 API
+  app.get([
+    '/api/passwords/verify',
+    '/api/passwords/verify/',
+    '/api/users/reset-password/verify',
+    '/api/users/reset-password/verify/'
+  ], (req, res) => {
+    try {
+      const token = req.query.token || req.query.t;
+      if (!token) return res.status(400).json({ error: 'トークンが必要です' });
+
+      const users = loadUsers();
+      const user = users.find((u: any) => u.preferences?.resetPasswordToken === token);
+
+      if (!user) return res.status(404).json({ error: '無効なパスワード設定リンクです。' });
+      if (new Date(user.preferences.resetPasswordExpires).getTime() < Date.now()) {
+        return res.status(400).json({ error: 'リンクの有効期限が切れています。' });
+      }
+
+      res.json({
+        success: true,
+        user: {
+          id: user.id,
+          name: user.name,
+          loginId: user.loginId,
+          email: user.email
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 9. パスワード再設定実行 API
+  app.post([
+    '/api/passwords/reset',
+    '/api/passwords/reset/',
+    '/api/users/reset-password',
+    '/api/users/reset-password/'
+  ], (req, res) => {
+    try {
+      const { token, newPassword } = req.body || {};
+      if (!token) return res.status(400).json({ error: 'トークンが必要です' });
+      if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: 'パスワードは4文字以上で入力してください' });
+
+      const users = loadUsers();
+      const user = users.find((u: any) => u.preferences?.resetPasswordToken === token);
+
+      if (!user) return res.status(404).json({ error: '無効なパスワード設定リンクです。' });
+      if (new Date(user.preferences.resetPasswordExpires).getTime() < Date.now()) {
+        return res.status(400).json({ error: 'リンクの有効期限が切れています。' });
+      }
+
+      user.password = hashPassword(newPassword);
+      user.mustChangePassword = false;
+      delete user.preferences.resetPasswordToken;
+      delete user.preferences.resetPasswordExpires;
+      user.preferences.mustChangePassword = false;
+      user.preferences.passwordChangedAt = new Date().toISOString();
+
+      saveUsers(users);
+
+      res.json({
+        success: true,
+        message: 'パスワードを設定しました。新しいパスワードでログインしてください。',
+        user: sanitizeUserForResponse(user)
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 10. 初回ログイン時・強制パスワード変更 API
+  app.post([
+    '/api/passwords/force-change',
+    '/api/passwords/force-change/',
+    '/api/users/force-change-password',
+    '/api/users/force-change-password/'
+  ], (req, res) => {
+    try {
+      const { userId, newPassword, currentPassword } = req.body || {};
+      if (!userId) return res.status(400).json({ error: 'ユーザーIDが必要です' });
+      if (!newPassword || newPassword.length < 4) return res.status(400).json({ error: '新しいパスワードは4文字以上で入力してください' });
+
+      const users = loadUsers();
+      const user = users.find((u: any) => u.id === userId);
+
+      if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+      if (currentPassword && user.password && !verifyPassword(currentPassword, user.password).isValid) {
+        return res.status(400).json({ error: '現在のパスワードが一致しません' });
+      }
+
+      user.password = hashPassword(newPassword);
+      user.mustChangePassword = false;
+      if (!user.preferences) user.preferences = {};
+      user.preferences.mustChangePassword = false;
+      user.preferences.passwordChangedAt = new Date().toISOString();
+
+      saveUsers(users);
+
+      res.json({
+        success: true,
+        message: 'パスワードを変更しました。',
+        user: sanitizeUserForResponse(user)
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 個人メール（緊急連絡先）登録依頼メール一斉送信 API
+  app.post(['/api/safety/request-registration', '/safety/request-registration'], async (req, res) => {
+    try {
+      const {
+        userIds = [],
+        appBaseUrl,
+        customMessage = '',
+        sendToCompanyEmail = true,
+        sendToMobileEmail = true,
+        senderName = '安否確認管理者'
+      } = req.body || {};
+
+      if (!Array.isArray(userIds) || userIds.length === 0) {
+        return res.status(400).json({ error: '送信対象の社員（ユーザー）が選択されていません。' });
+      }
+
+      const users = loadUsers();
+      const targetUsers = users.filter((u: any) => userIds.includes(String(u.id)));
+
+      if (targetUsers.length === 0) {
+        return res.status(404).json({ error: '該当するユーザーが見つかりませんでした。' });
+      }
+
+      // 基準URL（フロントエンドURLまたはリクエストオリジン）
+      let baseUrl = appBaseUrl || process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po';
+      if (baseUrl.endsWith('/')) {
+        baseUrl = baseUrl.slice(0, -1);
+      }
+      const directRegistrationUrl = `${baseUrl}/?tab=mypage&openEmergencyContact=true`;
+
+      let sentCount = 0;
+      let skippedCount = 0;
+      const results: Array<{ userId: string; name: string; sentEmails: string[]; error?: string }> = [];
+
+      for (const u of targetUsers) {
+        const targetEmails: string[] = [];
+
+        if (sendToCompanyEmail && u.email && u.email.includes('@')) {
+          targetEmails.push(u.email.trim());
+        }
+
+        if (sendToMobileEmail && u.mobileEmail && u.mobileEmail.includes('@')) {
+          const mob = u.mobileEmail.trim();
+          if (!targetEmails.includes(mob)) {
+            targetEmails.push(mob);
+          }
+        }
+
+        if (targetEmails.length === 0) {
+          skippedCount++;
+          results.push({ userId: u.id, name: u.name, sentEmails: [], error: '送信可能なPC/携帯メールアドレスが未設定です' });
+          continue;
+        }
+
+        const nowJst = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+        const subject = '【安否確認・緊急連絡先登録のお願い】個人メールアドレスの登録手続きについて';
+
+        const textBody = `${u.name} 様\n\n寺岡オートドアSNS 安否確認システムより、緊急連絡先（個人メールアドレス）登録のお願いです。\n\n大地震や自然災害などの有事発生時、会社のPCメールや携帯電話が使用できない場合でも確実に安否確認通知をお届けできるよう、ご自身の個人メールアドレス（Gmailや携帯キャリアメール等）の事前登録をお願いしております。\n\n${customMessage ? `【連絡事項・依頼メッセージ】\n${customMessage}\n\n` : ''}▼ 以下のリンクをクリックすると、個人設定の緊急連絡先登録画面が直接開きます。\n${directRegistrationUrl}\n\n※ご登録いただいた個人メールアドレスは AES-256-GCM により最高水準で暗号化されて保管され、管理者やデータベース上でも平文は一切表示・閲覧できない仕様となっておりますのでご安心ください。\n\n送信日時: ${nowJst}\n発信元: ${senderName}`;
+
+        const htmlBody = `
+          <div style="font-family: sans-serif; padding: 24px; line-height: 1.6; color: #1e293b; max-width: 600px; border: 1px solid #cbd5e1; border-radius: 12px; background-color: #ffffff; margin: auto;">
+            <div style="background-color: #4f46e5; color: #ffffff; padding: 16px 20px; border-radius: 8px 8px 0 0; margin: -24px -24px 20px -24px;">
+              <h2 style="margin: 0; font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+                🛡️ 【安否確認】緊急連絡先（個人メール）登録のお願い
+              </h2>
+            </div>
+
+            <p style="font-size: 15px; font-weight: 600; color: #0f172a;">${u.name} 様</p>
+            
+            <p style="font-size: 14px; color: #334155;">
+              社内SNS安否確認システムより、緊急連絡先（個人メールアドレス）登録のお願いです。
+            </p>
+            <p style="font-size: 14px; color: #334155;">
+              大地震や台風などの大規模災害発生時、会社のメールサーバーや社用携帯が不通になった場合でも確実に安否確認通知をお届けするため、ご自身の個人メールアドレス（Gmail、Yahoo、キャリアメール等）の登録にご協力をお願いいたします。
+            </p>
+
+            ${customMessage ? `
+              <div style="background-color: #f1f5f9; padding: 14px 16px; border-radius: 8px; border-left: 4px solid #4f46e5; margin: 16px 0;">
+                <p style="margin: 0; font-size: 13px; font-weight: 600; color: #334155;">【管理者からのメッセージ】</p>
+                <p style="margin: 4px 0 0 0; font-size: 13px; color: #475569; white-space: pre-wrap;">${customMessage}</p>
+              </div>
+            ` : ''}
+
+            <div style="text-align: center; margin: 28px 0;">
+              <a href="${directRegistrationUrl}" style="display: inline-block; background-color: #4f46e5; color: #ffffff; font-weight: 700; font-size: 15px; padding: 12px 28px; border-radius: 8px; text-decoration: none; box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2);">
+                👉 個人設定を開いて個人メールを登録する
+              </a>
+              <p style="font-size: 12px; color: #64748b; margin-top: 10px;">
+                ※ボタンが開けない場合は、下記URLをブラウザに貼り付けてアクセスしてください：<br>
+                <a href="${directRegistrationUrl}" style="color: #4f46e5; word-break: break-all;">${directRegistrationUrl}</a>
+              </p>
+            </div>
+
+            <div style="background-color: #ecfdf5; padding: 14px 16px; border-radius: 8px; border: 1px solid #a7f3d0; margin: 20px 0;">
+              <p style="margin: 0 0 4px 0; font-size: 13px; font-weight: 700; color: #065f46;">🔒 個人情報の保護・暗号化について</p>
+              <p style="margin: 0; font-size: 12px; color: #047857; line-height: 1.5;">
+                ご登録いただいた個人メールアドレスは <b>AES-256-GCM</b> により強固に暗号化されて保存されます。<br>
+                社内の管理者や役員画面、データベース上でも平文は一切表示・閲覧できず、災害発生時の自動一斉配信時のみ安全に使用されます。
+              </p>
+            </div>
+
+            <div style="border-top: 1px solid #e2e8f0; padding-top: 12px; margin-top: 20px; font-size: 11px; color: #94a3b8;">
+              <p style="margin: 0 0 4px 0;">送信日時: ${nowJst}</p>
+              <p style="margin: 0;">発信元: ${senderName} (寺岡オートドアSNS 安否確認システム)</p>
+            </div>
+          </div>
+        `;
+
+        const sentToThisUser: string[] = [];
+        for (const addr of targetEmails) {
+          try {
+            await sendEmailNotification({
+              to: addr,
+              subject,
+              text: textBody,
+              html: htmlBody
+            });
+            sentToThisUser.push(addr);
+          } catch (mErr: any) {
+            console.error(`[RequestRegistration] Mail send failed for ${addr}:`, mErr);
+          }
+        }
+
+        if (sentToThisUser.length > 0) {
+          sentCount++;
+          results.push({ userId: u.id, name: u.name, sentEmails: sentToThisUser });
+
+          // 社内アプリ内通知も作成
+          try {
+            createNotification({
+              user_id: String(u.id),
+              sender_id: 'admin',
+              sender_name: senderName,
+              type: 'safety_confirmation',
+              title: '【安否確認】個人メールアドレス（緊急連絡先）の登録をお願いします',
+              contents: '有事の安否確認に備え、マイページより個人メールアドレスをご登録ください。',
+              target_id: 'emergency_contact_registration'
+            });
+          } catch (_) {}
+        } else {
+          skippedCount++;
+          results.push({ userId: u.id, name: u.name, sentEmails: [], error: 'メール送信に失敗しました' });
+        }
+      }
+
+      res.json({
+        success: true,
+        message: `${sentCount} 名の社員（PC/携帯メール）宛に登録依頼メールを送信しました。`,
+        sentCount,
+        skippedCount,
+        totalRequested: targetUsers.length,
+        results
+      });
+    } catch (err: any) {
+      console.error('[RequestRegistration] Error:', err);
+      res.status(500).json({ error: err.message || '登録依頼メールの送信中にエラーが発生しました。' });
+    }
+  });
+
+  // ==========================================
+  // 安否確認 (Safety Confirmation) ストレージ & API
+  // ==========================================
+  const safetyEventsPath = path.join(dataDir, 'safety_events.json');
+  const safetyResponsesPath = path.join(dataDir, 'safety_responses.json');
+
+  function loadSafetyEvents(): any[] {
+    if (!fs.existsSync(safetyEventsPath)) return [];
+    try {
+      const data = JSON.parse(fs.readFileSync(safetyEventsPath, 'utf8'));
+      return Array.isArray(data) ? data : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveSafetyEvents(events: any[]) {
+    try {
+      fs.writeFileSync(safetyEventsPath, JSON.stringify(events, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save safety events:', e);
+    }
+  }
+
+  function loadSafetyResponses(): any[] {
+    if (!fs.existsSync(safetyResponsesPath)) return [];
+    try {
+      const data = JSON.parse(fs.readFileSync(safetyResponsesPath, 'utf8'));
+      return Array.isArray(data) ? data : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveSafetyResponses(responses: any[]) {
+    try {
+      fs.writeFileSync(safetyResponsesPath, JSON.stringify(responses, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save safety responses:', e);
+    }
+  }
+
+  // 安否確認イベント一覧取得 API
+  app.get(['/api/safety-events', '/api/safety-events/'], (req, res) => {
+    try {
+      const events = loadSafetyEvents();
+      events.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      res.json(events);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 安否確認発動 API (POST)
+  app.post(['/api/safety-events', '/api/safety-events/'], async (req, res) => {
+    try {
+      const {
+        title,
+        type,
+        disasterType,
+        severity,
+        level,
+        targetOffice,
+        targetDivision,
+        message,
+        notifyWebPush = true,
+        notifyCompanyEmail = true,
+        notifyPersonalEmail = true,
+        isDrill = false,
+        isTest = false,
+        createdBy,
+        createdById,
+        createdByName
+      } = req.body || {};
+
+      const eventType = type || disasterType || 'earthquake';
+
+      if (!title || !eventType) {
+        return res.status(400).json({ error: 'タイトルおよび災害種別は必須です。' });
+      }
+
+      const newId = `safety_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const nowIso = new Date().toISOString();
+
+      const newEvent = {
+        id: newId,
+        title,
+        type: eventType,
+        disasterType: eventType,
+        severity: severity || level || 'warning',
+        level: level || severity || '警戒',
+        targetOffice: targetOffice || '全社',
+        targetDivision: targetDivision || '全部署',
+        message: message || '',
+        notifyWebPush: !!notifyWebPush,
+        notifyCompanyEmail: !!notifyCompanyEmail,
+        notifyPersonalEmail: !!notifyPersonalEmail,
+        isDrill: !!(isDrill || isTest),
+        isTest: !!(isDrill || isTest),
+        status: 'active',
+        createdBy: createdBy || createdById || 'admin',
+        createdByName: createdByName || '管理者',
+        createdAt: nowIso,
+        updatedAt: nowIso
+      };
+
+      const events = loadSafetyEvents();
+      events.unshift(newEvent);
+      saveSafetyEvents(events);
+
+      // 全社ユーザーを読み込み、対象ユーザーをフィルタリング
+      const allUsers = loadUsers();
+      const targetUsers = allUsers.filter((u: any) => {
+        const matchOffice = (!targetOffice || targetOffice === '全社' || u.office === targetOffice);
+        const matchDivision = (!targetDivision || targetDivision === '全部署' || u.division === targetDivision);
+        return matchOffice && matchDivision;
+      });
+
+      console.log(`[SafetyConfirmation] 発動: ${title} (対象者数: ${targetUsers.length} 名)`);
+
+      // 1. アプリ内通知の作成
+      targetUsers.forEach((u: any) => {
+        try {
+          createNotification({
+            user_id: String(u.id),
+            sender_id: String(createdBy || 'admin'),
+            sender_name: createdByName || '安否確認本部',
+            type: 'safety_confirmation',
+            title: `【緊急安否確認】${title}`,
+            contents: message || '安否状況の回答をお願いします。',
+            target_id: newId
+          });
+        } catch (_) {}
+      });
+
+      // 2. Web Push 通知の一斉配信
+      if (notifyWebPush) {
+        try {
+          for (const u of targetUsers) {
+            await sendPushNotificationToUser({
+              targetUserId: String(u.id),
+              title: `🚨【安否確認】${title}`,
+              body: message || 'ただちに安否確認画面を開き、状況を回答してください。',
+              url: `/?tab=safety_confirmation&eventId=${newId}`,
+              data: { eventId: newId, tab: 'safety_confirmation' },
+              tag: `safety_${newId}`
+            });
+          }
+        } catch (pushErr) {
+          console.warn('[SafetyConfirmation] Push通知エラー:', pushErr);
+        }
+      }
+
+      // 3. メール一斉配信（会社PC・携帯メール + 暗号化個人メール）
+      if (notifyCompanyEmail || notifyPersonalEmail) {
+        const mailPromises = targetUsers.map(async (u: any) => {
+          const emailAddresses: string[] = [];
+
+          if (notifyCompanyEmail) {
+            if (u.email && u.email.includes('@')) emailAddresses.push(u.email);
+            if (u.mobileEmail && u.mobileEmail.includes('@') && u.mobileEmail !== u.email) {
+              emailAddresses.push(u.mobileEmail);
+            }
+          }
+
+          if (notifyPersonalEmail && u.personalEmailEncrypted) {
+            const decrypted = decryptText(u.personalEmailEncrypted);
+            if (decrypted && decrypted.includes('@') && !emailAddresses.includes(decrypted)) {
+              emailAddresses.push(decrypted);
+            }
+          }
+
+          if (emailAddresses.length === 0) return;
+
+          const appBaseUrl = (req.body && req.body.appBaseUrl && typeof req.body.appBaseUrl === 'string' && req.body.appBaseUrl.startsWith('http'))
+            ? req.body.appBaseUrl.replace(/\/+$/, '')
+            : (process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po').replace(/\/+$/, '');
+          const directAnswerLink = `${appBaseUrl}/?tab=safety_confirmation&safetyEventId=${newId}&safetyUserId=${u.id}`;
+          const nowJst = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+          const subject = `【緊急安否確認】${isDrill ? '【訓練】' : ''}${title}`;
+          const text = `${u.name} 様\n\n【緊急安否確認】${isDrill ? '【訓練】' : ''}${title}\n\n${message ? `■ 本部からの連絡事項:\n${message}\n\n` : ''}至急、以下のURLを開き現在の安否状況をご回答ください。\n（スマートフォンまたはPCから1タップで簡単に回答・報告できます）\n\n▼ 安否回答用URL:\n${directAnswerLink}\n\n発動日時: ${nowJst}\n発信本部: ${createdByName || '安否確認本部'}`;
+
+          const html = `
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 24px; line-height: 1.6; color: #1e293b; max-width: 600px; border: 2px solid #dc2626; border-radius: 16px; background-color: #ffffff; margin: 0 auto;">
+              <div style="background-color: #dc2626; color: #ffffff; padding: 16px 20px; border-radius: 12px 12px 0 0; margin: -24px -24px 20px -24px;">
+                <h2 style="margin: 0; font-size: 18px; font-weight: 800;">🚨 【緊急安否確認】${isDrill ? '【訓練】' : ''}${title}</h2>
+              </div>
+              <p style="font-size: 16px; font-weight: 700; color: #0f172a; margin-top: 0;">${u.name} 様</p>
+              <p style="font-size: 14px; color: #334155;">安否確認が発動されました。身の安全を確保した上で、速やかに以下のURLより現在の安否状況・出社可否をご回答ください。</p>
+              ${message ? `
+                <div style="background-color: #fef2f2; padding: 14px 16px; border-radius: 8px; border-left: 4px solid #dc2626; margin: 16px 0;">
+                  <p style="margin: 0 0 4px 0; font-size: 12px; font-weight: 700; color: #991b1b;">本部からの連絡事項:</p>
+                  <p style="margin: 0; font-size: 14px; color: #991b1b; white-space: pre-wrap; font-weight: 600;">${message}</p>
+                </div>
+              ` : ''}
+              <div style="text-align: center; margin: 28px 0; background-color: #fff1f2; padding: 20px; border-radius: 12px; border: 1px dashed #f43f5e;">
+                <a href="${directAnswerLink}" style="display: inline-block; background-color: #dc2626; color: #ffffff; padding: 15px 36px; font-size: 16px; font-weight: 800; text-decoration: none; border-radius: 12px; box-shadow: 0 4px 14px rgba(220, 38, 38, 0.4);">
+                  👉 今すぐ安否状況を回答する (1タップ報告)
+                </a>
+                <p style="font-size: 12px; color: #475569; margin: 14px 0 4px 0; font-weight: 700;">
+                  ※ボタンが開けない場合は下記の回答URLを直接ブラウザで開いてください：
+                </p>
+                <a href="${directAnswerLink}" style="font-size: 12px; color: #dc2626; word-break: break-all; text-decoration: underline; font-weight: 600;">
+                  ${directAnswerLink}
+                </a>
+              </div>
+              <div style="background-color: #f8fafc; padding: 12px 16px; border-radius: 8px; border: 1px solid #e2e8f0; font-size: 11px; color: #64748b;">
+                <p style="margin: 0 0 4px 0;"><b>発動日時:</b> ${nowJst}</p>
+                <p style="margin: 0;"><b>発信本部:</b> ${createdByName || '安否確認本部'} (寺岡オートドアSNS 安否確認システム)</p>
+              </div>
+            </div>
+          `;
+
+          for (const addr of emailAddresses) {
+            try {
+              await sendEmailNotification({ to: addr, subject, text, html });
+            } catch (mailErr) {
+              console.warn(`[SafetyConfirmation] Mail error to ${maskEmail(addr)}:`, mailErr);
+            }
+          }
+        });
+
+        // バックグラウンドでメール配信処理を実行
+        Promise.all(mailPromises).catch((err) => console.error('[SafetyConfirmation] Batch mail error:', err));
+      }
+
+      res.status(201).json({
+        success: true,
+        message: '安否確認を発動し、対象者へ一斉通知を開始しました。',
+        event: newEvent,
+        targetUserCount: targetUsers.length
+      });
+    } catch (err: any) {
+      console.error('Safety event trigger error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 安否確認 未回答者へのリマインド一斉送信 API
+  app.post(['/api/safety-events/:id/remind', '/api/safety/events/:id/remind'], async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { appBaseUrl, senderName } = req.body || {};
+
+      const events = loadSafetyEvents();
+      const event = events.find((e: any) => e.id === id);
+      if (!event) {
+        return res.status(404).json({ error: '対象の安否確認イベントが見つかりません。' });
+      }
+
+      const responses = loadSafetyResponses().filter((r: any) => r.eventId === id);
+      const answeredUserIds = new Set(responses.map((r: any) => String(r.userId)));
+
+      const allUsers = loadUsers();
+      const targetUsers = allUsers.filter((u: any) => {
+        const matchOffice = (!event.targetOffice || event.targetOffice === '全社' || u.office === event.targetOffice);
+        const matchDivision = (!event.targetDivision || event.targetDivision === '全部署' || u.division === event.targetDivision);
+        return matchOffice && matchDivision;
+      });
+
+      const unansweredUsers = targetUsers.filter((u: any) => !answeredUserIds.has(String(u.id)));
+
+      if (unansweredUsers.length === 0) {
+        return res.json({
+          success: true,
+          message: '対象の全社員が回答済みです。未回答者はいません。',
+          remindedCount: 0
+        });
+      }
+
+      const resolvedBaseUrl = (appBaseUrl && typeof appBaseUrl === 'string' && appBaseUrl.startsWith('http'))
+        ? appBaseUrl.replace(/\/$/, '')
+        : (process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po').replace(/\/+$/, '');
+
+      const directAnswerLink = `${resolvedBaseUrl}/?tab=safety_confirmation&safetyEventId=${event.id}`;
+      const nowJst = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+
+      // WebPush 再送
+      for (const u of unansweredUsers) {
+        try {
+          await sendPushNotificationToUser({
+            targetUserId: String(u.id),
+            title: `⚠️【未回答・再送】安否確認: ${event.title}`,
+            body: 'まだ安否確認の回答が完了していません。至急ご回答をお願いします。',
+            url: `/?tab=safety_confirmation&safetyEventId=${event.id}`,
+            tag: `safety_remind_${event.id}`
+          });
+        } catch (_) {}
+      }
+
+      // メール再送
+      let remindedCount = 0;
+      const mailPromises = unansweredUsers.map(async (u: any) => {
+        const directAnswerLink = `${resolvedBaseUrl}/?tab=safety_confirmation&safetyEventId=${event.id}&safetyUserId=${u.id}`;
+        const emailAddresses: string[] = [];
+        if (u.email && u.email.includes('@')) emailAddresses.push(u.email);
+        if (u.mobileEmail && u.mobileEmail.includes('@') && !emailAddresses.includes(u.mobileEmail)) {
+          emailAddresses.push(u.mobileEmail);
+        }
+        if (u.personalEmailEncrypted) {
+          const decrypted = decryptText(u.personalEmailEncrypted);
+          if (decrypted && decrypted.includes('@') && !emailAddresses.includes(decrypted)) {
+            emailAddresses.push(decrypted);
+          }
+        }
+
+        if (emailAddresses.length === 0) return;
+
+        const subject = `【再送・至急】⚠️【安否確認】未回答の確認 (${event.title})`;
+        const text = `${u.name} 様\n\n【安否確認システムからの再送連絡】\n\n発動中の安否確認（${event.title}）について、まだ回答が確認できておりません。\n\n身の安全を確保した上で、至急以下のURLより安否状況をご回答ください。\n\n▼ 安否回答用URL:\n${directAnswerLink}\n\n発動本部: ${senderName || event.createdByName || '安否確認本部'}\n送信日時: ${nowJst}`;
+
+        const html = `
+          <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; padding: 24px; line-height: 1.6; color: #1e293b; max-width: 600px; border: 2px solid #e11d48; border-radius: 16px; background-color: #ffffff; margin: 0 auto;">
+            <div style="background-color: #e11d48; color: #ffffff; padding: 16px 20px; border-radius: 12px 12px 0 0; margin: -24px -24px 20px -24px;">
+              <h2 style="margin: 0; font-size: 18px; font-weight: 800;">⚠️ 【再送・至急】安否状況のご回答をお願いします</h2>
+            </div>
+            <p style="font-size: 16px; font-weight: 700; color: #0f172a; margin-top: 0;">${u.name} 様</p>
+            <p style="font-size: 14px; color: #334155;">
+              発動中の安否確認<strong>「${event.title}」</strong>について、まだご回答をいただいておりません。<br>
+              会社の安全確認および支援体制確保のため、至急現在の状況をご回答ください。
+            </p>
+            <div style="text-align: center; margin: 28px 0; background-color: #fff1f2; padding: 20px; border-radius: 12px; border: 1px dashed #f43f5e;">
+              <a href="${directAnswerLink}" style="display: inline-block; background-color: #e11d48; color: #ffffff; padding: 15px 36px; font-size: 16px; font-weight: 800; text-decoration: none; border-radius: 12px; box-shadow: 0 4px 14px rgba(225, 29, 72, 0.4);">
+                👉 今すぐ安否状況を回答する
+              </a>
+              <p style="font-size: 12px; color: #475569; margin: 14px 0 4px 0; font-weight: 700;">
+                ※ボタンが開けない場合は下記の回答URLを直接開いてください：
+              </p>
+              <a href="${directAnswerLink}" style="font-size: 12px; color: #e11d48; word-break: break-all; text-decoration: underline; font-weight: 600;">
+                ${directAnswerLink}
+              </a>
+            </div>
+            <div style="background-color: #f8fafc; padding: 12px 16px; border-radius: 8px; border: 1px solid #e2e8f0; font-size: 11px; color: #64748b;">
+              <p style="margin: 0 0 4px 0;">送信日時: ${nowJst}</p>
+              <p style="margin: 0;">発信元: ${senderName || event.createdByName || '安否確認本部'}</p>
+            </div>
+          </div>
+        `;
+
+        let sent = false;
+        for (const addr of emailAddresses) {
+          try {
+            await sendEmailNotification({ to: addr, subject, text, html });
+            sent = true;
+          } catch (_) {}
+        }
+        if (sent) remindedCount++;
+      });
+
+      await Promise.all(mailPromises);
+
+      res.json({
+        success: true,
+        message: `未回答者 ${unansweredUsers.length} 名にリマインド通知を再送しました。`,
+        remindedCount: unansweredUsers.length
+      });
+    } catch (err: any) {
+      console.error('Safety remind error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 安否確認イベント更新 API (ステータス完了化など)
+  app.put(['/api/safety-events/:id', '/api/safety/events/:id'], (req, res) => {
+    try {
+      const { id } = req.params;
+      const data = req.body || {};
+      const events = loadSafetyEvents();
+      const idx = events.findIndex(e => e.id === id);
+
+      if (idx === -1) {
+        return res.status(404).json({ error: '安否確認イベントが見つかりません' });
+      }
+
+      events[idx] = {
+        ...events[idx],
+        ...data,
+        id,
+        updatedAt: new Date().toISOString()
+      };
+      saveSafetyEvents(events);
+
+      res.json({ success: true, event: events[idx] });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 安否確認イベント削除 API (個別イベント削除)
+  app.delete(['/api/safety-events/:id', '/api/safety/events/:id', '/api/safety-events/:id/delete', '/api/safety/events/:id/delete'], (req, res) => {
+    try {
+      const { id } = req.params;
+      let events = loadSafetyEvents();
+      events = events.filter(e => e.id !== id);
+      saveSafetyEvents(events);
+
+      let responses = loadSafetyResponses();
+      responses = responses.filter(r => r.eventId !== id);
+      saveSafetyResponses(responses);
+
+      res.json({ success: true, message: '安否確認イベントおよび回答データを削除しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+  app.post(['/api/safety-events/:id/delete', '/api/safety/events/:id/delete'], (req, res) => {
+    try {
+      const { id } = req.params;
+      let events = loadSafetyEvents();
+      events = events.filter(e => e.id !== id);
+      saveSafetyEvents(events);
+
+      let responses = loadSafetyResponses();
+      responses = responses.filter(r => r.eventId !== id);
+      saveSafetyResponses(responses);
+
+      res.json({ success: true, message: '安否確認イベントおよび回答データを削除しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 個別回答レコード削除 API (ユーザーの特定回答の取り消し・リセット)
+  app.delete([
+    '/api/safety-events/:eventId/responses/:userId',
+    '/api/safety/events/:eventId/responses/:userId',
+    '/api/safety-events/:eventId/responses/:userId/delete',
+    '/api/safety-responses/:id',
+    '/api/safety/responses/:id'
+  ], (req, res) => {
+    try {
+      const { eventId, userId, id } = req.params;
+      let responses = loadSafetyResponses();
+      
+      if (id) {
+        responses = responses.filter(r => r.id !== id);
+      } else if (eventId && userId) {
+        responses = responses.filter(r => !(r.eventId === eventId && String(r.userId) === String(userId)));
+      }
+
+      saveSafetyResponses(responses);
+      res.json({ success: true, message: '安否回答レコードを削除しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post([
+    '/api/safety-events/:eventId/responses/:userId/delete',
+    '/api/safety/events/:eventId/responses/:userId/delete',
+    '/api/safety-responses/:id/delete',
+    '/api/safety/responses/:id/delete'
+  ], (req, res) => {
+    try {
+      const { eventId, userId, id } = req.params;
+      let responses = loadSafetyResponses();
+      
+      if (id) {
+        responses = responses.filter(r => r.id !== id);
+      } else if (eventId && userId) {
+        responses = responses.filter(r => !(r.eventId === eventId && String(r.userId) === String(userId)));
+      }
+
+      saveSafetyResponses(responses);
+      res.json({ success: true, message: '安否回答レコードを削除しました。' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 安否確認回答一覧取得 API
+  app.get([
+    '/api/safety-events/:id/responses',
+    '/api/safety-events/:id/responses/',
+    '/api/safety/events/:id/responses',
+    '/api/safety/events/:id/responses/'
+  ], (req, res) => {
+    try {
+      const { id } = req.params;
+      const trimmedId = String(id).trim();
+      const responses = loadSafetyResponses()
+        .filter(r => String(r.eventId).trim() === trimmedId)
+        .map(r => ({
+          ...r,
+          id: String(r.id),
+          eventId: String(r.eventId || trimmedId),
+          userId: String(r.userId),
+          userName: r.userName || '',
+          office: r.office || r.userOffice || '',
+          division: r.division || r.userDivision || '',
+          userOffice: r.userOffice || r.office || '',
+          userDivision: r.userDivision || r.division || '',
+          safetyStatus: r.safetyStatus || r.status || 'safe',
+          status: r.status || r.safetyStatus || 'safe',
+          familyStatus: r.familyStatus || 'all_safe',
+          houseStatus: r.houseStatus || 'no_damage',
+          workAvailability: r.workAvailability || r.canWork || 'available',
+          canWork: r.canWork || r.workAvailability || 'available',
+          locationStatus: r.locationStatus || r.currentLocation || r.location || '自宅',
+          currentLocation: r.currentLocation || r.locationStatus || r.location || '自宅',
+          location: r.location || r.currentLocation || '自宅',
+          message: r.message || r.comment || '',
+          comment: r.comment || r.message || '',
+          respondedAt: r.respondedAt ? new Date(r.respondedAt).toISOString() : new Date().toISOString()
+        }));
+      res.json(responses);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 安否確認回答送信 API (ユーザーの回答登録・更新)
+  app.post([
+    '/api/safety-events/:id/respond',
+    '/api/safety-events/:id/respond/',
+    '/api/safety/events/:id/respond',
+    '/api/safety/events/:id/respond/'
+  ], (req, res) => {
+    try {
+      const { id } = req.params;
+      const {
+        userId,
+        userName,
+        office,
+        division,
+        userOffice,
+        userDivision,
+        status,
+        safetyStatus,
+        familyStatus,
+        houseStatus,
+        workAvailability,
+        canWork,
+        currentLocation,
+        locationStatus,
+        location,
+        comment,
+        message,
+        locationCoordinates
+      } = req.body || {};
+
+      const effectiveStatus = status || safetyStatus || 'safe';
+      const effectiveCanWork = canWork || workAvailability || 'available';
+      const effectiveLocation = currentLocation || locationStatus || location || '自宅';
+      const effectiveComment = comment || message || '';
+      const effectiveOffice = userOffice || office || '';
+      const effectiveDivision = userDivision || division || '';
+
+      if (!userId) {
+        return res.status(400).json({ error: 'ユーザーIDは必須です。' });
+      }
+
+      const trimmedId = String(id).trim();
+      const trimmedUserId = String(userId).trim();
+
+      const events = loadSafetyEvents();
+      const event = events.find(e => String(e.id).trim() === trimmedId);
+      if (!event) {
+        return res.status(404).json({ error: '安否確認イベントが存在しません。' });
+      }
+
+      const responses = loadSafetyResponses();
+      const nowIso = new Date().toISOString();
+      const idx = responses.findIndex(r => String(r.eventId).trim() === trimmedId && String(r.userId).trim() === trimmedUserId);
+
+      const responseRecord = {
+        id: idx >= 0 ? responses[idx].id : `resp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        eventId: trimmedId,
+        userId: trimmedUserId,
+        userName: userName || '匿名',
+        office: effectiveOffice,
+        division: effectiveDivision,
+        userOffice: effectiveOffice,
+        userDivision: effectiveDivision,
+        safetyStatus: effectiveStatus,
+        status: effectiveStatus,
+        familyStatus: familyStatus || 'all_safe',
+        houseStatus: houseStatus || 'no_damage',
+        workAvailability: effectiveCanWork,
+        canWork: effectiveCanWork,
+        locationStatus: effectiveLocation,
+        currentLocation: effectiveLocation,
+        location: effectiveLocation,
+        message: effectiveComment,
+        comment: effectiveComment,
+        locationCoordinates: locationCoordinates || undefined,
+        respondedAt: nowIso,
+        updatedAt: nowIso
+      };
+
+      if (idx >= 0) {
+        responses[idx] = responseRecord;
+      } else {
+        responses.unshift(responseRecord);
+      }
+
+      saveSafetyResponses(responses);
+
+      res.json({
+        success: true,
+        message: '安否確認の回答を受け付けました。',
+        response: responseRecord
+      });
+    } catch (err: any) {
+      console.error('Safety respond error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 気象庁 / 地震速報連動 自動発動エンジン (JMA Earthquake Auto-Trigger)
+  // ==========================================
+  const safetyAutoSettingsPath = path.join(dataDir, 'safety_auto_settings.json');
+
+  const defaultAutoSettings = {
+    enabled: true,
+    minIntensity: '5minus', // '4' (震度4), '5minus' (震度5弱), '5plus' (震度5強), '6minus' (震度6弱), '6plus' (震度6強), '7' (震度7)
+    targetScope: 'all', // 'all' | 'affected_offices'
+    targetOffices: ['名古屋', '東京', '大阪', '静岡', '浜松', '本社'],
+    notifyWebPush: true,
+    notifyCompanyEmail: true,
+    notifyPersonalEmail: true,
+    isDrillMode: false,
+    lastTriggeredQuakeId: '',
+    lastCheckedAt: new Date().toISOString(),
+    logs: [] as any[]
+  };
+
+  function loadSafetyAutoSettings() {
+    if (!fs.existsSync(safetyAutoSettingsPath)) {
+      try {
+        fs.writeFileSync(safetyAutoSettingsPath, JSON.stringify(defaultAutoSettings, null, 2), 'utf8');
+      } catch (e) {}
+      return defaultAutoSettings;
+    }
+    try {
+      const data = JSON.parse(fs.readFileSync(safetyAutoSettingsPath, 'utf8'));
+      return { ...defaultAutoSettings, ...data };
+    } catch (e) {
+      return defaultAutoSettings;
+    }
+  }
+
+  function saveSafetyAutoSettings(settings: any) {
+    try {
+      fs.writeFileSync(safetyAutoSettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save safety auto settings:', e);
+    }
+  }
+
+  const INTENSITY_NUMERIC: Record<string, number> = {
+    '1': 10,
+    '2': 20,
+    '3': 30,
+    '4': 40,
+    '5minus': 45,
+    '5plus': 50,
+    '6minus': 55,
+    '6plus': 60,
+    '7': 70
+  };
+
+  function intensityToText(scale: number): string {
+    if (scale >= 70) return '震度7';
+    if (scale >= 60) return '震度6強';
+    if (scale >= 55) return '震度6弱';
+    if (scale >= 50) return '震度5強';
+    if (scale >= 45) return '震度5弱';
+    if (scale >= 40) return '震度4';
+    if (scale >= 30) return '震度3';
+    if (scale >= 20) return '震度2';
+    if (scale >= 10) return '震度1';
+    return '不明';
+  }
+
+  // 最新地震情報を取得 (P2P地震情報 API)
+  async function fetchLatestEarthquakes(): Promise<any[]> {
+    try {
+      const response = await fetch('https://api.p2pquake.net/v2/history?codes=551&limit=10', {
+        headers: { 'User-Agent': 'Teranago-SNS-SafetyConfirmation/1.0' }
+      });
+      if (!response.ok) return [];
+      const data: any = await response.json();
+      return Array.isArray(data) ? data : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  // 地震データに基づく自動安否確認発動ロジック
+  async function processEarthquakeTrigger(quake: any, isSimulated = false) {
+    const settings = loadSafetyAutoSettings();
+    if (!settings.enabled && !isSimulated) {
+      return { triggered: false, reason: '自動連動が無効になっています' };
+    }
+
+    const quakeId = quake.id || `sim_${Date.now()}`;
+    if (!isSimulated && settings.lastTriggeredQuakeId === quakeId) {
+      return { triggered: false, reason: 'すでに発動済みの地震データです' };
+    }
+
+    const maxScale = quake.earthquake?.maxScale || quake.maxScale || 0;
+    const threshold = INTENSITY_NUMERIC[settings.minIntensity] || 45;
+
+    if (maxScale < threshold && !isSimulated) {
+      return { triggered: false, reason: `最大震度(${intensityToText(maxScale)})が設定閾値(${intensityToText(threshold)})未満です` };
+    }
+
+    const epicenter = quake.earthquake?.hypocenter?.name || quake.hypocenter?.name || '国内震源';
+    const magnitude = quake.earthquake?.hypocenter?.magnitude || quake.hypocenter?.magnitude || '不明';
+    const maxScaleText = intensityToText(maxScale);
+    const quakeTime = quake.earthquake?.time || quake.time || new Date().toLocaleString('ja-JP');
+
+    const eventTitle = `【緊急安否確認(気象庁連動)】${epicenter}で最大${maxScaleText}観測`;
+    const eventMessage = `気象庁より${epicenter}を震源とする地震（最大${maxScaleText}、M${magnitude}、発生時刻: ${quakeTime}）が検知されました。\nシステムにより安否確認が自動発動されました。身の安全を最優先に確保した上で、現在の安否状況をご回答ください。`;
+
+    const newEventId = `safety_jma_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const nowIso = new Date().toISOString();
+
+    const newEvent = {
+      id: newEventId,
+      title: eventTitle,
+      type: 'earthquake',
+      disasterType: 'earthquake',
+      severity: maxScaleText,
+      level: maxScaleText,
+      targetOffice: '全社',
+      targetDivision: '全部署',
+      message: eventMessage,
+      notifyWebPush: settings.notifyWebPush,
+      notifyCompanyEmail: settings.notifyCompanyEmail,
+      notifyPersonalEmail: settings.notifyPersonalEmail,
+      isDrill: settings.isDrillMode || isSimulated,
+      isTest: isSimulated,
+      status: 'active',
+      createdBy: 'jma_system',
+      createdById: 'jma_system',
+      createdByName: isSimulated ? '気象庁連動シミュレーター' : '気象庁 地震速報自動連動システム',
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+
+    const events = loadSafetyEvents();
+    events.unshift(newEvent);
+    saveSafetyEvents(events);
+
+    // 設定の最新発動IDを記録
+    settings.lastTriggeredQuakeId = quakeId;
+    settings.lastCheckedAt = nowIso;
+    settings.logs = [
+      {
+        id: `log_${Date.now()}`,
+        time: nowIso,
+        quakeId,
+        epicenter,
+        maxScaleText,
+        eventId: newEventId,
+        isSimulated
+      },
+      ...(settings.logs || []).slice(0, 19)
+    ];
+    saveSafetyAutoSettings(settings);
+
+    // ユーザーへの通知配信
+    const allUsers = loadUsers();
+    const targetUsers = allUsers;
+
+    if (settings.notifyCompanyEmail || settings.notifyPersonalEmail) {
+      for (const u of targetUsers) {
+        const autoBaseUrl = (process.env.APP_BASE_URL || 'https://teranago-sns.github.io/po').replace(/\/+$/, '');
+        const directLink = `${autoBaseUrl}/?tab=safety_confirmation&safetyEventId=${newEventId}&safetyUserId=${u.id}`;
+        const emailAddresses: string[] = [];
+        if (settings.notifyCompanyEmail && u.email && u.email.includes('@')) {
+          emailAddresses.push(u.email.trim());
+        }
+        if (settings.notifyPersonalEmail && (u.personalEmailEncrypted || u.personal_email_encrypted)) {
+          const dec = decryptText(u.personalEmailEncrypted || u.personal_email_encrypted);
+          if (dec && dec.includes('@') && !emailAddresses.includes(dec)) {
+            emailAddresses.push(dec.trim());
+          }
+        }
+
+        const mailSubject = `【緊急安否確認(自動発動)】${eventTitle}`;
+        const mailText = `${u.name} 様\n\n${eventMessage}\n\n▼ 安否状況の回答URL (1タップ回答):\n${directLink}\n\n発動日時: ${new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}`;
+
+        for (const addr of emailAddresses) {
+          sendEmailNotification({
+            to: addr,
+            subject: mailSubject,
+            text: mailText
+          }).catch(() => {});
+        }
+      }
+    }
+
+    return {
+      triggered: true,
+      eventId: newEventId,
+      event: newEvent,
+      targetsCount: targetUsers.length,
+      epicenter,
+      maxScaleText
+    };
+  }
+
+  // 1分ごとの気象庁地震情報ポーリング監視ワーカー
+  let jmaPollingTimer: NodeJS.Timeout | null = null;
+  function startJmaMonitor() {
+    if (jmaPollingTimer) clearInterval(jmaPollingTimer);
+    jmaPollingTimer = setInterval(async () => {
+      try {
+        const settings = loadSafetyAutoSettings();
+        if (!settings.enabled) return;
+        const quakes = await fetchLatestEarthquakes();
+        if (quakes && quakes.length > 0) {
+          const latestQuake = quakes[0];
+          // 発生から10分以内の地震のみ対象
+          const quakeTime = new Date(latestQuake.time || latestQuake.earthquake?.time || 0).getTime();
+          const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
+          if (quakeTime > tenMinutesAgo) {
+            await processEarthquakeTrigger(latestQuake, false);
+          }
+        }
+        settings.lastCheckedAt = new Date().toISOString();
+        saveSafetyAutoSettings(settings);
+      } catch (err) {
+        console.error('[JMA Monitor] Polling error:', err);
+      }
+    }, 60 * 1000);
+  }
+  startJmaMonitor();
+
+  // API 1: 気象庁自動発動設定 取得
+  app.get([
+    '/api/safety/auto-trigger-settings',
+    '/api/safety-auto-trigger-settings',
+    '/api/safety/auto-settings'
+  ], (req, res) => {
+    try {
+      const settings = loadSafetyAutoSettings();
+      res.json(settings);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API 2: 気象庁自動発動設定 保存・更新
+  app.post([
+    '/api/safety/auto-trigger-settings',
+    '/api/safety-auto-trigger-settings',
+    '/api/safety/auto-settings'
+  ], (req, res) => {
+    try {
+      const data = req.body || {};
+      const current = loadSafetyAutoSettings();
+      const updated = {
+        ...current,
+        ...data,
+        updatedAt: new Date().toISOString()
+      };
+      saveSafetyAutoSettings(updated);
+      res.json({ success: true, message: '気象庁連動・自動発動設定を保存しました。', settings: updated });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API 3: 直近の地震情報フィード取得 (API経由)
+  app.get([
+    '/api/safety/latest-earthquakes',
+    '/api/safety-latest-earthquakes'
+  ], async (req, res) => {
+    try {
+      const quakes = await fetchLatestEarthquakes();
+      res.json(quakes);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // API 4: 疑似地震テスト発動シミュレーション
+  app.post([
+    '/api/safety/test-jma-trigger',
+    '/api/safety-test-jma-trigger'
+  ], async (req, res) => {
+    try {
+      const {
+        epicenter = '愛知県西部',
+        scale = 50, // 50 = 震度5強
+        magnitude = 6.2,
+        depth = 10
+      } = req.body || {};
+
+      const mockQuake = {
+        id: `sim_${Date.now()}`,
+        time: new Date().toLocaleString('ja-JP'),
+        earthquake: {
+          time: new Date().toLocaleString('ja-JP'),
+          hypocenter: {
+            name: epicenter,
+            depth,
+            magnitude
+          },
+          maxScale: scale
+        }
+      };
+
+      const result = await processEarthquakeTrigger(mockQuake, true);
+      res.json({
+        success: true,
+        message: `疑似地震（${epicenter} / 最大${intensityToText(scale)}）の連動テスト発動が完了しました。`,
+        result
+      });
+    } catch (err: any) {
+      console.error('Test JMA trigger error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 伝言メモ (Memos) API
+  // ==========================================
+  const memosPath = path.join(dataDir, 'memos.json');
+
+  function loadMemos(): any[] {
+    if (!fs.existsSync(memosPath)) {
+      return [];
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(memosPath, 'utf8'));
+      return Array.isArray(raw) ? raw : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveMemos(memosList: any[]) {
+    try {
+      fs.writeFileSync(memosPath, JSON.stringify(memosList, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save memos:', e);
+    }
+  }
+
+  // 伝言メモ一覧取得（未対応優先 ＋ ページネーション対応: ?limit=300&offset=0 または ?all=true）
+  app.get(['/api/memos', '/api/memos/'], (req, res) => {
+    try {
+      const memosList = loadMemos();
+      const sorted = [...memosList].sort((a: any, b: any) => {
+        const aHandled = a.status === 'handled' || (a.details && a.details.status === 'handled') ? 1 : 0;
+        const bHandled = b.status === 'handled' || (b.details && b.details.status === 'handled') ? 1 : 0;
+        if (aHandled !== bHandled) return aHandled - bHandled;
+        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+      });
+
+      const isAll = req.query.all === 'true' || req.query.all === '1';
+      if (isAll) {
+        return res.json(sorted);
+      }
+
+      const rawLimit = parseInt(String(req.query.limit || '300'), 10);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 300;
+      const rawOffset = parseInt(String(req.query.offset || '0'), 10);
+      const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+
+      res.json(sorted.slice(offset, offset + limit));
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 伝言メモ新規作成
+  app.post(['/api/memos', '/api/memos/'], (req, res) => {
+    try {
+      const memosList = loadMemos();
+      const newMemo = {
+        id: req.body.id || `memo-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        ...req.body,
+        createdAt: req.body.createdAt || new Date().toISOString()
+      };
+      memosList.unshift(newMemo);
+      saveMemos(memosList);
+      res.status(201).json(newMemo);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 伝言メモ更新（ステータス変更・対応完了等）
+  app.put(['/api/memos/:id', '/api/memos/:id/'], (req, res) => {
+    try {
+      const memoId = req.params.id;
+      const memosList = loadMemos();
+      const idx = memosList.findIndex((m: any) => String(m.id) === String(memoId));
+      if (idx === -1) {
+        return res.status(404).json({ error: '伝言メモが見つかりません' });
+      }
+      
+      const current = memosList[idx];
+      const {
+        isRead,
+        status,
+        recipientStatuses,
+        recipientStatusesJson,
+        recipient_statuses_json,
+        details
+      } = req.body || {};
+
+      let updatedRecipientStatuses = recipientStatuses;
+      if (typeof updatedRecipientStatuses === 'string') {
+        try { updatedRecipientStatuses = JSON.parse(updatedRecipientStatuses); } catch (_) {}
+      }
+      if (!updatedRecipientStatuses && (recipientStatusesJson || recipient_statuses_json)) {
+        try { updatedRecipientStatuses = JSON.parse(recipientStatusesJson || recipient_statuses_json); } catch (_) {}
+      }
+      if (!updatedRecipientStatuses && details && details.recipientStatuses) {
+        updatedRecipientStatuses = details.recipientStatuses;
+      }
+      if (!updatedRecipientStatuses) {
+        updatedRecipientStatuses = current.recipientStatuses || [];
+      }
+
+      const allHandled = Array.isArray(updatedRecipientStatuses) &&
+        updatedRecipientStatuses.length > 0 &&
+        updatedRecipientStatuses.every((s: any) => s.isHandled);
+
+      let nextStatus = status;
+      if (!nextStatus) {
+        if (allHandled) {
+          nextStatus = 'handled';
+        } else if (isRead === 1 || isRead === true) {
+          nextStatus = 'read';
+        } else {
+          nextStatus = current.status || 'unread';
+        }
+      }
+
+      const nextIsRead = (isRead === 1 || isRead === true || nextStatus === 'handled' || allHandled) ? 1 : 0;
+
+      memosList[idx] = {
+        ...current,
+        ...req.body,
+        status: nextStatus,
+        isRead: nextIsRead === 1,
+        recipientStatuses: updatedRecipientStatuses,
+        recipientStatusesJson: JSON.stringify(updatedRecipientStatuses),
+        updatedAt: new Date().toISOString()
+      };
+      saveMemos(memosList);
+      res.json(memosList[idx]);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.patch(['/api/memos/:id', '/api/memos/:id/'], (req, res) => {
+    try {
+      const memoId = req.params.id;
+      const memosList = loadMemos();
+      const idx = memosList.findIndex((m: any) => String(m.id) === String(memoId));
+      if (idx === -1) {
+        return res.status(404).json({ error: '伝言メモが見つかりません' });
+      }
+      memosList[idx] = {
+        ...memosList[idx],
+        ...req.body,
+        updatedAt: new Date().toISOString()
+      };
+      saveMemos(memosList);
+      res.json(memosList[idx]);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 伝言メモ既読・対応完了
+  app.all(['/api/memos/:id/read', '/api/memos/:id/read/'], (req, res) => {
+    try {
+      const memoId = req.params.id;
+      const { userId, isHandled } = req.body || {};
+      const memosList = loadMemos();
+      const idx = memosList.findIndex((m: any) => String(m.id) === String(memoId));
+      if (idx === -1) {
+        return res.status(404).json({ error: '伝言メモが見つかりません' });
+      }
+      const nowIso = new Date().toISOString();
+      let statuses = memosList[idx].recipientStatuses || [];
+      if (userId && Array.isArray(statuses)) {
+        statuses = statuses.map((st: any) => {
+          if (st.userId === String(userId)) {
+            return {
+              ...st,
+              isViewed: true,
+              viewedAt: st.viewedAt || nowIso,
+              isHandled: isHandled !== undefined ? !!isHandled : st.isHandled,
+              handledAt: (isHandled || (isHandled === undefined && st.isHandled)) ? (st.handledAt || nowIso) : undefined
+            };
+          }
+          return st;
+        });
+      }
+      const allHandled = Array.isArray(statuses) && statuses.length > 0 && statuses.every((s: any) => s.isHandled);
+      memosList[idx] = {
+        ...memosList[idx],
+        isRead: true,
+        status: allHandled ? 'handled' : 'read',
+        recipientStatuses: statuses,
+        updatedAt: nowIso
+      };
+      saveMemos(memosList);
+      res.json({ message: '既読・対応状態更新完了', memo: memosList[idx] });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 伝言メモコメント追加（公開・非公開[宛先担当者本人のみ閲覧可能]対応）
+  app.post(['/api/memos/:id/comments', '/api/memos/:id/comments/'], (req, res) => {
+    try {
+      const memoId = req.params.id;
+      const { content, isPrivate = false, author } = req.body || {};
+      if (!content || !String(content).trim()) {
+        return res.status(400).json({ error: 'コメント本文を入力してください' });
+      }
+      const memosList = loadMemos();
+      const idx = memosList.findIndex((m: any) => String(m.id) === String(memoId));
+      if (idx === -1) {
+        return res.status(404).json({ error: '伝言メモが見つかりません' });
+      }
+
+      const newComment = {
+        id: `mcomm-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+        memoId: String(memoId),
+        author: author || { id: 'unknown', name: '担当者' },
+        content: String(content).trim(),
+        isPrivate: Boolean(isPrivate), // true = 宛先担当者（自分）のみ閲覧可能
+        createdAt: new Date().toISOString()
+      };
+
+      const existingComments = Array.isArray(memosList[idx].comments) ? memosList[idx].comments : [];
+      existingComments.push(newComment);
+      memosList[idx].comments = existingComments;
+      memosList[idx].commentsJson = JSON.stringify(existingComments);
+      if (memosList[idx].details) {
+        memosList[idx].details.comments = existingComments;
+      }
+      saveMemos(memosList);
+      res.status(201).json({ success: true, comment: newComment, comments: existingComments });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 伝言メモコメント削除
+  app.all(['/api/memos/:id/comments/:commentId', '/api/memos/:id/comments/:commentId/delete'], (req, res, next) => {
+    if (req.method !== 'DELETE' && !req.path.endsWith('/delete') && req.method !== 'POST') {
+      return next();
+    }
+    try {
+      const { id: memoId, commentId } = req.params;
+      const { userId, role } = req.body || {};
+      const memosList = loadMemos();
+      const idx = memosList.findIndex((m: any) => String(m.id) === String(memoId));
+      if (idx === -1) {
+        return res.status(404).json({ error: '伝言メモが見つかりません' });
+      }
+
+      let comments = Array.isArray(memosList[idx].comments) ? memosList[idx].comments : [];
+      const targetIndex = comments.findIndex((c: any) => String(c.id) === String(commentId));
+      if (targetIndex === -1) {
+        return res.status(404).json({ error: '対象のコメントが見つかりません' });
+      }
+
+      const targetComment = comments[targetIndex];
+      if (userId && targetComment.author?.id !== String(userId) && role !== 'admin') {
+        return res.status(403).json({ error: 'コメントを削除する権限がありません' });
+      }
+
+      comments.splice(targetIndex, 1);
+      memosList[idx].comments = comments;
+      memosList[idx].commentsJson = JSON.stringify(comments);
+      if (memosList[idx].details) {
+        memosList[idx].details.comments = comments;
+      }
+      saveMemos(memosList);
+      res.json({ success: true, message: 'コメント削除完了', comments });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 伝言メモ削除
+  app.all(['/api/memos/:id', '/api/memos/:id/delete'], (req, res, next) => {
+    if (req.method !== 'DELETE' && !req.path.endsWith('/delete')) {
+      return next();
+    }
+    try {
+      const memoId = req.params.id;
+      let memosList = loadMemos();
+      const beforeLen = memosList.length;
+      memosList = memosList.filter((m: any) => String(m.id) !== String(memoId));
+      saveMemos(memosList);
+      res.json({ success: true, deletedCount: beforeLen - memosList.length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // カレンダー (Events / Calendar) JSON ストレージ & API
+  // ==========================================
+  const eventsPath = path.join(dataDir, 'events.json');
+
+  function loadEvents(): any[] {
+    if (!fs.existsSync(eventsPath)) {
+      return [];
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(eventsPath, 'utf8'));
+      return Array.isArray(raw) ? raw : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveEvents(eventsList: any[]) {
+    try {
+      fs.writeFileSync(eventsPath, JSON.stringify(eventsList, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save events:', e);
+    }
+  }
+
+  function parseEventIsoJst(val: any): string {
+    if (!val) return new Date().toISOString();
+    if (val instanceof Date) return isNaN(val.getTime()) ? new Date().toISOString() : val.toISOString();
+    const s = String(val).trim();
+    if (!s) return new Date().toISOString();
+    if (s.endsWith('Z') || s.includes('+') || (s.includes('-') && s.length > 19 && s[19] === '-')) {
+      const d = new Date(s);
+      return !isNaN(d.getTime()) ? d.toISOString() : s;
+    }
+    const normalized = s.replace(' ', 'T');
+    if (normalized.length === 10) {
+      const dDateOnly = new Date(`${normalized}T00:00:00+09:00`);
+      return !isNaN(dDateOnly.getTime()) ? dDateOnly.toISOString() : new Date(s).toISOString();
+    }
+    const dJst = new Date(`${normalized}${normalized.length === 16 ? ':00' : ''}+09:00`);
+    return !isNaN(dJst.getTime()) ? dJst.toISOString() : new Date(s).toISOString();
+  }
+
+  // カレンダー予定一覧取得（期間ウィンドウ指定対応 + 繰り返し予定・現場予定常時保持）
+  app.get(['/api/events', '/api/events/', '/events', '/events/'], (req, res) => {
+    try {
+      const list = loadEvents();
+      const fetchAll = req.query.all === 'true' || req.query.all === '1';
+      if (fetchAll) {
+        return res.json(list);
+      }
+
+      const defaultFromMs = Date.now() - 180 * 24 * 60 * 60 * 1000;
+      const fromMs = req.query.from ? new Date(parseEventIsoJst(req.query.from)).getTime() : defaultFromMs;
+      const toMs = req.query.to ? new Date(parseEventIsoJst(req.query.to)).getTime() : null;
+
+      const filtered = list.filter((ev: any) => {
+        const rec = ev.recurrence;
+        if (rec && typeof rec === 'object' && rec.frequency && rec.frequency !== 'none') return true;
+        if (typeof rec === 'string' && rec.trim() !== '' && rec.trim() !== 'null' && !rec.includes('"frequency":"none"')) return true;
+        if (ev.recurrenceParentId) return true;
+        if (ev.siteId || ev.siteCode) return true;
+
+        const rawStart = ev.startAt || ev.start;
+        const rawEnd = ev.endAt || ev.end || rawStart;
+        const startMs = rawStart ? new Date(parseEventIsoJst(rawStart)).getTime() : 0;
+        const endMs = rawEnd ? new Date(parseEventIsoJst(rawEnd)).getTime() : startMs;
+
+        if (!isNaN(fromMs) && endMs < fromMs) return false;
+        if (toMs !== null && !isNaN(toMs) && startMs > toMs) return false;
+        return true;
+      });
+
+      res.json(filtered);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // カレンダー予定新規作成
+  app.post(['/api/events', '/api/events/', '/events', '/events/'], (req, res) => {
+    try {
+      const list = loadEvents();
+      const startIso = parseEventIsoJst(req.body.startAt || req.body.start);
+      const endIso = parseEventIsoJst(req.body.endAt || req.body.end || req.body.startAt || req.body.start);
+      const newEvent = {
+        id: req.body.id || `e-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        ...req.body,
+        start: startIso,
+        startAt: startIso,
+        end: endIso,
+        endAt: endIso,
+        createdAt: req.body.createdAt || new Date().toISOString()
+      };
+      list.push(newEvent);
+      saveEvents(list);
+      res.status(201).json(newEvent);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // カレンダー予定更新
+  app.put(['/api/events/:id', '/events/:id'], (req, res) => {
+    try {
+      const eventId = req.params.id;
+      const list = loadEvents();
+      const startIso = (req.body.startAt || req.body.start) ? parseEventIsoJst(req.body.startAt || req.body.start) : undefined;
+      const endIso = (req.body.endAt || req.body.end) ? parseEventIsoJst(req.body.endAt || req.body.end) : undefined;
+      const timeUpdates: any = {};
+      if (startIso) {
+        timeUpdates.start = startIso;
+        timeUpdates.startAt = startIso;
+      }
+      if (endIso) {
+        timeUpdates.end = endIso;
+        timeUpdates.endAt = endIso;
+      }
+      const idx = list.findIndex((e: any) => String(e.id) === String(eventId));
+      if (idx === -1) {
+        const newEv = { id: eventId, ...req.body, ...timeUpdates, updatedAt: new Date().toISOString() };
+        list.push(newEv);
+        saveEvents(list);
+        return res.json(newEv);
+      }
+      list[idx] = {
+        ...list[idx],
+        ...req.body,
+        ...timeUpdates,
+        updatedAt: new Date().toISOString()
+      };
+      saveEvents(list);
+      res.json(list[idx]);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // カレンダー予定削除
+  app.delete(['/api/events/:id', '/events/:id'], (req, res) => {
+    try {
+      const eventId = req.params.id;
+      let list = loadEvents();
+      list = list.filter((e: any) => String(e.id) !== String(eventId));
+      saveEvents(list);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post(['/api/events/:id/delete', '/events/:id/delete'], (req, res) => {
+    try {
+      const eventId = req.params.id;
+      let list = loadEvents();
+      list = list.filter((e: any) => String(e.id) !== String(eventId));
+      saveEvents(list);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 掲示板 (Bulletin Board) JSON ストレージ & API
+  // ==========================================
+  const bulletinsPath = path.join(dataDir, 'bulletins.json');
+  const bulletinCommentsPath = path.join(dataDir, 'bulletin_comments.json');
+  const bulletinViewersPath = path.join(dataDir, 'bulletin_viewers.json');
+
+  function loadBulletins(): any[] {
+    if (!fs.existsSync(bulletinsPath)) {
+      return [];
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(bulletinsPath, 'utf8'));
+      return Array.isArray(raw) ? raw : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveBulletins(bulletinsList: any[]) {
+    try {
+      fs.writeFileSync(bulletinsPath, JSON.stringify(bulletinsList, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save bulletins:', e);
+    }
+  }
+
+  function loadBulletinComments(): any[] {
+    if (!fs.existsSync(bulletinCommentsPath)) {
+      return [];
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(bulletinCommentsPath, 'utf8'));
+      return Array.isArray(raw) ? raw : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveBulletinComments(commentsList: any[]) {
+    try {
+      fs.writeFileSync(bulletinCommentsPath, JSON.stringify(commentsList, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save bulletin comments:', e);
+    }
+  }
+
+  function loadBulletinViewers(): any[] {
+    if (!fs.existsSync(bulletinViewersPath)) {
+      return [];
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(bulletinViewersPath, 'utf8'));
+      return Array.isArray(raw) ? raw : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveBulletinViewers(viewersList: any[]) {
+    try {
+      fs.writeFileSync(bulletinViewersPath, JSON.stringify(viewersList, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save bulletin viewers:', e);
+    }
+  }
+
+  // 掲示板トピック・サマリー取得 (GET /api/bulletins/summary & /api/board/summary)
+  // マイページ・速報表示用（最新N件・単一クエリ高速取得）
+  app.get([
+    '/api/bulletins/summary',
+    '/api/bulletins/summary/',
+    '/api/board/summary',
+    '/api/board/summary/'
+  ], (req, res) => {
+    try {
+      const allBulletins = loadBulletins();
+      const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 20, 1), 100);
+      const nowMs = Date.now();
+      const sliced = allBulletins.slice(0, limit);
+
+      const allComments = loadBulletinComments();
+      const allViewers = loadBulletinViewers();
+      const commentsCountMap = new Map<string, number>();
+      for (const c of allComments) {
+        const tid = String(c.topicId || c.topic_id || c.bulletinId || '');
+        if (tid) commentsCountMap.set(tid, (commentsCountMap.get(tid) || 0) + 1);
+      }
+
+      const targetIds = new Set(sliced.map((t: any) => String(t.id)));
+      const viewersMap = new Map<string, any[]>();
+      for (const v of allViewers) {
+        const tid = String(v.topicId || v.topic_id || v.bulletinId || '');
+        if (!tid || !targetIds.has(tid)) continue;
+        let list = viewersMap.get(tid);
+        if (!list) {
+          list = [];
+          viewersMap.set(tid, list);
+        }
+        const uid = String(v.user?.id || v.userId || v.id || '');
+        if (!uid) continue;
+        list.push({
+          viewedAt: v.viewedAt,
+          userId: uid,
+          user: { id: uid }
+        });
+      }
+
+      const summaryList = sliced.map((topic: any) => {
+        let isPollAutoPinned = false;
+        if (topic.poll && topic.poll.autoPinUntilDeadline && topic.poll.deadline) {
+          const trimmed = String(topic.poll.deadline).trim();
+          const deadlineMs = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+            ? new Date(`${trimmed}T23:59:59.999+09:00`).getTime()
+            : new Date(trimmed).getTime();
+          if (!isNaN(deadlineMs) && deadlineMs > nowMs) {
+            isPollAutoPinned = true;
+          }
+        }
+
+        const isCurrentlyPinned = isPollAutoPinned || (!!topic.isPinned && (!topic.pinnedUntil || new Date(topic.pinnedUntil).getTime() > nowMs));
+        
+        let safePoll = null;
+        if (topic.poll) {
+          safePoll = {
+            ...topic.poll,
+            id: topic.poll.id || `poll-${topic.id}`,
+            title: topic.poll.title || topic.poll.question || 'アンケート / 意思決定投票',
+            question: topic.poll.question || topic.poll.title || 'アンケート / 意思決定投票',
+            deadline: topic.poll.deadline || null,
+            autoPinUntilDeadline: !!topic.poll.autoPinUntilDeadline,
+            allowMultiple: !!topic.poll.allowMultiple,
+            isAnonymous: !!topic.poll.isAnonymous,
+            options: Array.isArray(topic.poll.options) ? topic.poll.options : [],
+            votes: Array.isArray(topic.poll.votes) ? topic.poll.votes : []
+          };
+        }
+
+        const tid = String(topic.id);
+        const topicViewers = viewersMap.get(tid) || [];
+        return {
+          id: tid,
+          category: topic.category || 'general',
+          title: topic.title,
+          content: topic.content,
+          author: topic.author || { id: 'unknown', name: '匿名' },
+          createdAt: topic.createdAt,
+          views: topicViewers.length || topic.views || 0,
+          likes: topic.likes || 0,
+          office: topic.office || '全社',
+          division: topic.division || '全部署',
+          scope: topic.scope || '全社',
+          isStrictScope: !!topic.isStrictScope,
+          targetUserIds: Array.isArray(topic.targetUserIds) ? topic.targetUserIds.map(String) : [],
+          targetGroupName: topic.targetGroupName || '',
+          tags: Array.isArray(topic.tags) ? topic.tags : (topic.tags ? [topic.tags] : []),
+          isPinned: isCurrentlyPinned,
+          pinnedUntil: topic.pinnedUntil || null,
+          pinnedDuration: topic.pinnedDuration || null,
+          hasPeriod: !!topic.hasPeriod,
+          startDate: topic.startDate || '',
+          endDate: topic.endDate || '',
+          attachments: topic.attachments || [],
+          poll: safePoll,
+          comments: [],
+          viewers: topicViewers,
+          commentsCount: commentsCountMap.get(tid) || topic.commentsCount || 0
+        };
+      });
+
+      res.json(summaryList);
+    } catch (err: any) {
+      console.error('Failed to get bulletins summary:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板トピック一覧取得 (GET /api/bulletins & /api/board) - O(1) Map突合 & コメント遅延ロード対応
+  app.get(['/api/bulletins', '/api/bulletins/', '/api/board', '/api/board/'], (req, res) => {
+    try {
+      const allBulletins = loadBulletins();
+      const allComments = loadBulletinComments();
+      const allViewers = loadBulletinViewers();
+      const includeComments = req.query.includeComments === 'true' || req.query.includeComments === '1';
+
+      // O(1) ルックアップ用 Map 構築（O(N*M) ループ排除）
+      const commentsCountMap = new Map<string, number>();
+      const commentsListMap = new Map<string, any[]>();
+      for (const c of allComments) {
+        const tid = String(c.topicId || c.topic_id || c.bulletinId || '');
+        if (!tid) continue;
+        commentsCountMap.set(tid, (commentsCountMap.get(tid) || 0) + 1);
+        if (includeComments) {
+          let list = commentsListMap.get(tid);
+          if (!list) {
+            list = [];
+            commentsListMap.set(tid, list);
+          }
+          list.push(c);
+        }
+      }
+
+      const viewersMap = new Map<string, any[]>();
+      for (const v of allViewers) {
+        const tid = String(v.topicId || v.topic_id || v.bulletinId || '');
+        if (!tid) continue;
+        let list = viewersMap.get(tid);
+        if (!list) {
+          list = [];
+          viewersMap.set(tid, list);
+        }
+        const uid = String(v.user?.id || v.userId || v.id || '');
+        list.push({
+          viewedAt: v.viewedAt,
+          userId: uid,
+          user: { id: uid }
+        });
+      }
+
+      const nowMs = Date.now();
+      const merged = allBulletins.map((topic: any) => {
+        const tid = String(topic.id);
+        const topicComments = includeComments ? (commentsListMap.get(tid) || []) : [];
+        const commentsCount = commentsCountMap.get(tid) || 0;
+        const topicViewers = viewersMap.get(tid) || [];
+        
+        let isPollAutoPinned = false;
+        if (topic.poll && topic.poll.autoPinUntilDeadline && topic.poll.deadline && !topic.poll.isClosed) {
+          const trimmed = String(topic.poll.deadline).trim();
+          const deadlineMs = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+            ? new Date(`${trimmed}T23:59:59.999+09:00`).getTime()
+            : new Date(trimmed).getTime();
+          if (!isNaN(deadlineMs) && deadlineMs > nowMs) {
+            isPollAutoPinned = true;
+          }
+        }
+
+        const isCurrentlyPinned = isPollAutoPinned || (!!topic.isPinned && (!topic.pinnedUntil || new Date(topic.pinnedUntil).getTime() > nowMs));
+        return {
+          ...topic,
+          isStrictScope: !!topic.isStrictScope,
+          targetUserIds: Array.isArray(topic.targetUserIds) ? topic.targetUserIds.map(String) : [],
+          targetGroupName: topic.targetGroupName || '',
+          isPinned: isCurrentlyPinned,
+          pinnedUntil: topic.pinnedUntil || null,
+          pinnedDuration: topic.pinnedDuration || null,
+          poll: topic.poll || null,
+          views: topicViewers.length || topic.views || 0,
+          comments: topicComments,
+          commentsCount,
+          viewers: topicViewers
+        };
+      });
+
+      const limitParam = parseInt(req.query.limit as string, 10);
+      const offsetParam = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
+      if (!isNaN(limitParam) && limitParam > 0) {
+        return res.json(merged.slice(offsetParam, offsetParam + limitParam));
+      }
+
+      res.json(merged);
+    } catch (err: any) {
+      console.error('Failed to get bulletins:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板トピック単体詳細・コメント・閲覧者取得 API (オンデマンド遅延ロード用)
+  app.get([
+    '/api/bulletins/:id/detail',
+    '/api/board/:id/detail',
+    '/api/bulletins/:id',
+    '/api/board/:id'
+  ], (req, res, next) => {
+    const topicId = String(req.params.id || '');
+    if (!topicId || topicId === 'summary' || topicId === 'upload' || topicId === 'file' || topicId === 'files') {
+      return next();
+    }
+    try {
+      const allBulletins = loadBulletins();
+      const topic = allBulletins.find((t: any) => String(t.id) === topicId);
+      if (!topic) {
+        return res.status(404).json({ error: 'トピックが見つかりません' });
+      }
+      const allComments = loadBulletinComments();
+      const allViewers = loadBulletinViewers();
+      const topicComments = allComments.filter((c: any) => String(c.topicId || c.topic_id || c.bulletinId) === topicId);
+      const topicViewers = allViewers.filter((v: any) => String(v.topicId || v.topic_id || v.bulletinId) === topicId);
+
+      const nowMs = Date.now();
+      let isPollAutoPinned = false;
+      if (topic.poll && topic.poll.autoPinUntilDeadline && topic.poll.deadline && !topic.poll.isClosed) {
+        const trimmed = String(topic.poll.deadline).trim();
+        const deadlineMs = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+          ? new Date(`${trimmed}T23:59:59.999+09:00`).getTime()
+          : new Date(trimmed).getTime();
+        if (!isNaN(deadlineMs) && deadlineMs > nowMs) {
+          isPollAutoPinned = true;
+        }
+      }
+      const isCurrentlyPinned = isPollAutoPinned || (!!topic.isPinned && (!topic.pinnedUntil || new Date(topic.pinnedUntil).getTime() > nowMs));
+
+      res.json({
+        ...topic,
+        isStrictScope: !!topic.isStrictScope,
+        targetUserIds: Array.isArray(topic.targetUserIds) ? topic.targetUserIds.map(String) : [],
+        targetGroupName: topic.targetGroupName || '',
+        isPinned: isCurrentlyPinned,
+        views: topicViewers.length || topic.views || 0,
+        comments: topicComments,
+        commentsCount: topicComments.length,
+        viewers: topicViewers
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板トピック新規作成 (POST /api/bulletins & /api/board)
+  app.post(['/api/bulletins', '/api/bulletins/', '/api/board', '/api/board/'], async (req, res) => {
+    try {
+      const bulletinsList = loadBulletins();
+      const nowIso = new Date().toISOString();
+      const normalizedTargetUserIds = Array.isArray(req.body.targetUserIds)
+        ? Array.from(new Set(req.body.targetUserIds.map((v: any) => String(v || '').trim()).filter(Boolean)))
+        : [];
+      const newTopic = {
+        id: req.body.id || `topic-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        title: req.body.title || '（無題）',
+        content: req.body.content || '',
+        category: req.body.category || 'general',
+        tags: Array.isArray(req.body.tags) ? req.body.tags : (req.body.tags ? [req.body.tags] : []),
+        office: req.body.office || '全社',
+        division: req.body.division || '全部署',
+        scope: req.body.scope || (normalizedTargetUserIds.length > 0 ? 'members' : '全社'),
+        isStrictScope: !!req.body.isStrictScope,
+        targetUserIds: normalizedTargetUserIds,
+        targetGroupName: req.body.targetGroupName ? String(req.body.targetGroupName).trim() : '',
+        author: req.body.author || { id: 'unknown', name: '匿名' },
+        attachments: req.body.attachments || [],
+        hasPeriod: !!req.body.hasPeriod,
+        startDate: req.body.startDate || null,
+        endDate: req.body.endDate || null,
+        isPinned: !!req.body.isPinned,
+        pinnedUntil: req.body.isPinned ? (req.body.pinnedUntil || null) : null,
+        pinnedDuration: req.body.isPinned ? (req.body.pinnedDuration || null) : null,
+        poll: req.body.poll || null,
+        views: 0,
+        createdAt: req.body.createdAt || nowIso,
+        updatedAt: nowIso
+      };
+
+      bulletinsList.unshift(newTopic);
+      saveBulletins(bulletinsList);
+
+      // 自動通知作成（マイグループ・指定メンバー指定時は対象メンバーのみ通知）
+      try {
+        const authorName = newTopic.author?.name || 'メンバー';
+        const allUsers = loadUsers();
+        const targetIdSet = normalizedTargetUserIds.length > 0 ? new Set(normalizedTargetUserIds) : null;
+        allUsers.forEach((u: any) => {
+          const uid = String(u.id);
+          if (uid !== String(newTopic.author?.id) && (!targetIdSet || targetIdSet.has(uid))) {
+            createNotification({
+              user_id: uid,
+              type: 'bulletin',
+              title: newTopic.poll ? `【アンケート】${authorName}さんがアンケート付きトピックを投稿しました` : `【掲示板】${authorName}さんが新しいトピックを投稿しました`,
+              contents: `${newTopic.title}`,
+              sender_id: newTopic.author?.id,
+              sender_name: authorName,
+              target_id: newTopic.id
+            });
+          }
+        });
+      } catch (notifErr) {
+        console.warn('Failed to create bulletin notification:', notifErr);
+      }
+
+      // Web Push 通知
+      try {
+        const pushParams: any = {
+          excludeUserId: newTopic.author?.id,
+          title: newTopic.poll ? `【アンケート】${newTopic.author?.name || '社員'}さんからアンケートのお願い` : `【掲示板】${newTopic.author?.name || '社員'}さんの新規投稿`,
+          body: `${newTopic.title}`,
+          url: `/?tab=board&topicId=${newTopic.id}`,
+          data: { topicId: newTopic.id, tab: 'board' }
+        };
+        if (normalizedTargetUserIds.length > 0) {
+          pushParams.targetUserIds = normalizedTargetUserIds.filter(id => id !== String(newTopic.author?.id));
+        }
+        if (!pushParams.targetUserIds || pushParams.targetUserIds.length > 0) {
+          await sendPushNotificationToUser(pushParams);
+        }
+      } catch (pushErr) {}
+
+      res.status(201).json(newTopic);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板トピック更新 (PUT /api/bulletins/:id & /api/board/:id)
+  app.put(['/api/bulletins/:id', '/api/board/:id'], (req, res) => {
+    try {
+      const topicId = req.params.id;
+      const bulletinsList = loadBulletins();
+      const idx = bulletinsList.findIndex((t: any) => String(t.id) === String(topicId));
+      if (idx === -1) {
+        return res.status(404).json({ error: 'トピックが見つかりません' });
+      }
+      let mergedPoll = req.body.poll !== undefined ? req.body.poll : bulletinsList[idx].poll;
+      if (req.body.poll && bulletinsList[idx].poll) {
+        const incomingOptions = Array.isArray(req.body.poll.options) ? req.body.poll.options : [];
+        const existingOptions = Array.isArray(bulletinsList[idx].poll.options) ? bulletinsList[idx].poll.options : [];
+        if (incomingOptions.length === 0 && existingOptions.length > 0) {
+          mergedPoll = {
+            ...bulletinsList[idx].poll,
+            ...req.body.poll,
+            options: existingOptions,
+            title: req.body.poll.title || req.body.poll.question || bulletinsList[idx].poll.title || bulletinsList[idx].poll.question || 'アンケート / 意思決定投票',
+            question: req.body.poll.question || req.body.poll.title || bulletinsList[idx].poll.question || bulletinsList[idx].poll.title || 'アンケート / 意思決定投票',
+            votes: Array.isArray(req.body.poll.votes) && req.body.poll.votes.length > 0 ? req.body.poll.votes : (bulletinsList[idx].poll.votes || [])
+          };
+        }
+      }
+
+      const nextTargetUserIds = req.body.targetUserIds !== undefined
+        ? (Array.isArray(req.body.targetUserIds)
+          ? Array.from(new Set(req.body.targetUserIds.map((v: any) => String(v || '').trim()).filter(Boolean)))
+          : [])
+        : (Array.isArray(bulletinsList[idx].targetUserIds) ? bulletinsList[idx].targetUserIds : []);
+
+      bulletinsList[idx] = {
+        ...bulletinsList[idx],
+        ...req.body,
+        isStrictScope: req.body.isStrictScope !== undefined ? !!req.body.isStrictScope : !!bulletinsList[idx].isStrictScope,
+        targetUserIds: nextTargetUserIds,
+        targetGroupName: req.body.targetGroupName !== undefined ? String(req.body.targetGroupName || '').trim() : (bulletinsList[idx].targetGroupName || ''),
+        isPinned: !!req.body.isPinned,
+        pinnedUntil: req.body.isPinned ? (req.body.pinnedUntil || null) : null,
+        pinnedDuration: req.body.isPinned ? (req.body.pinnedDuration || null) : null,
+        poll: mergedPoll,
+        updatedAt: new Date().toISOString()
+      };
+      saveBulletins(bulletinsList);
+
+      if (Array.isArray(req.body.viewers) && req.body.viewers.length > 0) {
+        let viewersList = loadBulletinViewers();
+        req.body.viewers.forEach((v: any) => {
+          const u = v.user || (v.userId ? { id: v.userId, name: v.name || '' } : null);
+          if (u && u.id) {
+            const existingIdx = viewersList.findIndex(
+              (item: any) => String(item.topicId || item.topic_id) === String(topicId) && String(item.user?.id || item.userId) === String(u.id)
+            );
+            const viewedAt = v.viewedAt || new Date().toISOString();
+            if (existingIdx >= 0) {
+              viewersList[existingIdx].viewedAt = viewedAt;
+              if (u) viewersList[existingIdx].user = u;
+            } else {
+              viewersList.push({
+                id: `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+                topicId: topicId,
+                user: u,
+                viewedAt: viewedAt
+              });
+            }
+          }
+        });
+        saveBulletinViewers(viewersList);
+      }
+
+      res.json(bulletinsList[idx]);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // アンケート投票 API (POST /api/bulletins/:id/poll/vote & /api/board/:id/poll/vote)
+  app.post(['/api/bulletins/:id/poll/vote', '/api/board/:id/poll/vote'], (req, res) => {
+    try {
+      const topicId = req.params.id;
+      const { userId, userName, userAvatarUrl, selectedOptionIds, comment } = req.body;
+      if (!userId || !Array.isArray(selectedOptionIds) || selectedOptionIds.length === 0) {
+        return res.status(400).json({ error: '投票者情報および選択肢が必要です' });
+      }
+
+      const bulletinsList = loadBulletins();
+      const idx = bulletinsList.findIndex((t: any) => String(t.id) === String(topicId));
+      if (idx === -1) {
+        return res.status(404).json({ error: 'トピックが見つかりません' });
+      }
+
+      const topic = bulletinsList[idx];
+      if (!topic.poll) {
+        return res.status(400).json({ error: 'このトピックにはアンケートが設定されていません' });
+      }
+
+      // 締め切りチェック
+      if (topic.poll.isClosed) {
+        return res.status(400).json({ error: 'アンケートは締め切られました' });
+      }
+      if (topic.poll.deadline) {
+        const trimmed = String(topic.poll.deadline).trim();
+        const deadlineMs = /^\d{4}-\d{2}-\d{2}$/.test(trimmed)
+          ? new Date(`${trimmed}T23:59:59.999+09:00`).getTime()
+          : new Date(trimmed).getTime();
+        if (!isNaN(deadlineMs) && Date.now() > deadlineMs) {
+          return res.status(400).json({ error: '回答期限を過ぎているため投票できません' });
+        }
+      }
+
+      const votes = Array.isArray(topic.poll.votes) ? [...topic.poll.votes] : [];
+      const nowIso = new Date().toISOString();
+      const existingVoteIdx = votes.findIndex((v: any) => String(v.userId) === String(userId));
+      const voteRecord = {
+        id: existingVoteIdx >= 0 ? votes[existingVoteIdx].id : `vote-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        userId: String(userId),
+        userName: userName || '匿名',
+        userAvatarUrl: userAvatarUrl || '',
+        selectedOptionIds: selectedOptionIds.map(String),
+        comment: (comment || '').trim() || undefined,
+        votedAt: nowIso
+      };
+
+      if (existingVoteIdx >= 0) {
+        votes[existingVoteIdx] = voteRecord;
+      } else {
+        votes.push(voteRecord);
+      }
+
+      topic.poll.votes = votes;
+      topic.updatedAt = nowIso;
+      saveBulletins(bulletinsList);
+
+      res.json({ success: true, poll: topic.poll, topic });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // アンケート早期締め切り & ピン留め解除 API (POST /api/bulletins/:id/poll/close)
+  app.post(['/api/bulletins/:id/poll/close', '/api/board/:id/poll/close'], (req, res) => {
+    try {
+      const topicId = req.params.id;
+      const { closedAt, closedById } = req.body || {};
+      const bulletinsList = loadBulletins();
+      const idx = bulletinsList.findIndex((t: any) => String(t.id) === String(topicId));
+      if (idx === -1) {
+        return res.status(404).json({ error: 'トピックが見つかりません' });
+      }
+
+      const topic = bulletinsList[idx];
+      if (!topic.poll) {
+        return res.status(400).json({ error: 'このトピックにはアンケートが設定されていません' });
+      }
+
+      const nowIso = closedAt || new Date().toISOString();
+      topic.poll.isClosed = true;
+      topic.poll.closedAt = nowIso;
+      topic.poll.closedById = closedById || null;
+      topic.poll.autoPinUntilDeadline = false;
+
+      // 締め切りと同時にピン留めも解除
+      topic.isPinned = false;
+      topic.pinnedUntil = null;
+      topic.pinnedDuration = null;
+      topic.updatedAt = nowIso;
+
+      saveBulletins(bulletinsList);
+      res.json({ success: true, message: 'アンケートは締め切られました', poll: topic.poll, topic });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板トピック削除 (DELETE /api/bulletins/:id & /api/board/:id)
+  app.delete(['/api/bulletins/:id', '/api/board/:id'], (req, res) => {
+    try {
+      const topicId = req.params.id;
+      let bulletinsList = loadBulletins();
+      const beforeLen = bulletinsList.length;
+      bulletinsList = bulletinsList.filter((t: any) => String(t.id) !== String(topicId));
+      saveBulletins(bulletinsList);
+
+      // 関連コメント・既読情報も削除
+      let commentsList = loadBulletinComments();
+      commentsList = commentsList.filter((c: any) => String(c.topicId || c.topic_id) !== String(topicId));
+      saveBulletinComments(commentsList);
+
+      let viewersList = loadBulletinViewers();
+      viewersList = viewersList.filter((v: any) => String(v.topicId || v.topic_id) !== String(topicId));
+      saveBulletinViewers(viewersList);
+
+      res.json({ success: true, deletedCount: beforeLen - bulletinsList.length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板コメント投稿 (POST /api/bulletins/:id/comments & /api/board/:id/comments)
+  app.post(['/api/bulletins/:id/comments', '/api/board/:id/comments'], async (req, res) => {
+    try {
+      const topicId = req.params.id;
+      const commentsList = loadBulletinComments();
+      const nowIso = new Date().toISOString();
+      const newComment = {
+        id: req.body.id || `comment-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        topicId: topicId,
+        content: req.body.content || '',
+        author: req.body.author || { id: 'unknown', name: '匿名' },
+        attachments: req.body.attachments || [],
+        createdAt: req.body.createdAt || nowIso
+      };
+
+      commentsList.push(newComment);
+      saveBulletinComments(commentsList);
+
+      // トピック作成者への通知
+      const bulletinsList = loadBulletins();
+      const targetTopic = bulletinsList.find((t: any) => String(t.id) === String(topicId));
+      if (targetTopic && targetTopic.author?.id && targetTopic.author.id !== newComment.author?.id) {
+        try {
+          createNotification({
+            user_id: String(targetTopic.author.id),
+            type: 'bulletin_comment',
+            title: `【掲示板】${newComment.author?.name || 'メンバー'}さんがコメントしました`,
+            contents: `「${targetTopic.title}」に新しいコメントがあります`,
+            sender_id: newComment.author?.id,
+            sender_name: newComment.author?.name,
+            target_id: String(topicId)
+          });
+          await sendPushNotificationToUser({
+            targetUserId: targetTopic.author.id,
+            title: `【掲示板】${newComment.author?.name || '社員'}さんからのコメント`,
+            body: `「${targetTopic.title}」に返信がありました。`,
+            url: `/?tab=board&topicId=${topicId}`
+          });
+        } catch (e) {}
+      }
+
+      res.status(201).json(newComment);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 掲示板コメント削除 (DELETE /api/bulletins/:topicId/comments/:commentId 等)
+  app.delete([
+    '/api/bulletins/:topicId/comments/:commentId',
+    '/api/board/:topicId/comments/:commentId',
+    '/api/bulletins/comments/:commentId',
+    '/api/board/comments/:commentId',
+    '/api/comments/:commentId'
+  ], (req, res) => {
+    try {
+      const commentId = req.params.commentId || req.params.id;
+      let commentsList = loadBulletinComments();
+      const initialLength = commentsList.length;
+      commentsList = commentsList.filter((c: any) => String(c.id) !== String(commentId));
+      saveBulletinComments(commentsList);
+      res.json({ success: true, message: 'コメント削除完了', deleted: commentsList.length < initialLength });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 既読登録 (POST /api/bulletins/:id/viewers & /api/topics/:id/viewers)
+  app.post(['/api/bulletins/:id/viewers', '/api/topics/:id/viewers', '/api/board/:id/viewers'], (req, res) => {
+    try {
+      const topicId = req.params.id;
+      const user = req.body.user || (req.body.userId ? { id: req.body.userId, name: req.body.name || 'メンバー' } : null);
+      if (!user || !user.id) {
+        return res.status(400).json({ error: 'ユーザー情報が必要です' });
+      }
+
+      const viewersList = loadBulletinViewers();
+      const existingIdx = viewersList.findIndex(
+        (v: any) => String(v.topicId || v.topic_id) === String(topicId) && String(v.user?.id || v.userId) === String(user.id)
+      );
+
+      const nowIso = req.body.viewedAt || new Date().toISOString();
+      if (existingIdx >= 0) {
+        viewersList[existingIdx].viewedAt = nowIso;
+        if (user) viewersList[existingIdx].user = user;
+      } else {
+        viewersList.push({
+          id: `viewer-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+          topicId: topicId,
+          user: user,
+          viewedAt: nowIso
+        });
+      }
+      saveBulletinViewers(viewersList);
+      res.json({ success: true, viewersCount: viewersList.filter((v: any) => String(v.topicId || v.topic_id) === String(topicId)).length });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // POP3 メール受信・掲示板自動投稿 (Inbound Mail Polling Engine)
+  // ==========================================
+  const pop3Config = {
+    host: process.env.POP3_HOST || process.env.SMTP_HOST || '',
+    port: Number(process.env.POP3_PORT || 110),
+    secure: false, // ポート110・セキュリティなし (平文TCP)
+    user: process.env.POP3_USER || process.env.SMTP_USER || '',
+    pass: process.env.POP3_PASS || process.env.SMTP_PASS || '',
+    fromAddress: process.env.SMTP_FROM_EMAIL || 'noreply@example.com',
+    deleteAfterImport: process.env.POP3_DELETE_AFTER_IMPORT !== 'false', // サーバーのメールボックス容量圧迫防止のため取り込み後/不要メールを自動削除
+    checkIntervalSec: Number(process.env.POP3_CHECK_INTERVAL_SEC || 60), // 60秒ごと自動巡回
+    defaultTag: process.env.POP3_DEFAULT_TAG || '社内メール'
+  };
+
+  interface Pop3LogEntry {
+    timestamp: string;
+    type: 'info' | 'success' | 'warn' | 'error';
+    message: string;
+  }
+
+  const pop3State = {
+    isPolling: false,
+    lastCheckedAt: null as string | null,
+    lastCheckStatus: 'idle' as 'idle' | 'checking' | 'success' | 'error',
+    lastCheckMessage: '起動待機中',
+    totalImportedCount: 0,
+    logs: [] as Pop3LogEntry[]
+  };
+
+  function addPop3Log(type: 'info' | 'success' | 'warn' | 'error', message: string) {
+    const timestamp = new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+    pop3State.logs.unshift({ timestamp, type, message });
+    if (pop3State.logs.length > 50) {
+      pop3State.logs = pop3State.logs.slice(0, 50);
+    }
+    console.log(`[POP3 ${type.toUpperCase()}] ${message}`);
+  }
+
+  // POP3 Socket クライアント実装
+  class Pop3SocketClient {
+    private socket: net.Socket | null = null;
+    private buffer = '';
+    private isMultiline = false;
+    private currentResolve: ((res: any) => void) | null = null;
+    private currentReject: ((err: any) => void) | null = null;
+
+    async connect(host: string, port: number, timeoutMs = 12000): Promise<string> {
+      return new Promise((resolve, reject) => {
+        const sock = net.createConnection({ host, port });
+        this.socket = sock;
+        sock.setTimeout(timeoutMs);
+
+        let initialResolved = false;
+
+        sock.on('connect', () => {});
+
+        sock.on('data', (chunk) => {
+          this.buffer += chunk.toString('latin1');
+          this.processBuffer();
+        });
+
+        sock.on('timeout', () => {
+          sock.destroy(new Error(`POP3 接続タイムアウト (${host}:${port})`));
+        });
+
+        sock.on('error', (err) => {
+          if (!initialResolved) {
+            initialResolved = true;
+            reject(err);
+          } else if (this.currentReject) {
+            const r = this.currentReject;
+            this.currentReject = null;
+            this.currentResolve = null;
+            r(err);
+          }
+        });
+
+        sock.on('close', () => {
+          if (this.currentReject) {
+            const r = this.currentReject;
+            this.currentReject = null;
+            this.currentResolve = null;
+            r(new Error('POP3 接続が切断されました'));
+          }
+        });
+
+        this.currentResolve = (greeting: string) => {
+          initialResolved = true;
+          resolve(greeting);
+        };
+        this.currentReject = (err: any) => {
+          initialResolved = true;
+          reject(err);
+        };
+      });
+    }
+
+    private processBuffer() {
+      if (!this.currentResolve) return;
+
+      if (this.isMultiline) {
+        let termIndex = this.buffer.indexOf('\r\n.\r\n');
+        let termLen = 5;
+        if (termIndex === -1) {
+          termIndex = this.buffer.indexOf('\n.\n');
+          termLen = 3;
+        }
+        if (termIndex === -1 && (this.buffer === '.\r\n' || this.buffer.startsWith('.\r\n'))) {
+          termIndex = 0;
+          termLen = 3;
+        }
+
+        if (termIndex !== -1) {
+          const fullContent = this.buffer.slice(0, termIndex);
+          this.buffer = this.buffer.slice(termIndex + termLen);
+          this.isMultiline = false;
+
+          const lines = fullContent.split(/\r?\n/);
+          const header = lines[0] || '';
+          const bodyLines = lines.slice(1).map(l => l.startsWith('..') ? l.substring(1) : l);
+
+          const r = this.currentResolve;
+          this.currentResolve = null;
+          this.currentReject = null;
+          r({
+            header,
+            body: bodyLines,
+            raw: Buffer.from(bodyLines.join('\r\n'), 'latin1')
+          });
+        }
+      } else {
+        const lineEnd = this.buffer.indexOf('\r\n');
+        if (lineEnd !== -1) {
+          const line = this.buffer.slice(0, lineEnd);
+          this.buffer = this.buffer.slice(lineEnd + 2);
+
+          const r = this.currentResolve;
+          this.currentResolve = null;
+          this.currentReject = null;
+          r(line);
+        }
+      }
+    }
+
+    async sendCommand(cmd: string): Promise<string> {
+      if (!this.socket) throw new Error('POP3 ソケットが初期化されていません');
+      return new Promise((resolve, reject) => {
+        this.isMultiline = false;
+        this.currentResolve = (res: string) => {
+          if (res && res.startsWith('-ERR')) {
+            reject(new Error(`POP3 コマンドエラー (${cmd}): ${res}`));
+          } else {
+            resolve(res);
+          }
+        };
+        this.currentReject = reject;
+        this.socket!.write(cmd + '\r\n');
+      });
+    }
+
+    async sendMultilineCommand(cmd: string): Promise<{ header: string; body: string[]; raw: Buffer }> {
+      if (!this.socket) throw new Error('POP3 ソケットが初期化されていません');
+      return new Promise((resolve, reject) => {
+        this.isMultiline = true;
+        this.currentResolve = (res: { header: string; body: string[]; raw: Buffer }) => {
+          if (res.header && res.header.startsWith('-ERR')) {
+            reject(new Error(`POP3 コマンドエラー (${cmd}): ${res.header}`));
+          } else {
+            resolve(res);
+          }
+        };
+        this.currentReject = reject;
+        this.socket!.write(cmd + '\r\n');
+      });
+    }
+
+    close() {
+      if (this.socket) {
+        try {
+          this.socket.destroy();
+        } catch (_) {}
+        this.socket = null;
+      }
+    }
+  }
+
+  // 送信者アドレスのホワイトリスト判定（登録メンバーのPCメール & 携帯メール & ログインID照合）
+  function matchSenderToWhitelist(candidateAddresses: string[], allUsers: any[]): any | null {
+    if (!candidateAddresses || candidateAddresses.length === 0) return null;
+
+    for (const rawAddr of candidateAddresses) {
+      if (!rawAddr) continue;
+      // <user@example.com> などのブラケットや引用符を除去
+      const cleanAddr = rawAddr.replace(/[<>\"\'\s]/g, '').trim().toLowerCase();
+      if (!cleanAddr) continue;
+
+      const addrUserPart = cleanAddr.split('@')[0] || '';
+
+      // 1. メールアドレス完全一致 (PCメール / 携帯メール)
+      const exactMatch = allUsers.find(u => {
+        const pc = (u.email || '').replace(/[<>\"\'\s]/g, '').trim().toLowerCase();
+        const mobile = (u.mobileEmail || '').replace(/[<>\"\'\s]/g, '').trim().toLowerCase();
+        return (pc && pc === cleanAddr) || (mobile && mobile === cleanAddr);
+      });
+      if (exactMatch) return exactMatch;
+
+      // 2. ユーザー名・ログインID一致 (例: user@example.com -> loginId: user)
+      if (addrUserPart) {
+        const loginMatch = allUsers.find(u => {
+          const loginId = (u.loginId || u.username || '').trim().toLowerCase();
+          return loginId && loginId === addrUserPart;
+        });
+        if (loginMatch) return loginMatch;
+      }
+
+      // 3. 部分一致 (ヘッダー内の name <address> またはドメイン・ユーザー名一致)
+      const partialMatch = allUsers.find(u => {
+        const pc = (u.email || '').replace(/[<>\"\'\s]/g, '').trim().toLowerCase();
+        const mobile = (u.mobileEmail || '').replace(/[<>\"\'\s]/g, '').trim().toLowerCase();
+        return (pc && (cleanAddr.includes(pc) || pc.includes(cleanAddr))) ||
+               (mobile && (cleanAddr.includes(mobile) || mobile.includes(cleanAddr)));
+      });
+      if (partialMatch) return partialMatch;
+    }
+    return null;
+  }
+
+  // MIMEヘッダー文字化け解読・デコードヘルパー
+  function decodeMimeHeader(str?: string): string {
+    if (!str) return '';
+    try {
+      let text = str;
+      text = text.replace(/=\?([^?]+)\?([BQbq])\?([^?]+)\?=/g, (_, charset, encoding, encText) => {
+        try {
+          if (encoding.toUpperCase() === 'B') {
+            return Buffer.from(encText, 'base64').toString('utf8');
+          } else if (encoding.toUpperCase() === 'Q') {
+            const qDecoded = encText.replace(/_/g, ' ').replace(/=([0-9A-F]{2})/gi, (__: string, hex: string) =>
+              String.fromCharCode(parseInt(hex, 16))
+            );
+            return Buffer.from(qDecoded, 'latin1').toString('utf8');
+          }
+        } catch (e) {
+          return encText;
+        }
+        return encText;
+      });
+      return text.trim();
+    } catch (e) {
+      return str || '';
+    }
+  }
+
+  // Content-Typeからの拡張子推定ヘルパー
+  function getExtensionFromMimeType(contentType?: string): string {
+    if (!contentType) return '.bin';
+    const ct = contentType.toLowerCase();
+    if (ct.includes('image/jpeg') || ct.includes('image/jpg')) return '.jpg';
+    if (ct.includes('image/png')) return '.png';
+    if (ct.includes('image/gif')) return '.gif';
+    if (ct.includes('image/webp')) return '.webp';
+    if (ct.includes('image/svg')) return '.svg';
+    if (ct.includes('application/pdf')) return '.pdf';
+    if (ct.includes('spreadsheetml') || ct.includes('excel') || ct.includes('xls')) return '.xlsx';
+    if (ct.includes('wordprocessingml') || ct.includes('msword') || ct.includes('doc')) return '.docx';
+    if (ct.includes('presentationml') || ct.includes('powerpoint') || ct.includes('ppt')) return '.pptx';
+    if (ct.includes('text/plain')) return '.txt';
+    if (ct.includes('text/csv')) return '.csv';
+    if (ct.includes('zip') || ct.includes('compressed')) return '.zip';
+    return '.bin';
+  }
+
+  // ファイルサイズ整形ヘルパー
+  function formatAttachmentSize(bytes: number): string {
+    if (!bytes || isNaN(bytes)) return '0 KB';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  // 1通のRawメールをパースして掲示板トピックへ変換・登録
+  async function processIncomingEmail(rawEmailBuffer: Buffer): Promise<{ imported: boolean; reason: string; topicId?: string }> {
+    try {
+      const parsed = await simpleParser(rawEmailBuffer);
+      const allUsers = loadUsers();
+
+      // 送信元メールアドレスの候補リストを抽出
+      const candidateSenders: string[] = [];
+      if (parsed.from?.value) {
+        parsed.from.value.forEach(v => {
+          if (v.address) candidateSenders.push(v.address);
+        });
+      }
+      if (parsed.from?.text) {
+        const matches = parsed.from.text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+        if (matches) candidateSenders.push(...matches);
+      }
+      if (parsed.replyTo?.value) {
+        parsed.replyTo.value.forEach(v => {
+          if (v.address) candidateSenders.push(v.address);
+        });
+      }
+
+      // ホワイトリスト照合
+      const matchedUser = matchSenderToWhitelist(candidateSenders, allUsers);
+      if (!matchedUser) {
+        const senderStr = candidateSenders.join(', ') || parsed.from?.text || '不明な送信元';
+        addPop3Log('warn', `ホワイトリスト外の送信元 (${senderStr}) からのメールのため、掲示板への掲載をスキップしました。`);
+        return { imported: false, reason: `ホワイトリスト外 (${senderStr})` };
+      }
+
+      // 添付ファイルの保存処理
+      const attachmentsList: any[] = [];
+      if (parsed.attachments && parsed.attachments.length > 0) {
+        for (let i = 0; i < parsed.attachments.length; i++) {
+          const att = parsed.attachments[i];
+          try {
+            // MIMEヘッダーデコードを適用
+            let decodedFilename = decodeMimeHeader(att.filename);
+            if (!decodedFilename) {
+              decodedFilename = `email_attachment_${Date.now()}_${i}`;
+            }
+
+            let ext = path.extname(decodedFilename);
+            if (!ext || ext.length > 10 || ext.includes('=')) {
+              ext = getExtensionFromMimeType(att.contentType);
+              if (!path.extname(decodedFilename)) {
+                decodedFilename = `${decodedFilename}${ext}`;
+              }
+            }
+
+            const cleanBase = path.basename(decodedFilename, ext)
+              .replace(/[^a-zA-Z0-9_\-\u3000-\u303F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF\uFF65-\uFF9F\uFF01-\uFF5E]/g, '_') || 'file';
+            
+            const safeSavedFilename = `${Date.now()}_${i}_${cleanBase}${ext}`;
+            const filePath = path.join(bulletinsFilesDir, safeSavedFilename);
+
+            fs.writeFileSync(filePath, att.content);
+            attachmentsList.push({
+              id: `att_mail_${Date.now()}_${i}`,
+              name: decodedFilename,
+              size: formatAttachmentSize(att.size || att.content?.length || 0),
+              url: `/bulletinsfiles/${encodeURIComponent(safeSavedFilename)}`,
+              type: att.contentType || 'application/octet-stream'
+            });
+          } catch (attErr) {
+            console.error('[POP3] 添付ファイル保存エラー:', attErr);
+          }
+        }
+      }
+
+      // 本文の抽出と整形
+      const rawText = parsed.text || (parsed.html ? parsed.html.replace(/<[^>]+>/g, '') : '') || '（本文なし）';
+      const mailSubject = (parsed.subject || '（無題の社内メール）').trim();
+      const mailDateStr = parsed.date ? new Date(parsed.date).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' }) : new Date().toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+      const fromDisplay = parsed.from?.text || `${matchedUser.name} <${matchedUser.email || matchedUser.mobileEmail}>`;
+
+      // ─── 本文1行目から特定のタブ（タグ／拠点／部署）の解析 ───
+      // メール投稿時のデフォルトは必ず「全社」「全部署」
+      let targetOffice = '全社';
+      let targetDivision = '全部署';
+      const extractedTags = new Set<string>();
+      extractedTags.add('社内メール');
+
+      // 登録ユーザー一覧から既知の拠点名・部署名リストを動的に収集
+      const knownOffices = new Set<string>(['本社', '名古屋支店', '静岡営業所', '三河営業所', '三重営業所', '岐阜営業所', '東京支店', '大阪支店']);
+      const knownDivisions = new Set<string>(['管理', '営業', '設計', '工務', '保守', '総務', '製造', '開発', 'IT', '人事', '経理', '管理部', '営業部', '設計部', '工務部', '保守部', '総務部']);
+      allUsers.forEach((u: any) => {
+        if (u.office && u.office.trim() && u.office !== '全社') knownOffices.add(u.office.trim());
+        if (u.division && u.division.trim() && u.division !== '全部署') knownDivisions.add(u.division.trim());
+        if (u.department && u.department.trim() && u.department !== '全部署') knownDivisions.add(u.department.trim());
+      });
+
+      // 本文を行ごとに分割し、最初の非空行（1行目）をチェック
+      const lines = rawText.split(/\r?\n/);
+      let firstLineIndex = -1;
+      for (let idx = 0; idx < lines.length; idx++) {
+        if (lines[idx].trim().length > 0) {
+          firstLineIndex = idx;
+          break;
+        }
+      }
+
+      let isFirstLineHeaderInstruction = false;
+      let bodyTextForContent = rawText;
+
+      if (firstLineIndex !== -1) {
+        const firstLineRaw = lines[firstLineIndex].trim();
+
+        // 1行目のフォーマットパターンを判定:
+        // パターンA: [タブ名/宛先] または 【タブ名/宛先】 または (タブ名/宛先)
+        // パターンB: タブ: ○○ / タグ: ○○ / カテゴリ: ○○ / 宛先: ○○ / 拠点: ○○ / 部署: ○○
+        // パターンC: #タグ名
+        // パターンD: 単一の短いキーワード行（例: "重要", "お知らせ", "保守", "名古屋支店"）
+        let extractedDirective = '';
+        const bracketMatch = firstLineRaw.match(/^[\[【\(「](.+?)[\]】\)」]$/);
+        const prefixMatch = firstLineRaw.match(/^(?:タブ|タグ|カテゴリ|カテゴリー|宛先|対象|公開範囲|拠点|部署|scope)[\s:：]+(.+)$/i);
+        const hashMatch = firstLineRaw.match(/^#([^\s#　]+)$/);
+
+        if (bracketMatch) {
+          extractedDirective = bracketMatch[1].trim();
+          isFirstLineHeaderInstruction = true;
+        } else if (prefixMatch) {
+          extractedDirective = prefixMatch[1].trim();
+          isFirstLineHeaderInstruction = true;
+        } else if (hashMatch) {
+          extractedDirective = hashMatch[1].trim();
+          isFirstLineHeaderInstruction = true;
+        } else if (firstLineRaw.length <= 20 && !/[。、!?！？]/.test(firstLineRaw)) {
+          // 短い単語1行のみで、既知の拠点・部署・重要タグに合致する場合
+          const candidate = firstLineRaw.replace(/^[#＃]/, '').trim();
+          const matchOffice = Array.from(knownOffices).find(o => candidate === o || candidate.includes(o));
+          const matchDiv = Array.from(knownDivisions).find(d => candidate === d || candidate.includes(d));
+          if (matchOffice || matchDiv || ['重要', 'お知らせ', '緊急', '連絡', '社内連絡', '議事録', '保守', '工務', '営業', '総務', 'IT', '人事'].includes(candidate)) {
+            extractedDirective = candidate;
+            isFirstLineHeaderInstruction = true;
+          }
+        }
+
+        if (extractedDirective) {
+          // 抽出された文字列から拠点、部署、タグを特定
+          // 1. 拠点判定
+          for (const officeName of Array.from(knownOffices)) {
+            if (extractedDirective.includes(officeName)) {
+              targetOffice = officeName;
+              break;
+            }
+          }
+
+          // 2. 部署判定
+          for (const divName of Array.from(knownDivisions)) {
+            if (extractedDirective.includes(divName)) {
+              targetDivision = divName;
+              break;
+            }
+          }
+
+          // 3. タグ判定（スラッシュや記号で分割してタグとして登録）
+          const tagTokens = extractedDirective
+            .split(/[\/\s,、|｜・]+/)
+            .map(t => t.replace(/^[#＃\[\]【】\(\)]/, '').trim())
+            .filter(Boolean);
+
+          tagTokens.forEach(token => {
+            if (token && token !== '全社' && token !== '全部署') {
+              extractedTags.add(token);
+            }
+          });
+
+          // 1行目が明示的な指定行の場合は、本文からその行を除いてすっきり表示
+          if (isFirstLineHeaderInstruction) {
+            const remainingLines = [...lines];
+            remainingLines.splice(firstLineIndex, 1);
+            while (remainingLines.length > 0 && remainingLines[0].trim() === '') {
+              remainingLines.shift();
+            }
+            bodyTextForContent = remainingLines.join('\n');
+          }
+        }
+      }
+
+      // 件名および本文からの #ハッシュタグ も抽出
+      const tagMatches = `${mailSubject} ${rawText}`.match(/#([^\s#　]+)/g);
+      if (tagMatches) {
+        tagMatches.forEach(t => {
+          const cleanTag = t.replace(/^#/, '').trim();
+          if (cleanTag && cleanTag !== '社内メール') {
+            extractedTags.add(cleanTag);
+          }
+        });
+      }
+
+      // 本文先頭にメールヘッダー風の分かりやすいヘッダーバナーを付与
+      const targetDisplay = (targetOffice === '全社' && targetDivision === '全部署')
+        ? '全社 / 全部署'
+        : `${targetOffice} / ${targetDivision}`;
+
+      const formattedContent = `${bodyTextForContent}\n\n───────────────\n📧 メール受信情報\n差出人: ${fromDisplay}\n宛先: ${targetDisplay}\n送信日時: ${mailDateStr}\n添付ファイル: ${attachmentsList.length} 件`;
+
+      // 掲示板トピック作成
+      const topicId = `topic_mail_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+      const nowIso = parsed.date ? new Date(parsed.date).toISOString() : new Date().toISOString();
+      const newTopic = {
+        id: topicId,
+        title: mailSubject,
+        content: formattedContent,
+        category: 'general',
+        tags: Array.from(extractedTags),
+        office: targetOffice,
+        division: targetDivision,
+        scope: (targetOffice === '全社' && targetDivision === '全部署') ? '全社' : '特定部署',
+        authorId: matchedUser.id,
+        author_id: matchedUser.id,
+        author: {
+          id: matchedUser.id,
+          name: matchedUser.name,
+          department: matchedUser.department || matchedUser.division,
+          office: matchedUser.office,
+          avatarUrl: matchedUser.avatarUrl || '',
+          position: matchedUser.position || ''
+        },
+        attachments: attachmentsList,
+        hasPeriod: false,
+        isPinned: false,
+        views: 0,
+        likes: 0,
+        comments: [],
+        commentsCount: 0,
+        viewers: [],
+        createdAt: nowIso,
+        created_at: nowIso,
+        updatedAt: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+
+      const bulletinsList = loadBulletins();
+      // 重複登録防止
+      if (!bulletinsList.some((b: any) => String(b.id) === String(newTopic.id))) {
+        bulletinsList.unshift(newTopic);
+        saveBulletins(bulletinsList);
+      }
+
+      // ルートの bulletins.json にもフォールバック保存
+      try {
+        const rootBPath = path.join(process.cwd(), 'bulletins.json');
+        let rList = [];
+        if (fs.existsSync(rootBPath)) {
+          rList = JSON.parse(fs.readFileSync(rootBPath, 'utf8'));
+        }
+        if (!Array.isArray(rList)) rList = [];
+        if (!rList.some((b: any) => String(b.id) === String(newTopic.id))) {
+          rList.unshift(newTopic);
+          fs.writeFileSync(rootBPath, JSON.stringify(rList, null, 2), 'utf8');
+        }
+      } catch (_) {}
+
+      // MS SQL Server (dbo.Bulletins) へも直接 INSERT（存在する場合・完全同期）
+      try {
+        // @ts-ignore
+        if (typeof getPool === 'function' || typeof (global as any).getPool === 'function') {
+          // @ts-ignore
+          const pool = typeof getPool === 'function' ? await getPool() : await (global as any).getPool();
+          if (pool) {
+            // @ts-ignore
+            const sqlModule = await import('mssql').catch(() => null);
+            const sql = sqlModule?.default || sqlModule;
+            if (sql) {
+              const targetScope = (targetOffice === '全社' && targetDivision === '全部署') ? '全社' : '特定部署';
+              await pool.request()
+                .input('id', sql.VarChar, String(topicId))
+                .input('title', sql.NVarChar, mailSubject || '')
+                .input('content', sql.NVarChar, formattedContent || '')
+                .input('category', sql.NVarChar, 'general')
+                .input('authorId', sql.VarChar, String(matchedUser.id))
+                .input('isPinned', sql.Bit, 0)
+                .input('pinnedUntil', sql.VarChar, null)
+                .input('office', sql.NVarChar, targetOffice || '全社')
+                .input('division', sql.NVarChar, targetDivision || '全部署')
+                .input('scope', sql.NVarChar, targetScope)
+                .input('tags', sql.NVarChar, Array.from(extractedTags).join(','))
+                .input('hasPeriod', sql.Bit, 0)
+                .input('startDate', sql.VarChar, null)
+                .input('endDate', sql.VarChar, null)
+                .input('attachments', sql.NVarChar, JSON.stringify(attachmentsList || []))
+                .query(`
+                  IF NOT EXISTS (SELECT 1 FROM dbo.Bulletins WHERE id = @id)
+                  INSERT INTO dbo.Bulletins (id, title, content, category, authorId, isPinned, pinnedUntil, office, division, scope, tags, attachments, hasPeriod, startDate, endDate, createdAt, views, likes)
+                  VALUES (@id, @title, @content, @category, @authorId, @isPinned, @pinnedUntil, @office, @division, @scope, @tags, @attachments, @hasPeriod, @startDate, @endDate, GETDATE(), 0, 0)
+                `);
+              console.log(`[POP3] SQL Server dbo.Bulletins inserted successfully: ${topicId} (office: ${targetOffice}, division: ${targetDivision})`);
+            }
+          }
+        }
+      } catch (dbErr: any) {
+        console.warn('[POP3] SQL Server dbo.Bulletins insert skipped or failed:', dbErr.message);
+      }
+
+      pop3State.totalImportedCount++;
+      addPop3Log('success', `メールを掲示板へ掲載しました: 「${mailSubject}」（投稿者: ${matchedUser.name}様, 宛先: ${targetDisplay}, タグ: #${Array.from(extractedTags).join(' #')}）`);
+
+      // 社内メンバーへのアプリ内通知 & Web Push
+      try {
+        const allUsers = loadUsers();
+        allUsers.forEach((u: any) => {
+          if (String(u.id) !== String(matchedUser.id)) {
+            createNotification({
+              user_id: String(u.id),
+              type: 'bulletin',
+              title: `【掲示板】${matchedUser.name}さんからメール投稿がありました`,
+              contents: `${mailSubject}`,
+              sender_id: matchedUser.id,
+              sender_name: matchedUser.name,
+              target_id: topicId
+            });
+          }
+        });
+      } catch (notifErr) {}
+
+      try {
+        await sendPushNotificationToUser({
+          excludeUserId: matchedUser.id,
+          title: `【掲示板】${matchedUser.name}さんからのメール投稿`,
+          body: `${mailSubject}`,
+          url: `/?tab=board&topicId=${topicId}`,
+          data: { topicId, tab: 'board' }
+        });
+      } catch (pushErr) {}
+
+      return { imported: true, reason: '成功', topicId };
+    } catch (err: any) {
+      console.error('[POP3] メールパース・投稿エラー:', err);
+      addPop3Log('error', `メールパースエラー: ${err.message}`);
+      return { imported: false, reason: `パースエラー: ${err.message}` };
+    }
+  }
+
+  // POP3 メールボックス巡回・受信実行関数
+  let lastPollStartedAt = 0;
+  async function pollPop3InboundEmails(): Promise<{ checked: boolean; found: number; imported: number; deleted: number; message: string }> {
+    // 30秒以上経過していたらロックを自動解除（安全弁）
+    if (pop3State.isPolling && Date.now() - lastPollStartedAt > 30000) {
+      console.warn('[POP3] 前回のポーリング処理がタイムアウトしたため、ロックを強制解除しました。');
+      pop3State.isPolling = false;
+    }
+
+    if (!pop3Config.pass || !pop3Config.pass.trim()) {
+      pop3State.lastCheckedAt = new Date().toISOString();
+      pop3State.lastCheckStatus = 'idle';
+      const skipMsg = 'POP3受信用のパスワード(POP3_PASS/SMTP_PASS)が設定されていないため、メール巡回を待機しています。';
+      pop3State.lastCheckMessage = skipMsg;
+      return { checked: false, found: 0, imported: 0, deleted: 0, message: skipMsg };
+    }
+
+    if (pop3State.isPolling) {
+      return { checked: true, found: 0, imported: 0, deleted: 0, message: '現在POP3メール受信巡回を実行中です。数秒後に再確認してください。' };
+    }
+
+    pop3State.isPolling = true;
+    lastPollStartedAt = Date.now();
+    pop3State.lastCheckStatus = 'checking';
+    const client = new Pop3SocketClient();
+
+    try {
+      addPop3Log('info', `POP3 サーバー (${pop3Config.host}:${pop3Config.port}) への接続を開始します (ユーザー: ${pop3Config.user})...`);
+      
+      await client.connect(pop3Config.host, pop3Config.port, 12000);
+      await client.sendCommand(`USER ${pop3Config.user}`);
+      await client.sendCommand(`PASS ${pop3Config.pass}`);
+
+      // メール件数確認 (STAT)
+      const statRes = await client.sendCommand('STAT');
+      const statParts = statRes.split(' ');
+      const msgCount = parseInt(statParts[1] || '0', 10);
+
+      pop3State.lastCheckedAt = new Date().toISOString();
+
+      if (msgCount === 0) {
+        await client.sendCommand('QUIT');
+        client.close();
+        pop3State.lastCheckStatus = 'success';
+        pop3State.lastCheckMessage = '新着メールはありません (0 件)';
+        return { checked: true, found: 0, imported: 0, deleted: 0, message: '新着メールはありません (0 件)' };
+      }
+
+      addPop3Log('info', `POP3 サーバー上に ${msgCount} 件の未処理メールを検出しました。受信・解析を開始します。`);
+
+      let importedCount = 0;
+      let deletedCount = 0;
+
+      for (let i = 1; i <= msgCount; i++) {
+        try {
+          const retrRes = await client.sendMultilineCommand(`RETR ${i}`);
+          const res = await processIncomingEmail(retrRes.raw);
+          if (res.imported) {
+            importedCount++;
+          }
+
+          // 掲示板取り込み後、またはホワイトリスト外のスパムメールはサーバー容量圧迫を防ぐため削除
+          if (pop3Config.deleteAfterImport) {
+            await client.sendCommand(`DELE ${i}`);
+            deletedCount++;
+          }
+        } catch (msgErr: any) {
+          addPop3Log('error', `メール #${i} の取得エラー: ${msgErr.message}`);
+        }
+      }
+
+      // QUIT でサーバー側の削除を確定して切断
+      await client.sendCommand('QUIT');
+      client.close();
+
+      pop3State.lastCheckStatus = 'success';
+      const summaryMsg = `受信完了: 検出 ${msgCount} 件, 掲示板掲載 ${importedCount} 件, サーバー削除 ${deletedCount} 件`;
+      pop3State.lastCheckMessage = summaryMsg;
+      addPop3Log('success', summaryMsg);
+
+      return { checked: true, found: msgCount, imported: importedCount, deleted: deletedCount, message: summaryMsg };
+    } catch (err: any) {
+      client.close();
+      pop3State.lastCheckedAt = new Date().toISOString();
+      pop3State.lastCheckStatus = 'error';
+      const errMsg = `POP3 接続・受信エラー: ${err.message}`;
+      pop3State.lastCheckMessage = errMsg;
+      addPop3Log('error', errMsg);
+      return { checked: true, found: 0, imported: 0, deleted: 0, message: errMsg };
+    } finally {
+      pop3State.isPolling = false;
+    }
+  }
+
+  // POP3 定期ポーリングタイマー (60秒間隔)
+  if (pop3Config.checkIntervalSec > 0) {
+    setInterval(() => {
+      pollPop3InboundEmails().catch(e => {
+        console.error('[POP3 Background Interval Error]', e);
+      });
+    }, pop3Config.checkIntervalSec * 1000);
+    console.log(`[POP3] Background inbound mail worker started (Interval: ${pop3Config.checkIntervalSec}s, Host: ${pop3Config.host}:${pop3Config.port})`);
+  }
+
+  // POP3 稼働状況・設定取得 API
+  app.get(['/api/email/inbound/status', '/api/email/inbound/status/'], (req, res) => {
+    const allUsers = loadUsers();
+    const whitelistUsers = allUsers.filter(u => !!(u.email?.trim() || u.mobileEmail?.trim()));
+    res.json({
+      config: {
+        host: pop3Config.host,
+        port: pop3Config.port,
+        secure: pop3Config.secure,
+        user: pop3Config.user,
+        fromAddress: pop3Config.fromAddress,
+        deleteAfterImport: pop3Config.deleteAfterImport,
+        checkIntervalSec: pop3Config.checkIntervalSec,
+        defaultTag: pop3Config.defaultTag
+      },
+      whitelist: {
+        totalMembers: allUsers.length,
+        whitelistedMembersCount: whitelistUsers.length,
+        members: whitelistUsers.map(u => ({
+          id: u.id,
+          name: u.name,
+          department: u.department || u.division,
+          email: u.email,
+          mobileEmail: u.mobileEmail
+        }))
+      },
+      state: pop3State
+    });
+  });
+
+  // POP3 即時メール受信実行 API
+  app.post(['/api/email/inbound/check-now', '/api/email/inbound/check-now/'], async (req, res) => {
+    try {
+      const result = await pollPop3InboundEmails();
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // POP3 メール投稿テスト・シミュレーター API
+  app.post(['/api/email/inbound/simulate', '/api/email/inbound/simulate/'], async (req, res) => {
+    try {
+      const senderEmail = req.body.senderEmail || req.body.from;
+      const subject = req.body.subject || '【連絡】社内メールからのテスト投稿';
+      const body = req.body.body || req.body.text || '社内メール受信連携のテスト投稿です。';
+
+      if (!senderEmail) {
+        return res.status(400).json({ error: '送信者メールアドレス (senderEmail) を指定してください。' });
+      }
+
+      // RFC822 形式の擬似メールバッファを作成
+      const mockRawEmail = [
+        `From: "テスト送信者" <${senderEmail}>`,
+        `To: <${pop3Config.fromAddress}>`,
+        `Subject: ${subject}`,
+        `Date: ${new Date().toUTCString()}`,
+        `Message-ID: <simulated-${Date.now()}@example.com>`,
+        `Content-Type: text/plain; charset=utf-8`,
+        ``,
+        body
+      ].join('\r\n');
+
+      const processRes = await processIncomingEmail(Buffer.from(mockRawEmail, 'utf8'));
+      res.json({
+        success: processRes.imported,
+        message: processRes.imported ? 'テストメールを掲示板へ正常に投稿しました。' : `投稿スキップ: ${processRes.reason}`,
+        details: processRes
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // 日報・週報 (Work Reports / Daily Reports) API
+  // ==========================================
+  const workReportsPath = path.join(dataDir, 'work_reports.json');
+
+  interface StoredWorkReport {
+    id: string;
+    // 新カラム定義 (WorkReports テーブル仕様)
+    author_id: string;
+    supervisor_id?: string;
+    week_start_date?: string; // YYYY-MM-DD
+    week_label?: string; // e.g. '2026年8月17日週'
+    tasks: string;
+    achievements?: string;
+    issues?: string;
+    continued_items?: string;
+    next_week_plans?: string;
+    status: 'draft' | 'submitted' | 'reviewed';
+    review_feedback?: string;
+    reviewed_at?: string;
+    createdAt: string;
+    updated_at?: string;
+    // 互換性用プロパティ
+    authorId?: string;
+    authorName?: string;
+    authorDepartment?: string;
+    authorAvatarUrl?: string;
+    author?: any;
+    reportType?: string;
+    date?: string; // YYYY-MM-DD
+    reportDate?: string;
+    weekStartDate?: string;
+    weekLabel?: string;
+    department?: string;
+    results?: string;
+    ongoingProjects?: string;
+    tomorrowPlan?: string;
+    supervisorId?: string;
+    supervisorName?: string;
+    supervisor?: any;
+    feedbackComment?: string;
+    submittedAt?: string;
+    reviewedAt?: string;
+    updatedAt?: string;
+    maintenanceData?: any;
+    constructionData?: any;
+    salesData?: any;
+  }
+
+  function loadWorkReports(): StoredWorkReport[] {
+    if (!fs.existsSync(workReportsPath)) {
+      return [];
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(workReportsPath, 'utf8'));
+      if (!Array.isArray(raw)) return [];
+      return raw.map(r => normalizeWorkReport(r));
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function normalizeWorkReport(r: any): StoredWorkReport {
+    const author_id = r.author_id || r.authorId || (r.author && r.author.id) || 'u1';
+    const supervisor_id = r.supervisor_id || r.supervisorId || (r.supervisor && r.supervisor.id) || undefined;
+    const week_start_date = r.week_start_date || r.weekStartDate || (r.date ? r.date.slice(0, 10) : undefined) || (r.reportDate ? r.reportDate.slice(0, 10) : undefined);
+    const week_label = r.week_label || r.weekLabel || (week_start_date ? `${week_start_date}週` : undefined);
+    const tasks = r.tasks || r.content || '';
+    const achievements = r.achievements !== undefined ? r.achievements : (r.results || '');
+    const issues = r.issues || '';
+    const continued_items = r.continued_items !== undefined ? r.continued_items : (r.ongoingProjects || '');
+    const next_week_plans = r.next_week_plans !== undefined ? r.next_week_plans : (r.tomorrowPlan || '');
+    const status = r.status || 'submitted';
+    const review_feedback = r.review_feedback !== undefined ? r.review_feedback : (r.feedbackComment || '');
+    const reviewed_at = r.reviewed_at || r.reviewedAt || undefined;
+    const createdAt = r.createdAt || r.created_at || new Date().toISOString();
+    const updated_at = r.updated_at || r.updatedAt || r.createdAt || new Date().toISOString();
+    const mData = r.maintenanceData || r.maintenance_data;
+    const cData = r.constructionData || r.construction_data;
+    const sData = r.salesData || r.sales_data;
+    const repType = r.reportType || r.report_type || (mData ? 'maintenance_daily' : (cData ? 'construction_daily' : (sData ? 'sales_daily' : (week_start_date ? 'weekly' : 'daily'))));
+
+    return {
+      id: String(r.id),
+      author_id,
+      supervisor_id,
+      week_start_date,
+      week_label,
+      tasks,
+      achievements,
+      issues,
+      continued_items,
+      next_week_plans,
+      status,
+      review_feedback,
+      reviewed_at,
+      createdAt,
+      updated_at,
+      // 互換用
+      authorId: author_id,
+      authorName: r.authorName || (r.author && r.author.name) || undefined,
+      authorDepartment: r.authorDepartment || r.department || (r.author && r.author.department) || undefined,
+      authorAvatarUrl: r.authorAvatarUrl || (r.author && r.author.avatarUrl) || undefined,
+      author: r.author || undefined,
+      reportType: repType,
+      date: r.date || r.reportDate || week_start_date,
+      reportDate: r.reportDate || r.date || week_start_date,
+      weekStartDate: week_start_date,
+      weekLabel: week_label,
+      department: r.department || r.authorDepartment || (r.author && r.author.department) || '',
+      results: achievements,
+      ongoingProjects: continued_items,
+      tomorrowPlan: next_week_plans,
+      supervisorId: supervisor_id,
+      supervisorName: r.supervisorName || (r.supervisor && r.supervisor.name) || undefined,
+      supervisor: r.supervisor || undefined,
+      feedbackComment: review_feedback,
+      submittedAt: r.submittedAt || (status === 'submitted' ? (r.createdAt || createdAt) : undefined),
+      reviewedAt: reviewed_at,
+      updatedAt: updated_at,
+      maintenanceData: mData,
+      constructionData: cData,
+      salesData: sData
+    };
+  }
+
+  function saveWorkReports(items: StoredWorkReport[]) {
+    try {
+      fs.writeFileSync(workReportsPath, JSON.stringify(items, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save work reports:', e);
+    }
+  }
+
+  // 日報・週報一覧取得 API
+  app.get(['/api/work-reports', '/api/daily-reports', '/api/reports'], (req, res) => {
+    try {
+      let reports = loadWorkReports();
+      const { authorId, author_id, supervisorId, supervisor_id, department, reportType, status, weekStartDate, week_start_date } = req.query;
+
+      const targetAuthor = author_id || authorId;
+      const targetSupervisor = supervisor_id || supervisorId;
+      const targetWeekStart = week_start_date || weekStartDate;
+
+      if (targetAuthor) {
+        reports = reports.filter(r => r.author_id === String(targetAuthor) || r.authorId === String(targetAuthor));
+      }
+      if (targetSupervisor) {
+        reports = reports.filter(r => r.supervisor_id === String(targetSupervisor) || r.supervisorId === String(targetSupervisor));
+      }
+      if (department) {
+        reports = reports.filter(r => r.department === String(department));
+      }
+      if (reportType) {
+        reports = reports.filter(r => r.reportType === String(reportType));
+      }
+      if (status) {
+        reports = reports.filter(r => r.status === String(status));
+      }
+      if (targetWeekStart) {
+        reports = reports.filter(r => r.week_start_date === String(targetWeekStart) || r.weekStartDate === String(targetWeekStart));
+      }
+
+      // 下書き・未確認（submitted / draft）を優先し、新しい順にソート (week_start_date or createdAt desc)
+      reports.sort((a, b) => {
+        const aPriority = (a.status === 'draft' || a.status === 'submitted') ? 0 : 1;
+        const bPriority = (b.status === 'draft' || b.status === 'submitted') ? 0 : 1;
+        if (aPriority !== bPriority) return aPriority - bPriority;
+        const timeA = new Date(a.week_start_date || a.date || a.createdAt).getTime();
+        const timeB = new Date(b.week_start_date || b.date || b.createdAt).getTime();
+        return timeB - timeA;
+      });
+
+      const isAll = req.query.all === 'true' || req.query.all === '1';
+      if (!isAll) {
+        const rawLimit = parseInt(String(req.query.limit || '300'), 10);
+        const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 300;
+        const rawOffset = parseInt(String(req.query.offset || '0'), 10);
+        const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
+        reports = reports.slice(offset, offset + limit);
+      }
+
+      res.json(reports);
+    } catch (err: any) {
+      console.error('Get work reports error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 日報・週報 作成 / 登録 API (新旧カラム両対応 & notifications 連動)
+  app.post(['/api/work-reports', '/api/daily-reports', '/api/reports'], async (req, res) => {
+    try {
+      const data = req.body || {};
+      const reports = loadWorkReports();
+      const nowIso = new Date().toISOString();
+
+      const newId = data.id && !data.id.startsWith('r-temp-') ? data.id : `rep_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const existingIdx = reports.findIndex(r => r.id === newId);
+
+      const isSubmitting = data.status === 'submitted' || data.isSubmitting;
+      const status = data.status || (isSubmitting ? 'submitted' : 'draft');
+
+      const author_id = String(data.author_id || data.authorId || (data.author && data.author.id) || 'u1');
+      const authorName = data.authorName || (data.author && data.author.name) || '社員';
+      const supervisor_id = data.supervisor_id || data.supervisorId || (data.supervisor && data.supervisor.id) || undefined;
+      const week_start_date = data.week_start_date || data.weekStartDate || (data.date ? data.date.slice(0, 10) : undefined) || (data.reportDate ? data.reportDate.slice(0, 10) : undefined) || nowIso.slice(0, 10);
+      const week_label = data.week_label || data.weekLabel || (week_start_date ? `${week_start_date}週` : undefined);
+      const tasks = data.tasks || data.content || '';
+      const achievements = data.achievements !== undefined ? data.achievements : (data.results || '');
+      const issues = data.issues || '';
+      const continued_items = data.continued_items !== undefined ? data.continued_items : (data.ongoingProjects || '');
+      const next_week_plans = data.next_week_plans !== undefined ? data.next_week_plans : (data.tomorrowPlan || '');
+      const review_feedback = data.review_feedback !== undefined ? data.review_feedback : (data.feedbackComment || '');
+      const reviewed_at = data.reviewed_at || data.reviewedAt || undefined;
+      const createdAt = data.createdAt || data.created_at || (existingIdx >= 0 ? reports[existingIdx].createdAt : nowIso);
+      const updated_at = nowIso;
+
+      const newReport: StoredWorkReport = {
+        id: newId,
+        author_id,
+        supervisor_id,
+        week_start_date,
+        week_label,
+        tasks,
+        achievements,
+        issues,
+        continued_items,
+        next_week_plans,
+        status,
+        review_feedback,
+        reviewed_at,
+        createdAt,
+        updated_at,
+        // 互換用
+        authorId: author_id,
+        authorName,
+        authorDepartment: data.authorDepartment || data.department || (data.author && data.author.department) || '',
+        authorAvatarUrl: data.authorAvatarUrl || (data.author && data.author.avatarUrl) || '',
+        author: data.author || undefined,
+        reportType: data.reportType || data.report_type || (data.maintenanceData || data.maintenance_data ? 'maintenance_daily' : (data.constructionData || data.construction_data ? 'construction_daily' : (data.salesData || data.sales_data ? 'sales_daily' : (week_start_date ? 'weekly' : 'daily')))),
+        date: data.date || data.reportDate || week_start_date,
+        reportDate: data.reportDate || data.date || week_start_date,
+        weekStartDate: week_start_date,
+        weekLabel: week_label,
+        department: data.department || (data.author && data.author.department) || '',
+        results: achievements,
+        ongoingProjects: continued_items,
+        tomorrowPlan: next_week_plans,
+        supervisorId: supervisor_id,
+        supervisorName: data.supervisorName || (data.supervisor && data.supervisor.name) || undefined,
+        supervisor: data.supervisor || undefined,
+        feedbackComment: review_feedback,
+        submittedAt: status === 'submitted' ? (data.submittedAt || nowIso) : undefined,
+        reviewedAt: reviewed_at,
+        updatedAt: updated_at,
+        maintenanceData: data.maintenanceData || data.maintenance_data,
+        constructionData: data.constructionData || data.construction_data,
+        salesData: data.salesData || data.sales_data,
+      };
+
+      if (existingIdx >= 0) {
+        reports[existingIdx] = newReport;
+      } else {
+        reports.unshift(newReport);
+      }
+
+      saveWorkReports(reports);
+
+      // 上長へ提出された場合は notifications テーブル・JSON へレコード自動作成 & Push通知
+      if (status === 'submitted' && supervisor_id && supervisor_id !== author_id) {
+        const repType = newReport.reportType;
+        const typeLabel = repType === 'maintenance_daily' ? '保守日報' : (repType === 'daily' ? '日報' : (repType === 'sales_daily' ? '営業日報' : (repType === 'construction_daily' ? '工務日報' : '週報')));
+        const dateLabel = newReport.date || week_label || week_start_date || '最新';
+        try {
+          createNotification({
+            user_id: supervisor_id,
+            sender_id: author_id,
+            type: 'work_report',
+            title: `【${typeLabel}】${authorName}さんより提出`,
+            contents: `${dateLabel}の${typeLabel}が提出されました。確認をお願いします。`,
+            target_id: newId,
+            sender_name: authorName
+          });
+        } catch (notifErr) {
+          console.warn('Failed to auto-create notification:', notifErr);
+        }
+
+        try {
+          await sendPushNotificationToUser({
+            targetUserId: supervisor_id,
+            title: `【${typeLabel}】${authorName}さんより提出`,
+            body: `${dateLabel}の${typeLabel}が提出されました。確認をお願いします。`,
+            url: '/?tab=daily_report',
+            data: { reportId: newReport.id, tab: 'daily_report' },
+            tag: `report_submit_${newReport.id}`
+          });
+        } catch (pushErr) {
+          console.warn('[Push] Report supervisor notify error:', pushErr);
+        }
+      }
+
+      res.json({ success: true, report: newReport });
+    } catch (err: any) {
+      console.error('Save work report error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 日報・週報 更新 API
+  app.put(['/api/work-reports/:id', '/api/daily-reports/:id', '/api/reports/:id'], async (req, res) => {
+    try {
+      const { id } = req.params;
+      const data = req.body || {};
+      const reports = loadWorkReports();
+      const idx = reports.findIndex(r => r.id === id);
+
+      if (idx === -1) {
+        return res.status(404).json({ error: '対象の報告が見つかりません' });
+      }
+
+      const prevStatus = reports[idx].status;
+      const nextStatus = data.status || prevStatus;
+      const nowIso = new Date().toISOString();
+
+      // 作成者（author_id / author）の厳格な保護: 既存日報の原本作成者を最優先し、承認者等による書き換えを防止
+      const originalAuthorId = reports[idx].author_id || reports[idx].authorId || (reports[idx].author && reports[idx].author.id);
+      const resolvedAuthorId = originalAuthorId || data.author_id || data.authorId || (data.author && data.author.id);
+      const resolvedAuthor = reports[idx].author || data.author;
+
+      const merged = {
+        ...reports[idx],
+        ...data,
+        id,
+        status: nextStatus,
+        achievements: data.achievements !== undefined ? data.achievements : (data.results !== undefined ? data.results : reports[idx].achievements),
+        continued_items: data.continued_items !== undefined ? data.continued_items : (data.ongoingProjects !== undefined ? data.ongoingProjects : reports[idx].continued_items),
+        next_week_plans: data.next_week_plans !== undefined ? data.next_week_plans : (data.tomorrowPlan !== undefined ? data.tomorrowPlan : reports[idx].next_week_plans),
+        review_feedback: data.review_feedback !== undefined ? data.review_feedback : (data.feedbackComment !== undefined ? data.feedbackComment : reports[idx].review_feedback),
+        author_id: resolvedAuthorId,
+        authorId: resolvedAuthorId,
+        author: resolvedAuthor,
+        supervisor_id: data.supervisor_id !== undefined ? data.supervisor_id : (data.supervisorId !== undefined ? data.supervisorId : reports[idx].supervisor_id),
+        week_start_date: data.week_start_date || data.weekStartDate || reports[idx].week_start_date,
+        week_label: data.week_label || data.weekLabel || reports[idx].week_label,
+        submittedAt: nextStatus === 'submitted' && prevStatus !== 'submitted' ? nowIso : (data.submittedAt || reports[idx].submittedAt),
+        updated_at: nowIso,
+        updatedAt: nowIso
+      };
+
+      const updatedReport = normalizeWorkReport(merged);
+      reports[idx] = updatedReport;
+      saveWorkReports(reports);
+
+      if (nextStatus === 'submitted' && prevStatus !== 'submitted' && updatedReport.supervisor_id) {
+        const repType = updatedReport.reportType;
+        const typeLabel = repType === 'maintenance_daily' ? '保守日報' : (repType === 'daily' ? '日報' : (repType === 'sales_daily' ? '営業日報' : (repType === 'construction_daily' ? '工務日報' : '週報')));
+        const dateLabel = updatedReport.date || updatedReport.week_label || updatedReport.week_start_date || '最新';
+        try {
+          createNotification({
+            user_id: updatedReport.supervisor_id,
+            sender_id: updatedReport.author_id,
+            type: 'work_report',
+            title: `【${typeLabel}】${updatedReport.authorName || '社員'}さんより提出`,
+            contents: `${dateLabel}の${typeLabel}が提出されました。確認をお願いします。`,
+            target_id: updatedReport.id,
+            sender_name: updatedReport.authorName
+          });
+        } catch (notifErr) {}
+
+        try {
+          await sendPushNotificationToUser({
+            targetUserId: updatedReport.supervisor_id,
+            title: `【${typeLabel}】${updatedReport.authorName || '社員'}さんより提出`,
+            body: `${dateLabel}の${typeLabel}が提出されました。確認をお願いします。`,
+            url: '/?tab=daily_report',
+            data: { reportId: updatedReport.id, tab: 'daily_report' }
+          });
+        } catch (pushErr) {}
+      }
+
+      res.json({ success: true, report: updatedReport });
+    } catch (err: any) {
+      console.error('Update work report error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 上長への報告・提出 API
+  app.post(['/api/work-reports/:id/submit', '/api/daily-reports/:id/submit', '/api/reports/:id/submit'], async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { supervisorId, supervisor_id, supervisorName } = req.body || {};
+      const reports = loadWorkReports();
+      const idx = reports.findIndex(r => r.id === id);
+
+      if (idx === -1) {
+        return res.status(404).json({ error: '対象の報告が見つかりません' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const targetSupId = supervisor_id || supervisorId || reports[idx].supervisor_id;
+      reports[idx].status = 'submitted';
+      reports[idx].submittedAt = nowIso;
+      reports[idx].updated_at = nowIso;
+      reports[idx].updatedAt = nowIso;
+      if (targetSupId) {
+        reports[idx].supervisor_id = targetSupId;
+        reports[idx].supervisorId = targetSupId;
+      }
+      if (supervisorName) reports[idx].supervisorName = supervisorName;
+
+      saveWorkReports(reports);
+
+      if (targetSupId) {
+        const repType = reports[idx].reportType;
+        const typeLabel = repType === 'maintenance_daily' ? '保守日報' : (repType === 'daily' ? '日報' : (repType === 'sales_daily' ? '営業日報' : (repType === 'construction_daily' ? '工務日報' : '週報')));
+        const dateLabel = reports[idx].date || reports[idx].week_label || reports[idx].week_start_date || '最新';
+        try {
+          createNotification({
+            user_id: targetSupId,
+            sender_id: reports[idx].author_id,
+            type: 'work_report',
+            title: `【${typeLabel}】${reports[idx].authorName || '社員'}さんより提出`,
+            contents: `${dateLabel}の${typeLabel}が提出されました。確認をお願いします。`,
+            target_id: reports[idx].id,
+            sender_name: reports[idx].authorName
+          });
+        } catch (notifErr) {}
+
+        try {
+          await sendPushNotificationToUser({
+            targetUserId: targetSupId,
+            title: `【${typeLabel}】${reports[idx].authorName || '社員'}さんより提出`,
+            body: `${dateLabel}の${typeLabel}が提出されました。確認をお願いします。`,
+            url: '/?tab=daily_report',
+            data: { reportId: reports[idx].id, tab: 'daily_report' },
+            tag: `report_submit_${reports[idx].id}`
+          });
+        } catch (pushErr) {}
+      }
+
+      res.json({ success: true, report: reports[idx] });
+    } catch (err: any) {
+      console.error('Submit work report error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 上長による確認・承認・フィードバック API (notifications 連動)
+  app.post(['/api/work-reports/:id/review', '/api/daily-reports/:id/review', '/api/reports/:id/review'], async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { feedbackComment, review_feedback, reviewerUserId, reviewerName } = req.body || {};
+      const reports = loadWorkReports();
+      const idx = reports.findIndex(r => r.id === id);
+
+      if (idx === -1) {
+        return res.status(404).json({ error: '対象の報告が見つかりません' });
+      }
+
+      const nowIso = new Date().toISOString();
+      const comment = review_feedback !== undefined ? review_feedback : (feedbackComment !== undefined ? feedbackComment : '');
+      reports[idx].status = 'reviewed';
+      reports[idx].reviewed_at = nowIso;
+      reports[idx].reviewedAt = nowIso;
+      reports[idx].review_feedback = comment;
+      reports[idx].feedbackComment = comment;
+      reports[idx].updated_at = nowIso;
+      reports[idx].updatedAt = nowIso;
+
+      saveWorkReports(reports);
+
+      // 提出者本人へ確認完了の通知を notifications に作成 & Push通知
+      if (reports[idx].author_id) {
+        const repType = reports[idx].reportType;
+        const typeLabel = repType === 'maintenance_daily' ? '保守日報' : (repType === 'daily' ? '日報' : (repType === 'sales_daily' ? '営業日報' : (repType === 'construction_daily' ? '工務日報' : '週報')));
+        const periodName = reports[idx].date || reports[idx].week_label || reports[idx].week_start_date || '';
+        try {
+          createNotification({
+            user_id: reports[idx].author_id,
+            sender_id: reviewerUserId || reports[idx].supervisor_id,
+            type: 'work_report_review',
+            title: `【${typeLabel}】${reviewerName || '上長'}が${typeLabel}を確認しました`,
+            contents: `${periodName}の${typeLabel}が確認されました。${comment ? `コメント: 「${comment}」` : ''}`,
+            target_id: reports[idx].id,
+            sender_name: reviewerName || '上長'
+          });
+        } catch (notifErr) {
+          console.warn('Failed to auto-create review notification:', notifErr);
+        }
+
+        try {
+          await sendPushNotificationToUser({
+            targetUserId: reports[idx].author_id,
+            title: `【${typeLabel}】${reviewerName || '上長'}が${typeLabel}を確認しました`,
+            body: `${periodName}の${typeLabel}が確認されました。${comment ? `「${comment}」` : ''}`,
+            url: '/?tab=daily_report',
+            data: { reportId: reports[idx].id, tab: 'daily_report' },
+            tag: `report_reviewed_${reports[idx].id}`
+          });
+        } catch (pushErr) {}
+      }
+
+      res.json({ success: true, report: reports[idx] });
+    } catch (err: any) {
+      console.error('Review work report error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // 日報・週報 削除 API
+  app.delete(['/api/work-reports/:id', '/api/daily-reports/:id', '/api/reports/:id'], (req, res) => {
+    try {
+      const { id } = req.params;
+      let reports = loadWorkReports();
+      const initialCount = reports.length;
+      reports = reports.filter(r => r.id !== id);
+      saveWorkReports(reports);
+      res.json({ success: true, deleted: initialCount - reports.length });
+    } catch (err: any) {
+      console.error('Delete work report error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ==========================================
+  // ワークフロー (Workflows / Applications) JSON ストレージ & API
+  // ==========================================
+  const workflowsPath = path.join(dataDir, 'workflows.json');
+
+  interface StoredWorkflow {
+    id: string;
+    title: string;
+    applicantId: string;
+    approverId?: string;
+    status: string; // 'pending' | 'approved' | 'rejected' | 'draft'
+    category?: string;
+    type?: string;
+    description?: string;
+    attachments?: any;
+    purchaseOrderNumber?: string | null;
+    constructionDate?: string | null;
+    linkedInventoryIssueId?: string | null;
+    details?: string | any;
+    createdAt: string;
+    updatedAt?: string;
+  }
+
+  function getInitialWorkflowsSample(): StoredWorkflow[] {
+    const initial: StoredWorkflow[] = [
+      {
+        id: 'wf-101',
+        title: '備品（モニタ・キーボード）購入申請',
+        applicantId: 'u2',
+        approverId: 'u1',
+        status: 'pending',
+        category: 'purchase_order',
+        type: 'purchase_order',
+        description: '業務効率化および開発環境の整備のため、高解像度モニターと周辺機器を導入したく申請いたします。',
+        attachments: [],
+        purchaseOrderNumber: 'PO-2026-0801',
+        constructionDate: null,
+        linkedInventoryIssueId: null,
+        createdAt: new Date(Date.now() - 86400000 * 2).toISOString(),
+        updatedAt: new Date(Date.now() - 86400000 * 2).toISOString(),
+        details: JSON.stringify({
+          flowId: 'flow-1',
+          flowName: '標準承認フロー',
+          currentStepIndex: 1,
+          totalSteps: 2,
+          reason: '開発受託業務用モニターおよびキーボードの購入',
+          purchasePurpose: '業務効率化および開発環境の整備のため、高解像度モニターと周辺機器を導入したく申請いたします。',
+          purchaseTiming: 'urgent',
+          purchaseVendor: 'Amazon / アスクル',
+          purchaseMethod: 'self',
+          amount: 45000,
+          expenseType: '備品消耗品費',
+          purchaseItems: [
+            { itemName: '4K 27インチモニター', quantity: 1, unitPrice: 35000, amount: 35000 },
+            { itemName: 'メカニカルキーボード', quantity: 1, unitPrice: 10000, amount: 10000 }
+          ],
+          stepsConfig: [
+            { stepNumber: 1, approverType: 'supervisor_1', stepName: '一次承認（直属上長）' },
+            { stepNumber: 2, approverType: 'department_head', stepName: '最終承認（部長）' }
+          ],
+          history: []
+        })
+      }
+    ];
+    try {
+      fs.writeFileSync(workflowsPath, JSON.stringify(initial, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to write initial workflows sample:', e);
+    }
+    return initial;
+  }
+
+  function loadWorkflows(): StoredWorkflow[] {
+    if (!fs.existsSync(workflowsPath)) {
+      return getInitialWorkflowsSample();
+    }
+    try {
+      const raw = JSON.parse(fs.readFileSync(workflowsPath, 'utf8'));
+      if (!Array.isArray(raw) || raw.length === 0) {
+        return getInitialWorkflowsSample();
+      }
+      return raw;
+    } catch (e) {
+      return getInitialWorkflowsSample();
+    }
+  }
+
+  function saveWorkflows(items: StoredWorkflow[]) {
+    try {
+      fs.writeFileSync(workflowsPath, JSON.stringify(items, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save workflows:', e);
+    }
+  }
+
+  // ==========================================
+  // マスター管理 (Office, Division, Position, ItemMaster, ApprovalFlow)
+  // ==========================================
+  const officesFilePath = path.join(dataDir, 'offices.json');
+  const divisionsFilePath = path.join(dataDir, 'divisions.json');
+  const positionsFilePath = path.join(dataDir, 'positions.json');
+  const itemMastersFilePath = path.join(dataDir, 'item-masters.json');
+  const approvalFlowsFilePath = path.join(dataDir, 'approval-flows.json');
+  const maintenanceConfigsFilePath = path.join(dataDir, 'maintenance_office_configs.json');
+  const drivingLogConfigsFilePath = path.join(dataDir, 'driving_log_office_configs.json');
+
+  const defaultOffices = [
+    { id: 'off-1', name: '本社', type: 'headquarters', code: 'HQ', location: '愛知県名古屋市', phone: '052-000-0000' },
+    { id: 'off-2', name: '名古屋支店', type: 'branch', code: 'NGO', location: '愛知県名古屋市', phone: '052-000-0001' },
+    { id: 'off-3', name: '静岡営業所', type: 'office', code: 'SZK', location: '静岡県静岡市', phone: '054-000-0000' },
+    { id: 'off-4', name: '浜松営業所', type: 'office', code: 'HMS', location: '静岡県浜松市', phone: '053-000-0000' },
+    { id: 'off-5', name: '三河営業所', type: 'office', code: 'MKW', location: '愛知県岡崎市', phone: '0564-00-0000' },
+  ];
+
+  const defaultDivisions = [
+    { id: 'div-1', name: '管理部', code: 'ADM', description: '総務・人事・経理等' },
+    { id: 'div-2', name: '営業部', code: 'SAL', description: '営業・顧客対応' },
+    { id: 'div-3', name: '設計部', code: 'DES', description: '設計・開発' },
+    { id: 'div-4', name: '工務部', code: 'CON', description: '施工・施工管理' },
+    { id: 'div-5', name: '保守部', code: 'MNT', description: '保守・メンテナンス' },
+  ];
+
+  const defaultPositions = [
+    { id: 'pos-1', name: '社長', level: 10 },
+    { id: 'pos-2', name: '役員', level: 9 },
+    { id: 'pos-3', name: '部長', level: 8 },
+    { id: 'pos-4', name: '課長', level: 6 },
+    { id: 'pos-5', name: '係長', level: 4 },
+    { id: 'pos-6', name: '主任', level: 2 },
+    { id: 'pos-7', name: '一般社員', level: 1 },
+  ];
+
+  const defaultItemMasters = [
+    { id: 'itm-1', code: 'EQ-001', name: '4K 27インチモニター', category: '開発備品', unit: '台', defaultUnitPrice: 45000, unitPrice: 45000, description: '作業用ディスプレイ', spec: '27inch 4K', minStock: 2, currentStock: 5 },
+    { id: 'itm-2', code: 'EQ-002', name: 'ノートPC Core-i7', category: 'OA機器', unit: '台', defaultUnitPrice: 180000, unitPrice: 180000, description: '標準支給PC', spec: 'Core-i7 16GB', minStock: 3, currentStock: 8 },
+  ];
+
+  const defaultApprovalFlows = [
+    { id: 'flow-1', name: '基本承認フロー', description: '全申請向けの共通承認フロー', targetApplicationType: 'all', isDefault: true, steps: [{ stepNumber: 1, approverRole: 'supervisor', title: '直属上長承認' }] }
+  ];
+
+  const loadJsonMaster = (filePath: string, defaultData: any[]) => {
+    if (!fs.existsSync(filePath)) {
+      try {
+        fs.writeFileSync(filePath, JSON.stringify(defaultData, null, 2), 'utf8');
+      } catch (e) {
+        console.error(`Failed to write default master (${filePath}):`, e);
+      }
+      return defaultData;
+    }
+    try {
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      return Array.isArray(data) ? data : defaultData;
+    } catch (e) {
+      return defaultData;
+    }
+  };
+
+  const saveJsonMaster = (filePath: string, data: any[]) => {
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    } catch (e) {
+      console.error(`Failed to save master (${filePath}):`, e);
+    }
+  };
+
+  // 拠点マスター (Offices)
+  const normalizeOfficeMasterPayload = (item: any, id: string) => ({
+    ...item,
+    id,
+    fax: item.fax || '',
+    officeManagerId: item.officeManagerId || '',
+    officeManagerName: item.officeManagerName || '',
+    safeDrivingManagerId: item.safeDrivingManagerId || '',
+    safeDrivingManagerName: item.safeDrivingManagerName || '',
+    accountingManagerId: item.accountingManagerId || '',
+    accountingManagerName: item.accountingManagerName || '',
+    dispatchManagerId: item.dispatchManagerId || '',
+    dispatchManagerName: item.dispatchManagerName || '',
+  });
+
+  app.get(['/api/masters/offices', '/api/masters/offices/', '/api/offices', '/api/offices/'], (req, res) => {
+    res.json(loadJsonMaster(officesFilePath, defaultOffices));
+  });
+
+  app.post(['/api/masters/offices', '/api/masters/offices/', '/api/offices', '/api/offices/'], (req, res) => {
+    const list = loadJsonMaster(officesFilePath, defaultOffices);
+    const item = req.body || {};
+    const id = item.id || `off-${Date.now()}`;
+    const newItem = normalizeOfficeMasterPayload(item, id);
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(officesFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.put(['/api/masters/offices/:id', '/api/masters/offices/:id/', '/api/offices/:id', '/api/offices/:id/'], (req, res) => {
+    const list = loadJsonMaster(officesFilePath, defaultOffices);
+    const id = req.params.id;
+    const item = req.body || {};
+    const newItem = normalizeOfficeMasterPayload(item, id);
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(officesFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.delete(['/api/masters/offices/:id', '/api/masters/offices/:id/', '/api/offices/:id', '/api/offices/:id/'], (req, res) => {
+    let list = loadJsonMaster(officesFilePath, defaultOffices);
+    const id = req.params.id;
+    list = list.filter((i: any) => i.id !== id);
+    saveJsonMaster(officesFilePath, list);
+    res.json({ success: true, id });
+  });
+
+  // 拠点別カスタム様式・設定（保守日報・運転記録簿 共通ヘルパー）
+  const registerInlineOfficeConfigRoutes = ({
+    getPaths,
+    postPaths,
+    putPaths,
+    filePath,
+    idPrefix,
+  }: {
+    getPaths: string[];
+    postPaths: string[];
+    putPaths: string[];
+    filePath: string;
+    idPrefix: string;
+  }) => {
+    app.get(getPaths, (req, res) => {
+      res.json(loadJsonMaster(filePath, []));
+    });
+
+    const saveConfigHandler = (req: any, res: any) => {
+      let list = loadJsonMaster(filePath, []);
+      const body = req.body || {};
+      const normBase = (raw?: string) => (raw || '').trim().replace(/(支店|営業所|本社|出張所|事務所|センター)$/, '').trim();
+      if (Array.isArray(body)) {
+        list = body;
+      } else if (body && (body.officeId || body.officeName || body.id)) {
+        const officeName = body.officeName || req.params.officeName || body.id;
+        const officeId = body.officeId || undefined;
+        const targetNorm = normBase(officeName);
+        const index = list.findIndex((c: any) =>
+          (officeId && c.officeId && String(c.officeId) === String(officeId)) ||
+          (body.id && c.id === body.id) ||
+          c.officeName === officeName ||
+          (targetNorm && normBase(c.officeName) === targetNorm)
+        );
+        const newConfig = {
+          ...(index >= 0 ? list[index] : {}),
+          ...body,
+          officeId: officeId || (index >= 0 ? list[index].officeId : undefined),
+          officeName,
+          id: body.id || (officeId ? `${idPrefix}${officeId}` : `${idPrefix}${officeName}`),
+          updatedAt: new Date().toISOString()
+        };
+        if (index >= 0) {
+          list[index] = newConfig;
+        } else {
+          list.push(newConfig);
+        }
+      }
+      saveJsonMaster(filePath, list);
+      res.json({ success: true, configs: list });
+    };
+
+    app.post(postPaths, saveConfigHandler);
+    app.put(putPaths, saveConfigHandler);
+  };
+
+  // 保守日報 拠点別カスタム様式・設定 (Maintenance Daily Report Office Configurations)
+  registerInlineOfficeConfigRoutes({
+    getPaths: ['/api/masters/maintenance-configs', '/api/masters/maintenance-configs/', '/api/maintenance-configs', '/api/maintenance-configs/'],
+    postPaths: ['/api/masters/maintenance-configs', '/api/masters/maintenance-configs/', '/api/maintenance-configs', '/api/maintenance-configs/'],
+    putPaths: ['/api/masters/maintenance-configs', '/api/masters/maintenance-configs/', '/api/maintenance-configs', '/api/maintenance-configs/', '/api/masters/maintenance-configs/:officeName', '/api/maintenance-configs/:officeName/'],
+    filePath: maintenanceConfigsFilePath,
+    idPrefix: 'cfg-office-'
+  });
+
+  // 運転記録簿 拠点別カスタム様式・設定 (Driving Log Office Configurations)
+  registerInlineOfficeConfigRoutes({
+    getPaths: ['/api/masters/driving-log-configs', '/api/masters/driving-log-configs/', '/api/driving-log-configs', '/api/driving-log-configs/'],
+    postPaths: ['/api/masters/driving-log-configs', '/api/masters/driving-log-configs/', '/api/driving-log-configs', '/api/driving-log-configs/'],
+    putPaths: ['/api/masters/driving-log-configs', '/api/masters/driving-log-configs/', '/api/driving-log-configs', '/api/driving-log-configs/', '/api/masters/driving-log-configs/:officeName', '/api/driving-log-configs/:officeName/'],
+    filePath: drivingLogConfigsFilePath,
+    idPrefix: 'drv-cfg-office-'
+  });
+
+  // 部署マスター (Divisions)
+  app.get(['/api/masters/divisions', '/api/masters/divisions/', '/api/divisions', '/api/divisions/'], (req, res) => {
+    res.json(loadJsonMaster(divisionsFilePath, defaultDivisions));
+  });
+
+  app.post(['/api/masters/divisions', '/api/masters/divisions/', '/api/divisions', '/api/divisions/'], (req, res) => {
+    const list = loadJsonMaster(divisionsFilePath, defaultDivisions);
+    const item = req.body || {};
+    const id = item.id || `div-${Date.now()}`;
+    const newItem = { ...item, id };
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(divisionsFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.put(['/api/masters/divisions/:id', '/api/masters/divisions/:id/', '/api/divisions/:id', '/api/divisions/:id/'], (req, res) => {
+    const list = loadJsonMaster(divisionsFilePath, defaultDivisions);
+    const id = req.params.id;
+    const item = req.body || {};
+    const newItem = { ...item, id };
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(divisionsFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.delete(['/api/masters/divisions/:id', '/api/masters/divisions/:id/', '/api/divisions/:id', '/api/divisions/:id/'], (req, res) => {
+    let list = loadJsonMaster(divisionsFilePath, defaultDivisions);
+    const id = req.params.id;
+    list = list.filter((i: any) => i.id !== id);
+    saveJsonMaster(divisionsFilePath, list);
+    res.json({ success: true, id });
+  });
+
+  // 役職マスター (Positions)
+  app.get(['/api/masters/positions', '/api/masters/positions/', '/api/positions', '/api/positions/'], (req, res) => {
+    res.json(loadJsonMaster(positionsFilePath, defaultPositions));
+  });
+
+  app.post(['/api/masters/positions', '/api/masters/positions/', '/api/positions', '/api/positions/'], (req, res) => {
+    const list = loadJsonMaster(positionsFilePath, defaultPositions);
+    const item = req.body || {};
+    const id = item.id || `pos-${Date.now()}`;
+    const newItem = { ...item, id };
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(positionsFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.put(['/api/masters/positions/:id', '/api/masters/positions/:id/', '/api/positions/:id', '/api/positions/:id/'], (req, res) => {
+    const list = loadJsonMaster(positionsFilePath, defaultPositions);
+    const id = req.params.id;
+    const item = req.body || {};
+    const newItem = { ...item, id };
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(positionsFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.delete(['/api/masters/positions/:id', '/api/masters/positions/:id/', '/api/positions/:id', '/api/positions/:id/'], (req, res) => {
+    let list = loadJsonMaster(positionsFilePath, defaultPositions);
+    const id = req.params.id;
+    list = list.filter((i: any) => i.id !== id);
+    saveJsonMaster(positionsFilePath, list);
+    res.json({ success: true, id });
+  });
+
+  // 品目マスター (ItemMasters)
+  app.get(['/api/masters/item-masters', '/api/masters/item-masters/', '/api/item-masters', '/api/item-masters/'], (req, res) => {
+    let list = loadJsonMaster(itemMastersFilePath, defaultItemMasters);
+    // If list is empty or using defaults, check if data/masters_custom.json has itemMasters
+    const customPath = path.join(dataDir, 'masters_custom.json');
+    if ((!list || list.length === 0 || JSON.stringify(list) === JSON.stringify(defaultItemMasters)) && fs.existsSync(customPath)) {
+      try {
+        const custom = JSON.parse(fs.readFileSync(customPath, 'utf8'));
+        if (Array.isArray(custom.itemMasters) && custom.itemMasters.length > 0) {
+          list = custom.itemMasters;
+          saveJsonMaster(itemMastersFilePath, list);
+        }
+      } catch (_) {}
+    }
+    const normalized = (list || []).map((item: any) => {
+      const price = Number(item.defaultUnitPrice ?? item.unitPrice ?? item.price ?? 0);
+      return {
+        ...item,
+        defaultUnitPrice: price,
+        unitPrice: price,
+      };
+    });
+    res.json(normalized);
+  });
+
+  app.post(['/api/masters/item-masters', '/api/masters/item-masters/', '/api/item-masters', '/api/item-masters/'], (req, res) => {
+    const list = loadJsonMaster(itemMastersFilePath, defaultItemMasters);
+    const item = req.body || {};
+    const id = item.id || `itm-${Date.now()}`;
+    const price = Number(item.defaultUnitPrice ?? item.unitPrice ?? item.price ?? 0);
+    const newItem = {
+      ...item,
+      id,
+      defaultUnitPrice: price,
+      unitPrice: price,
+    };
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(itemMastersFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.put(['/api/masters/item-masters/:id', '/api/masters/item-masters/:id/', '/api/item-masters/:id', '/api/item-masters/:id/'], (req, res) => {
+    const list = loadJsonMaster(itemMastersFilePath, defaultItemMasters);
+    const id = req.params.id;
+    const item = req.body || {};
+    const price = Number(item.defaultUnitPrice ?? item.unitPrice ?? item.price ?? 0);
+    const newItem = {
+      ...item,
+      id,
+      defaultUnitPrice: price,
+      unitPrice: price,
+    };
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(itemMastersFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.delete(['/api/masters/item-masters/:id', '/api/masters/item-masters/:id/', '/api/item-masters/:id', '/api/item-masters/:id/'], (req, res) => {
+    let list = loadJsonMaster(itemMastersFilePath, defaultItemMasters);
+    const id = req.params.id;
+    list = list.filter((i: any) => i.id !== id);
+    saveJsonMaster(itemMastersFilePath, list);
+    res.json({ success: true, id });
+  });
+
+  // 承認フロー設定 (ApprovalFlows)
+  const normalizeApprovalFlow = (item: any) => ({
+    ...item,
+    targetOfficeIds: Array.isArray(item?.targetOfficeIds) ? item.targetOfficeIds.filter(Boolean).map(String) : [],
+    priority: Number.isFinite(Number(item?.priority)) ? Number(item.priority) : 0,
+    steps: Array.isArray(item?.steps) ? item.steps : [],
+  });
+
+  app.get(['/api/masters/approval-flows', '/api/masters/approval-flows/', '/api/approval-flows', '/api/approval-flows/'], (req, res) => {
+    const list = loadJsonMaster(approvalFlowsFilePath, defaultApprovalFlows);
+    res.json(Array.isArray(list) ? list.map(normalizeApprovalFlow) : []);
+  });
+
+  app.post(['/api/masters/approval-flows', '/api/masters/approval-flows/', '/api/approval-flows', '/api/approval-flows/'], (req, res) => {
+    const list = loadJsonMaster(approvalFlowsFilePath, defaultApprovalFlows);
+    const item = req.body || {};
+    const id = item.id || `flow-${Date.now()}`;
+    const newItem = normalizeApprovalFlow({ ...item, id });
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(approvalFlowsFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.put(['/api/masters/approval-flows/:id', '/api/masters/approval-flows/:id/', '/api/approval-flows/:id', '/api/approval-flows/:id/'], (req, res) => {
+    const list = loadJsonMaster(approvalFlowsFilePath, defaultApprovalFlows);
+    const id = req.params.id;
+    const item = req.body || {};
+    const newItem = normalizeApprovalFlow({ ...item, id });
+    const idx = list.findIndex((i: any) => i.id === id);
+    if (idx >= 0) list[idx] = newItem; else list.push(newItem);
+    saveJsonMaster(approvalFlowsFilePath, list);
+    res.json({ success: true, ...newItem });
+  });
+
+  app.delete(['/api/masters/approval-flows/:id', '/api/masters/approval-flows/:id/', '/api/approval-flows/:id', '/api/approval-flows/:id/'], (req, res) => {
+    let list = loadJsonMaster(approvalFlowsFilePath, defaultApprovalFlows);
+    const id = req.params.id;
+    list = list.filter((i: any) => i.id !== id);
+    saveJsonMaster(approvalFlowsFilePath, list);
+    res.json({ success: true, id });
+  });
+
+  // ワークフロー一覧取得 API
+  app.get(['/api/workflows', '/api/workflows/', '/workflows', '/workflows/'], (req, res) => {
+    try {
+      const list = loadWorkflows();
+      const users = loadUsers();
+      const enriched = list.map(item => {
+        const u = users.find(usr => usr.id === item.applicantId);
+        return {
+          ...item,
+          applicant: {
+            id: item.applicantId,
+            name: u?.name || '不明',
+            department: u?.department || u?.division || '',
+            avatarUrl: u?.avatarUrl || ''
+          },
+          attachments: typeof item.attachments === 'string' ? JSON.parse(item.attachments || '[]') : (item.attachments || [])
+        };
+      });
+      res.json(enriched);
+    } catch (err: any) {
+      console.error('Get workflows error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ワークフロー新規作成 API
+  app.post(['/api/workflows', '/api/workflows/', '/workflows', '/workflows/'], (req, res) => {
+    try {
+      const data = req.body || {};
+      const list = loadWorkflows();
+      const nowIso = new Date().toISOString();
+
+      const newId = data.id || `wf-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+      const applicantId = String(data.applicantId || (data.applicant && data.applicant.id) || 'u1');
+      const approverId = data.approverId || (data.approver && data.approver.id) || undefined;
+      const status = data.status || 'pending';
+      const category = data.category || data.type || 'other';
+
+      let detailsStr = '';
+      if (typeof data.details === 'string') {
+        detailsStr = data.details;
+      } else if (typeof data.details === 'object' && data.details !== null) {
+        detailsStr = JSON.stringify(data.details);
+      } else {
+        const { id, title, applicantId: _a, approverId: _ap, status: _s, category: _c, type: _t, ...rest } = data;
+        detailsStr = JSON.stringify(rest);
+      }
+
+      const newWorkflow: StoredWorkflow = {
+        id: newId,
+        title: data.title || '無題の申請',
+        applicantId,
+        approverId,
+        status,
+        category,
+        type: category,
+        purchaseOrderNumber: data.purchaseOrderNumber || null,
+        constructionDate: data.constructionDate || null,
+        linkedInventoryIssueId: data.linkedInventoryIssueId || null,
+        details: detailsStr,
+        createdAt: data.createdAt || nowIso,
+        updatedAt: nowIso
+      };
+
+      const existingIdx = list.findIndex(w => w.id === newId);
+      if (existingIdx >= 0) {
+        list[existingIdx] = newWorkflow;
+      } else {
+        list.unshift(newWorkflow);
+      }
+
+      saveWorkflows(list);
+      res.status(201).json(newWorkflow);
+    } catch (err: any) {
+      console.error('Create workflow error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ワークフロー更新 API (承認 / 却下 / 変更)
+  app.put(['/api/workflows/:id', '/workflows/:id'], (req, res) => {
+    try {
+      const { id } = req.params;
+      const data = req.body || {};
+      const list = loadWorkflows();
+      const idx = list.findIndex(w => w.id === id);
+
+      const nowIso = new Date().toISOString();
+
+      let detailsStr = '';
+      if (typeof data.details === 'string') {
+        detailsStr = data.details;
+      } else if (typeof data.details === 'object' && data.details !== null) {
+        detailsStr = JSON.stringify(data.details);
+      }
+
+      if (idx === -1) {
+        const newWorkflow: StoredWorkflow = {
+          id,
+          title: data.title || '無題の申請',
+          applicantId: String(data.applicantId || 'u1'),
+          approverId: data.approverId || undefined,
+          status: data.status || 'pending',
+          category: data.category || data.type || 'other',
+          type: data.category || data.type || 'other',
+          purchaseOrderNumber: data.purchaseOrderNumber || null,
+          constructionDate: data.constructionDate || null,
+          linkedInventoryIssueId: data.linkedInventoryIssueId || null,
+          details: detailsStr || JSON.stringify(data),
+          createdAt: data.createdAt || nowIso,
+          updatedAt: nowIso
+        };
+        list.unshift(newWorkflow);
+        saveWorkflows(list);
+        return res.json(newWorkflow);
+      }
+
+      const existing = list[idx];
+
+      // details 内の status 等も更新されて送られてくるため、detailsObj があればパースして同期
+      let mergedDetailsStr = detailsStr || existing.details;
+      if (detailsStr) {
+        try {
+          const parsedDetails = JSON.parse(detailsStr);
+          parsedDetails.status = data.status || existing.status;
+          mergedDetailsStr = JSON.stringify(parsedDetails);
+        } catch (e) {}
+      }
+
+      const updatedWorkflow: StoredWorkflow = {
+        ...existing,
+        title: data.title !== undefined ? data.title : existing.title,
+        applicantId: data.applicantId ? String(data.applicantId) : existing.applicantId,
+        approverId: data.approverId !== undefined ? data.approverId : existing.approverId,
+        status: data.status !== undefined ? data.status : existing.status,
+        category: data.category || data.type || existing.category,
+        type: data.category || data.type || existing.type,
+        purchaseOrderNumber: data.purchaseOrderNumber !== undefined ? data.purchaseOrderNumber : existing.purchaseOrderNumber,
+        constructionDate: data.constructionDate !== undefined ? data.constructionDate : existing.constructionDate,
+        linkedInventoryIssueId: data.linkedInventoryIssueId !== undefined ? data.linkedInventoryIssueId : existing.linkedInventoryIssueId,
+        details: mergedDetailsStr,
+        updatedAt: nowIso
+      };
+
+      list[idx] = updatedWorkflow;
+      saveWorkflows(list);
+
+      res.json(updatedWorkflow);
+    } catch (err: any) {
+      console.error('Update workflow error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ワークフロー削除 API
+  app.delete(['/api/workflows/:id', '/workflows/:id'], (req, res) => {
+    try {
+      const { id } = req.params;
+      let list = loadWorkflows();
+      const initialCount = list.length;
+      list = list.filter(w => w.id !== id);
+      saveWorkflows(list);
+      res.json({ success: true, deleted: initialCount - list.length });
+    } catch (err: any) {
+      console.error('Delete workflow error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post(['/api/workflows/:id/delete', '/workflows/:id/delete'], (req, res) => {
+    try {
+      const { id } = req.params;
+      let list = loadWorkflows();
+      const initialCount = list.length;
+      list = list.filter(w => w.id !== id);
+      saveWorkflows(list);
+      res.json({ success: true, deleted: initialCount - list.length });
+    } catch (err: any) {
+      console.error('Delete workflow error:', err);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // Helper functions for iCal timezone & dates
+  function getJstDateString(dateInput: Date | string | undefined): string {
+    if (!dateInput) return '';
+    const d = new Date(dateInput);
+    if (isNaN(d.getTime())) return '';
+    // JST offset (+9 hours)
+    const jstDate = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+    const yyyy = jstDate.getUTCFullYear();
+    const mm = String(jstDate.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(jstDate.getUTCDate()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  function addDaysJstFormatted(dateStr: string, days: number): string {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    const date = new Date(Date.UTC(y, m - 1, d + days, 12, 0, 0));
+    const year = date.getUTCFullYear();
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    return `${year}${month}${day}`;
+  }
+
+  function formatToUtc(dateInput: Date | string | undefined): string {
+    if (!dateInput) return '';
+    const d = new Date(dateInput);
+    if (isNaN(d.getTime())) return '';
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const yyyy = d.getUTCFullYear();
+    const mm = pad(d.getUTCMonth() + 1);
+    const dd = pad(d.getUTCDate());
+    const hh = pad(d.getUTCHours());
+    const min = pad(d.getUTCMinutes());
+    const ss = pad(d.getUTCSeconds());
+    return `${yyyy}${mm}${dd}T${hh}${min}${ss}Z`;
+  }
+
+  // iCal RRULE 生成ヘルパー (RFC 5545 準拠)
+  function buildIcsRRule(recurrenceInput: any, startIso: string, isAllDay: boolean): string {
+    let rule: any = recurrenceInput;
+    if (!rule) return '';
+    if (typeof rule === 'string') {
+      try { rule = JSON.parse(rule); } catch (_) {}
+    }
+    if (!rule || typeof rule !== 'object' || !rule.frequency || rule.frequency === 'none') {
+      return '';
+    }
+
+    const freq = String(rule.frequency).toUpperCase();
+    if (!['DAILY', 'WEEKLY', 'MONTHLY', 'YEARLY'].includes(freq)) {
+      return '';
+    }
+
+    const parts: string[] = [`FREQ=${freq}`];
+
+    if (rule.interval && Number(rule.interval) > 1) {
+      parts.push(`INTERVAL=${rule.interval}`);
+    }
+
+    const dayMap = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+    if (freq === 'WEEKLY') {
+      if (Array.isArray(rule.daysOfWeek) && rule.daysOfWeek.length > 0) {
+        const days = rule.daysOfWeek.map((d: number) => dayMap[d]).filter(Boolean).join(',');
+        if (days) parts.push(`BYDAY=${days}`);
+      } else {
+        const d = new Date(startIso);
+        const dayIdx = !isNaN(d.getTime()) ? new Date(d.getTime() + 9 * 3600 * 1000).getUTCDay() : 0;
+        parts.push(`BYDAY=${dayMap[dayIdx]}`);
+      }
+    }
+
+    if (freq === 'MONTHLY') {
+      if (rule.monthlyType === 'day_of_week' && rule.weekOfMonth && rule.dayOfWeek !== undefined) {
+        const byDayCode = `${rule.weekOfMonth}${dayMap[rule.dayOfWeek]}`;
+        parts.push(`BYDAY=${byDayCode}`);
+      } else if (rule.monthDay) {
+        parts.push(`BYMONTHDAY=${rule.monthDay}`);
+      } else {
+        const d = new Date(startIso);
+        const day = !isNaN(d.getTime()) ? new Date(d.getTime() + 9 * 3600 * 1000).getUTCDate() : 1;
+        parts.push(`BYMONTHDAY=${day}`);
+      }
+    }
+
+    if (rule.endType === 'until_date' && rule.endDate) {
+      const endClean = String(rule.endDate).replace(/-/g, '');
+      if (isAllDay) {
+        parts.push(`UNTIL=${endClean}`);
+      } else {
+        const [y, m, d] = String(rule.endDate).split('-').map(Number);
+        // 日本時間の23:59:59 -> UTC 14:59:59
+        const utcUntil = new Date(Date.UTC(y, m - 1, d, 14, 59, 59));
+        parts.push(`UNTIL=${formatToUtc(utcUntil)}`);
+      }
+    } else if (rule.endType === 'count' && rule.count && Number(rule.count) > 0) {
+      parts.push(`COUNT=${rule.count}`);
+    }
+
+    return `RRULE:${parts.join(';')}`;
+  }
+
+  // ==========================================
+  // iCal (ICS) カレンダー外部連携 API
+  // ==========================================
+  app.get(['/api/ical', '/api/ical/'], (req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(`
+      <div style="font-family: sans-serif; padding: 24px; max-width: 600px; margin: auto; line-height: 1.6;">
+        <h2 style="color: #4f46e5; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px;">iCalカレンダー同期機能</h2>
+        <p>このエンドポイントは、各ユーザー専用のiCal形式カレンダーを提供します。</p>
+        <div style="background-color: #f3f4f6; padding: 16px; border-radius: 8px; font-family: monospace; font-size: 14px; margin: 16px 0;">
+          <strong>URLフォーマット:</strong><br>
+          /api/ical/user_【ユーザーID】_calendar.ics
+        </div>
+        <p><strong>例 (u1の場合):</strong><br>
+          <a href="/api/ical/user_u1_calendar.ics" style="color: #2563eb; text-decoration: underline;">/api/ical/user_u1_calendar.ics</a>
+        </p>
+        <p style="color: #6b7280; font-size: 13px; margin-top: 24px; border-top: 1px solid #e5e7eb; padding-top: 16px;">
+          ※GoogleカレンダーやOutlook、Mac標準カレンダーなどの「URLで追加」機能に上記URLを設定することで同期が可能です。
+        </p>
+      </div>
+    `);
+  });
+
+  app.get(['/api/ical/user_:userId_calendar.ics', '/ical/user_:userId_calendar.ics'], (req, res) => {
+    try {
+      let rawUserId = (req.params as any).userId || (req.params as any).userId_calendar || '';
+      if (rawUserId.endsWith('_calendar')) {
+        rawUserId = rawUserId.substring(0, rawUserId.length - '_calendar'.length);
+      }
+      const userId = rawUserId;
+
+      const allRawEvents = loadEvents();
+
+      // Normalization
+      const normalizedEvents = allRawEvents.map((e: any) => {
+        let detailsObj: any = {};
+        if (e.description && typeof e.description === 'string' && e.description.startsWith('{')) {
+          try { detailsObj = JSON.parse(e.description); } catch (_) {}
+        }
+
+        let recurrenceObj = e.recurrence || detailsObj.recurrence;
+        if (typeof recurrenceObj === 'string') {
+          try { recurrenceObj = JSON.parse(recurrenceObj); } catch (_) {}
+        }
+
+        let exceptionsArr = e.recurrenceExceptions || detailsObj.recurrenceExceptions || [];
+        if (typeof exceptionsArr === 'string') {
+          try { exceptionsArr = JSON.parse(exceptionsArr); } catch (_) {}
+        }
+        if (!Array.isArray(exceptionsArr)) {
+          exceptionsArr = [];
+        }
+
+        return {
+          id: String(e.id),
+          title: e.title || '予定',
+          start: e.startAt || e.start || new Date().toISOString(),
+          end: e.endAt || e.end || e.startAt || e.start || new Date().toISOString(),
+          isAllDay: e.isAllDay === true || e.isAllDay === 1 || e.isAllDay === 'true' || e.isAllDay === '1',
+          type: e.category || e.type || 'personal',
+          office: e.office || '全社',
+          division: e.division || '全部署',
+          location: e.location || detailsObj.location || '',
+          memo: e.memo || detailsObj.memo || (typeof e.description === 'string' && !e.description.startsWith('{') ? e.description : ''),
+          attendees: e.attendees || detailsObj.attendees || [],
+          createdBy: e.createdBy || detailsObj.createdBy,
+          createdById: e.createdById || e.userId || detailsObj.createdById || detailsObj.userId,
+          recurrence: recurrenceObj,
+          recurrenceParentId: e.recurrenceParentId || detailsObj.recurrenceParentId,
+          recurrenceOriginalDate: e.recurrenceOriginalDate || detailsObj.recurrenceOriginalDate || e.instanceDate || detailsObj.instanceDate,
+          recurrenceExceptions: exceptionsArr,
+        };
+      });
+
+      // ユーザー情報を取得
+      const allUsers = loadUsers();
+      const targetUser = allUsers.find((u: any) => String(u.id) === String(userId) || u.loginId === userId || u.email === userId);
+      const userName = targetUser?.name;
+      const userEmail = targetUser?.email;
+      const userMobileEmail = targetUser?.mobileEmail;
+
+      // 参加者チェックヘルパー
+      const isUserAttendee = (e: any): boolean => {
+        let attendeesList: any[] = [];
+        if (Array.isArray(e.attendees)) {
+          attendeesList = e.attendees;
+        } else if (typeof e.attendees === 'string') {
+          try {
+            const p = JSON.parse(e.attendees);
+            if (Array.isArray(p)) attendeesList = p;
+          } catch (_) {}
+        }
+
+        if (!attendeesList || attendeesList.length === 0) {
+          // 作成者本人であれば参加とみなす
+          if (String(e.createdById) === String(userId) || (userName && e.createdBy?.name === userName)) {
+            return true;
+          }
+          return false;
+        }
+
+        return attendeesList.some((att: any) => {
+          if (!att) return false;
+          if (typeof att === 'object') {
+            const attId = String(att.id || '');
+            const attName = String(att.name || '');
+            const attEmail = String(att.email || '');
+            return attId === String(userId) ||
+                   (userName && attName === userName) ||
+                   (userEmail && attEmail === userEmail) ||
+                   (userMobileEmail && attEmail === userMobileEmail);
+          }
+          const attStr = String(att);
+          return attStr === String(userId) || (userName && attStr === userName);
+        });
+      };
+
+      // ユーザーが関係する予定を抽出
+      const userEvents = normalizedEvents.filter(e => {
+        if (isUserAttendee(e)) return true;
+        // 子イベントの場合、親が参加対象なら子も対象
+        if (e.recurrenceParentId) {
+          const parent = normalizedEvents.find(p => p.id === e.recurrenceParentId);
+          if (parent && isUserAttendee(parent)) return true;
+        }
+        return false;
+      });
+
+      // イベントの種別分類 (RFC 5545 準拠)
+      // 1. 繰り返し親イベント (Master)
+      // 2. 「この予定のみ変更」されたオーバーライドイベント (Exceptions)
+      // 3. 通常の単発イベント (Single)
+      const recurringMasters = userEvents.filter(e =>
+        !e.recurrenceParentId &&
+        e.recurrence &&
+        e.recurrence.frequency &&
+        e.recurrence.frequency !== 'none'
+      );
+
+      const recurringOverrides = userEvents.filter(e =>
+        !!e.recurrenceParentId &&
+        (e.recurrenceOriginalDate || (e.id && e.id.startsWith('e-ovr-')))
+      );
+
+      const singleEvents = userEvents.filter(e =>
+        !e.recurrenceParentId &&
+        (!e.recurrence || !e.recurrence.frequency || e.recurrence.frequency === 'none')
+      );
+
+      const nowStr = formatToUtc(new Date());
+      let icsContent = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Company SNS Calendar//JA\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\nX-WR-CALNAME:社内カレンダー同期\r\nX-WR-TIMEZONE:Asia/Tokyo\r\n";
+
+      // A. 単発イベントの出力
+      for (const evt of singleEvents) {
+        const isAllDay = evt.isAllDay === true;
+        let dtStartLine = '';
+        let dtEndLine = '';
+
+        if (isAllDay) {
+          const startJst = getJstDateString(evt.start);
+          const endJst = evt.end ? getJstDateString(evt.end) : startJst;
+          if (startJst) {
+            const startClean = startJst.replace(/-/g, '');
+            dtStartLine = `DTSTART;VALUE=DATE:${startClean}\r\n`;
+            const endCleanNext = addDaysJstFormatted(endJst || startJst, 1);
+            dtEndLine = `DTEND;VALUE=DATE:${endCleanNext}\r\n`;
+          }
+        } else {
+          const startD = evt.start ? new Date(evt.start) : null;
+          const endD = evt.end ? new Date(evt.end) : startD;
+          if (startD && endD) {
+            dtStartLine = `DTSTART:${formatToUtc(startD)}\r\n`;
+            dtEndLine = `DTEND:${formatToUtc(endD)}\r\n`;
+          }
+        }
+
+        const summaryEscaped = (evt.title || '').replace(/\r\n|\r|\n/g, ' ').replace(/[,;]/g, '\\$&');
+        const descEscaped = String(evt.memo || '').replace(/\r\n|\r|\n/g, '\\n').replace(/[,;]/g, '\\$&');
+        const locEscaped = (evt.location || '').replace(/\r\n|\r|\n/g, ' ').replace(/[,;]/g, '\\$&');
+
+        icsContent += "BEGIN:VEVENT\r\n";
+        icsContent += `UID:evt-${evt.id}@company-sns\r\n`;
+        icsContent += `DTSTAMP:${nowStr}\r\n`;
+        icsContent += `SUMMARY:${summaryEscaped}\r\n`;
+        if (evt.memo) icsContent += `DESCRIPTION:${descEscaped}\r\n`;
+        if (evt.location) icsContent += `LOCATION:${locEscaped}\r\n`;
+        if (dtStartLine) icsContent += dtStartLine;
+        if (dtEndLine) icsContent += dtEndLine;
+        icsContent += "END:VEVENT\r\n";
+      }
+
+      // B. 繰り返し親イベントの出力 (RRULE & EXDATE)
+      for (const master of recurringMasters) {
+        const isAllDay = master.isAllDay === true;
+        let dtStartLine = '';
+        let dtEndLine = '';
+
+        if (isAllDay) {
+          const startJst = getJstDateString(master.start);
+          const endJst = master.end ? getJstDateString(master.end) : startJst;
+          if (startJst) {
+            const startClean = startJst.replace(/-/g, '');
+            dtStartLine = `DTSTART;VALUE=DATE:${startClean}\r\n`;
+            const endCleanNext = addDaysJstFormatted(endJst || startJst, 1);
+            dtEndLine = `DTEND;VALUE=DATE:${endCleanNext}\r\n`;
+          }
+        } else {
+          const startD = master.start ? new Date(master.start) : null;
+          const endD = master.end ? new Date(master.end) : startD;
+          if (startD && endD) {
+            dtStartLine = `DTSTART:${formatToUtc(startD)}\r\n`;
+            dtEndLine = `DTEND:${formatToUtc(endD)}\r\n`;
+          }
+        }
+
+        const rrule = buildIcsRRule(master.recurrence, master.start, isAllDay);
+        if (!rrule) continue;
+
+        // この親に紐づくオーバーライド（この予定のみ変更）を検索
+        const relatedOverrides = recurringOverrides.filter(o => o.recurrenceParentId === master.id);
+        const overrideOrigDates = new Set(
+          relatedOverrides
+            .map(o => o.recurrenceOriginalDate || (o.id && o.id.startsWith('e-ovr-') ? o.id.split('-').pop() : ''))
+            .filter(Boolean)
+        );
+
+        // 純粋な削除日 (オーバーライドが存在しない exceptions) を EXDATE として抽出
+        const rawExceptions: string[] = Array.isArray(master.recurrenceExceptions) ? master.recurrenceExceptions : [];
+        const pureDeletedDates = rawExceptions.filter(exDate => !overrideOrigDates.has(exDate));
+
+        let exdateLines = '';
+        if (pureDeletedDates.length > 0) {
+          if (isAllDay) {
+            const datesFormatted = pureDeletedDates.map(d => d.replace(/-/g, '')).join(',');
+            exdateLines = `EXDATE;VALUE=DATE:${datesFormatted}\r\n`;
+          } else {
+            // 親の開始時刻 (UTC) の時分秒を取得し、除外日に適用
+            const masterD = new Date(master.start);
+            const mHours = masterD.getUTCHours();
+            const mMinutes = masterD.getUTCMinutes();
+            const mSeconds = masterD.getUTCSeconds();
+
+            const datesFormatted = pureDeletedDates.map(dStr => {
+              const [y, m, d] = dStr.split('-').map(Number);
+              const exUtc = new Date(Date.UTC(y, m - 1, d, mHours, mMinutes, mSeconds));
+              return formatToUtc(exUtc);
+            }).join(',');
+            exdateLines = `EXDATE:${datesFormatted}\r\n`;
+          }
+        }
+
+        const summaryEscaped = (master.title || '').replace(/\r\n|\r|\n/g, ' ').replace(/[,;]/g, '\\$&');
+        const descEscaped = String(master.memo || '').replace(/\r\n|\r|\n/g, '\\n').replace(/[,;]/g, '\\$&');
+        const locEscaped = (master.location || '').replace(/\r\n|\r|\n/g, ' ').replace(/[,;]/g, '\\$&');
+
+        icsContent += "BEGIN:VEVENT\r\n";
+        icsContent += `UID:evt-${master.id}@company-sns\r\n`;
+        icsContent += `DTSTAMP:${nowStr}\r\n`;
+        icsContent += `SUMMARY:${summaryEscaped}\r\n`;
+        if (master.memo) icsContent += `DESCRIPTION:${descEscaped}\r\n`;
+        if (master.location) icsContent += `LOCATION:${locEscaped}\r\n`;
+        if (dtStartLine) icsContent += dtStartLine;
+        if (dtEndLine) icsContent += dtEndLine;
+        icsContent += `${rrule}\r\n`;
+        if (exdateLines) icsContent += exdateLines;
+        icsContent += "END:VEVENT\r\n";
+      }
+
+      // C. 「この予定のみ変更」されたオーバーライド例外の出力 (RECURRENCE-ID)
+      for (const ovr of recurringOverrides) {
+        const parent = normalizedEvents.find(p => p.id === ovr.recurrenceParentId);
+        if (!parent) continue;
+
+        const isAllDay = ovr.isAllDay === true;
+        let dtStartLine = '';
+        let dtEndLine = '';
+
+        if (isAllDay) {
+          const startJst = getJstDateString(ovr.start);
+          const endJst = ovr.end ? getJstDateString(ovr.end) : startJst;
+          if (startJst) {
+            const startClean = startJst.replace(/-/g, '');
+            dtStartLine = `DTSTART;VALUE=DATE:${startClean}\r\n`;
+            const endCleanNext = addDaysJstFormatted(endJst || startJst, 1);
+            dtEndLine = `DTEND;VALUE=DATE:${endCleanNext}\r\n`;
+          }
+        } else {
+          const startD = ovr.start ? new Date(ovr.start) : null;
+          const endD = ovr.end ? new Date(ovr.end) : startD;
+          if (startD && endD) {
+            dtStartLine = `DTSTART:${formatToUtc(startD)}\r\n`;
+            dtEndLine = `DTEND:${formatToUtc(endD)}\r\n`;
+          }
+        }
+
+        // RECURRENCE-ID (親の元の予定日時) の算出
+        let recurrenceIdLine = '';
+        const origDateStr = ovr.recurrenceOriginalDate || (ovr.id.startsWith('e-ovr-') ? ovr.id.split('-').slice(2).join('-') : getJstDateString(ovr.start));
+
+        if (origDateStr && origDateStr.includes('-')) {
+          if (parent.isAllDay) {
+            recurrenceIdLine = `RECURRENCE-ID;VALUE=DATE:${origDateStr.replace(/-/g, '')}\r\n`;
+          } else {
+            const parentD = new Date(parent.start);
+            const pHours = parentD.getUTCHours();
+            const pMinutes = parentD.getUTCMinutes();
+            const pSeconds = parentD.getUTCSeconds();
+            const [y, m, d] = origDateStr.split('-').map(Number);
+            const origUtc = new Date(Date.UTC(y, m - 1, d, pHours, pMinutes, pSeconds));
+            recurrenceIdLine = `RECURRENCE-ID:${formatToUtc(origUtc)}\r\n`;
+          }
+        }
+
+        const summaryEscaped = (ovr.title || '').replace(/\r\n|\r|\n/g, ' ').replace(/[,;]/g, '\\$&');
+        const descEscaped = String(ovr.memo || '').replace(/\r\n|\r|\n/g, '\\n').replace(/[,;]/g, '\\$&');
+        const locEscaped = (ovr.location || '').replace(/\r\n|\r|\n/g, ' ').replace(/[,;]/g, '\\$&');
+
+        icsContent += "BEGIN:VEVENT\r\n";
+        // 親と同じ UID を持つことで、クライアントに「親の該当インスタンスの置換」と認識させる
+        icsContent += `UID:evt-${parent.id}@company-sns\r\n`;
+        icsContent += `DTSTAMP:${nowStr}\r\n`;
+        if (recurrenceIdLine) icsContent += recurrenceIdLine;
+        icsContent += `SUMMARY:${summaryEscaped}\r\n`;
+        if (ovr.memo) icsContent += `DESCRIPTION:${descEscaped}\r\n`;
+        if (ovr.location) icsContent += `LOCATION:${locEscaped}\r\n`;
+        if (dtStartLine) icsContent += dtStartLine;
+        if (dtEndLine) icsContent += dtEndLine;
+        icsContent += "END:VEVENT\r\n";
+      }
+
+      icsContent += "END:VCALENDAR\r\n";
+
+      // Folding 75 octets (RFC 5545 standard)
+      const lines = icsContent.split("\r\n");
+      const foldedLines = lines.map(line => {
+        if (!line) return '';
+        const buf = Buffer.from(line, 'utf-8');
+        if (buf.length <= 72) return line;
+
+        let result = '';
+        let currentBytes = 0;
+        let currentStr = '';
+
+        for (let i = 0; i < line.length; i++) {
+          const char = line[i];
+          const charBytes = Buffer.from(char, 'utf-8').length;
+
+          if (currentBytes + charBytes > 72) {
+            result += currentStr + "\r\n ";
+            currentStr = char;
+            currentBytes = charBytes;
+          } else {
+            currentStr += char;
+            currentBytes += charBytes;
+          }
+        }
+        result += currentStr;
+        return result;
+      });
+      const finalIcs = foldedLines.join("\r\n");
+
+      res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+      res.setHeader('Content-Disposition', 'inline; filename="user_' + userId + '_calendar.ics"');
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate, proxy-revalidate');
+      res.send(finalIcs);
+    } catch (err: any) {
+      console.error('[iCal Export Error]', err);
+      res.status(500).send(err.message);
+    }
+  });
+
+  // ==========================================
+  // 点検報告書 (Inspection Reports & CRM) API
+  // ==========================================
+  const inspectionReportsPath = path.join(dataDir, 'inspection_reports.json');
+  const crmInspectionsPath = path.join(dataDir, 'crm_inspections.json');
+
+  function loadJsonData(filePath: string, defaultVal: any = []) {
+    if (!fs.existsSync(filePath)) return defaultVal;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : defaultVal;
+    } catch (e) {
+      return defaultVal;
+    }
+  }
+
+  function saveJsonData(filePath: string, data: any) {
+    try {
+      fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+    } catch (e) {
+      console.error('[Inspection API] Failed to save JSON:', e);
+    }
+  }
+
+  // 点検報告書一覧取得
+  app.get(['/api/inspections/reports', '/api/inspection-reports', '/api/inspections'], (req, res) => {
+    try {
+      const { date, status, jobNo, inspectorId } = req.query;
+      let reports = loadJsonData(inspectionReportsPath, []);
+      if (date) reports = reports.filter((r: any) => r.inspectionDate === date);
+      if (status) reports = reports.filter((r: any) => r.status === status);
+      if (jobNo) reports = reports.filter((r: any) => r.jobNo === jobNo);
+      if (inspectorId) reports = reports.filter((r: any) => r.inspectorId === inspectorId);
+      res.json({ success: true, reports });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 点検報告書詳細取得
+  app.get(['/api/inspections/reports/:id', '/api/inspection-reports/:id'], (req, res) => {
+    try {
+      const { id } = req.params;
+      const reports = loadJsonData(inspectionReportsPath, []);
+      const report = reports.find((r: any) => r.id === id);
+      if (!report) return res.status(404).json({ success: false, error: 'Report not found' });
+      res.json({ success: true, report });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 点検報告書保存・更新 (電子署名含む)
+  app.post(['/api/inspections/reports', '/api/inspection-reports', '/api/inspections'], (req, res) => {
+    try {
+      const report = req.body;
+      if (!report || !report.id || !report.jobNo) {
+        return res.status(400).json({ success: false, error: 'id and jobNo are required' });
+      }
+      const now = new Date().toISOString();
+      const updatedReport = {
+        ...report,
+        updatedAt: now,
+        createdAt: report.createdAt || now
+      };
+      const reports = loadJsonData(inspectionReportsPath, []);
+      const idx = reports.findIndex((r: any) => r.id === report.id);
+      if (idx >= 0) {
+        reports[idx] = { ...reports[idx], ...updatedReport };
+      } else {
+        reports.push(updatedReport);
+      }
+      saveJsonData(inspectionReportsPath, reports);
+      res.json({ success: true, report: updatedReport });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 事務確認（検印）トグル更新
+  app.put(['/api/inspections/reports/:id/confirm', '/api/inspection-reports/:id/confirm'], (req, res) => {
+    try {
+      const { id } = req.params;
+      const { user } = req.body || {};
+      const reports = loadJsonData(inspectionReportsPath, []);
+      const target = reports.find((r: any) => r.id === id);
+      const newConfirmed = target ? !target.officeConfirmed : true;
+      const now = new Date().toISOString();
+
+      const updateData = {
+        officeConfirmed: newConfirmed,
+        officeConfirmedAt: newConfirmed ? now : null,
+        officeConfirmedById: newConfirmed && user ? user.id : null,
+        officeConfirmedByName: newConfirmed && user ? user.name : null,
+        updatedAt: now
+      };
+
+      if (target) {
+        Object.assign(target, updateData);
+        saveJsonData(inspectionReportsPath, reports);
+      }
+      res.json({ success: true, report: target ? { ...target, ...updateData } : updateData });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // 前回点検結果取得 (前回コピー用)
+  app.get(['/api/inspections/previous/:jobNo', '/api/inspection-reports/previous/:jobNo'], (req, res) => {
+    try {
+      const { jobNo } = req.params;
+      const reports = loadJsonData(inspectionReportsPath, []);
+      const matched = reports
+        .filter((r: any) => r.jobNo === jobNo && r.status === 'signed')
+        .sort((a: any, b: any) => new Date(b.inspectionDate || 0).getTime() - new Date(a.inspectionDate || 0).getTime());
+      res.json({ success: true, report: matched[0] || null });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // CRM点検データ 一括登録
+  app.post(['/api/inspections/crm-data/bulk', '/api/inspections/crm/bulk'], (req, res) => {
+    try {
+      const { items } = req.body;
+      if (!Array.isArray(items)) {
+        return res.status(400).json({ success: false, error: 'items array is required' });
+      }
+      const existingCrm = loadJsonData(crmInspectionsPath, []);
+      const crmMap = new Map(existingCrm.map((i: any) => [i.jobNo, i]));
+      for (const it of items) {
+        if (it.jobNo) crmMap.set(it.jobNo, it);
+      }
+      saveJsonData(crmInspectionsPath, Array.from(crmMap.values()));
+      res.json({ success: true, count: items.length });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // CRM点検データ 取得
+  app.get(['/api/inspections/crm-data'], (req, res) => {
+    try {
+      const { yearMonth } = req.query;
+      let items = loadJsonData(crmInspectionsPath, []);
+      if (yearMonth) items = items.filter((i: any) => i.yearMonth === yearMonth);
+      res.json({ success: true, items });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  // Vite開発用ミドルウェア または プロダクション静的ファイルサーブ
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  // 4. グローバルエラーハンドリングミドルウェア（エラー時も確実にCORSヘッダーを付与してFailed to fetchを防ぐ）
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[Unhandled API Error Guard]:', err);
+    if (!res.headersSent) {
+      const origin = req.headers.origin;
+      if (origin && isAllowedOrigin(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+      }
+      res.status(500).json({ error: 'Internal Server Error', message: err?.message || 'サーバー内部エラーが発生しました' });
+    }
+  });
+
+  const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+
+  // Synology NAS (Nginx リバースプロキシ: 通常60秒タイムアウト) との Keep-Alive 競合（Race Condition）解消
+  // Node.js のデフォルト(5秒)が Nginx より短いために発生していた突然のソケット切断・Failed to fetch を完全防止
+  server.keepAliveTimeout = 65000; // 65秒 (Nginx 60秒より長く設定)
+  server.headersTimeout = 66000;   // 66秒 (keepAliveTimeoutより長く設定)
+}
+
+startServer();
