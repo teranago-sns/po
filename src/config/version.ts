@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.19.15',
-  date: '2026-11-19',
-  releaseNumber: 15,
+  version: '2026.11.23.1',
+  date: '2026-11-23',
+  releaseNumber: 1,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.19 #15 (JST)',
-  description: '本番Organization (teranago-sns/po) 移行＆セキュリティ監査対応：SMTP/POP3直書き認証情報・APIパスワード漏洩の完全除去、厳格CORS(https://teranago-sns.github.io)＆CSP対応、招待完了時scryptハッシュ化、ビルドパス/po/化'
+  display: 'v2026.11.23 #1 (JST)',
+  description: '本番・旧環境両対応のユーザーアイコン表示修正（/api/uploads正規化・自動フォールバック・最新トークン差し替え・SWエラーキャッシュ防止）'
 } as const;
