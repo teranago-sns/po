@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.24.1',
+  version: '2026.11.24.4',
   date: '2026-11-24',
-  releaseNumber: 1,
+  releaseNumber: 4,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.24 #1 (JST)',
-  description: '写真報告書一覧の縮小サムネイル・チャット写真・カレンダー設定アイコンの認証トークン付きURL解決を統一修正'
+  display: 'v2026.11.24 #4 (JST)',
+  description: '操作マニュアルを3タブ構成（はじめに・おすすめ／逆引きレシピ／機能別リファレンス）へ全面整理し、初回おすすめ設定＆おすすめ3大機能・横断全文検索を追加'
 } as const;
