@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.25.3',
+  version: '2026.11.25.5',
   date: '2026-11-25',
-  releaseNumber: 3,
+  releaseNumber: 5,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.25 #3 (JST)',
-  description: '単発予定削除時の繰り返し予定誤判定バグ修正（編集画面の単発削除確認対応）および予定再編集時の拠点・部署all上書き不具合の修正'
+  display: 'v2026.11.25 #5 (JST)',
+  description: 'Web Push（PWAマニフェスト・SW・プレビュー）およびHTML/テキスト通知メールのブランド表記をTERAPOへ統一'
 } as const;
