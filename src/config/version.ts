@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.25.2',
+  version: '2026.11.25.3',
   date: '2026-11-25',
-  releaseNumber: 2,
+  releaseNumber: 3,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.25 #2 (JST)',
-  description: '点検予定管理へのCRM点検報告書PDFドラッグ＆ドロップ取込（作業Noゼロ埋め吸収・物件No/設置場所/型式マッピング）と点検報告書の独立3行印刷対応'
+  display: 'v2026.11.25 #3 (JST)',
+  description: '単発予定削除時の繰り返し予定誤判定バグ修正（編集画面の単発削除確認対応）および予定再編集時の拠点・部署all上書き不具合の修正'
 } as const;

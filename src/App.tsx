@@ -72,7 +72,7 @@ import { GlobalWorkflowDetailModal } from './components/GlobalWorkflowDetailModa
 import { UserDirectory } from './components/UserDirectory';
 import { UserDetailModal } from './components/UserDetailModal';
 import { filterStepsForApplicant, resolveApproverForStep, resolveApproversForStep, isUserCurrentApprover, getSupervisorAtLevel, findBestMatchingApprovalFlow } from './utils/workflowHelpers';
-import { planRecurrenceSave, planRecurrenceDelete, safeParseRecurrence, safeParseExceptions, expandRecurringEvents, isExpandedRecurrenceId, extractParentIdFromInstanceId, extractDateFromInstanceId } from './utils/recurrenceUtils';
+import { planRecurrenceSave, planRecurrenceDelete, safeParseRecurrence, safeParseExceptions, expandRecurringEvents, isExpandedRecurrenceId, extractParentIdFromInstanceId, extractDateFromInstanceId, isRecurringEvent } from './utils/recurrenceUtils';
 import { sortUsersByDivision } from './utils/userSort';
 import { getUserOfficeName, getUserDivisionName } from './utils/masterResolver';
 import { hasTopicTargetMembers, canUserViewTopic, getTopicScopeBadgeLabel } from './utils/boardHelpers';
@@ -1255,8 +1255,8 @@ export default function App() {
             isAllDay: e.isAllDay === true || e.isAllDay === 1 || e.isAllDay === 'true' || e.isAllDay === '1',
             isPrivate: Boolean(e.isPrivate === true || e.isPrivate === 1 || e.isPrivate === 'true' || e.isPrivate === '1' || detailsObj.isPrivate === true || detailsObj.isPrivate === 1 || detailsObj.isPrivate === 'true' || detailsObj.isPrivate === '1' || e.isSecret === true || e.isSecret === 1),
             type: e.category || 'personal',
-            office: e.office || '全社',
-            division: e.division || '全部署',
+            office: (!e.office || e.office === 'all') ? '全社' : e.office,
+            division: (!e.division || e.division === 'all') ? '全部署' : e.division,
             ...detailsObj,
             location: e.location || detailsObj.location || '',
             memo: e.memo || detailsObj.memo || '',
@@ -3036,8 +3036,8 @@ export default function App() {
       isAllDay: ev.isAllDay ? 1 : 0,
       isPrivate: (ev.isPrivate || (ev as any).isSecret) ? 1 : 0,
       category: ev.type,
-      office: ev.office || '全社',
-      division: ev.division || '全部署',
+      office: (!ev.office || ev.office === 'all') ? '全社' : ev.office,
+      division: (!ev.division || ev.division === 'all') ? '全部署' : ev.division,
       location: ev.location || '',
       attendees: ev.attendees || [],
       memo: ev.memo || '',
@@ -3202,9 +3202,10 @@ export default function App() {
     const parentEvent = events.find(e => e.id === parentId);
     const targetDate = instanceDate || targetEvent?.instanceDate || (isExpandedInstance ? extractDateFromInstanceId(eventId) : (targetEvent?.start ? targetEvent.start.split('T')[0] : undefined));
 
-    const hasRecurrence = isExpandedInstance ||
-      !!(targetEvent && (targetEvent.recurrence?.frequency !== 'none' || targetEvent.recurrenceParentId || targetEvent.instanceDate)) ||
-      !!(parentEvent && parentEvent.recurrence?.frequency !== 'none');
+    const hasRecurrence =
+      isExpandedInstance ||
+      isRecurringEvent(targetEvent) ||
+      isRecurringEvent(parentEvent);
 
     const performDelete = async () => {
       const originalEvents = [...events];
