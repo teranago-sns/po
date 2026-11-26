@@ -32,6 +32,11 @@ export interface EventModalProps {
   defaultInitialDate?: string; // YYYY-MM-DD or YYYY-MM-DDTHH:mm
   defaultEndDate?: string;     // YYYY-MM-DD or YYYY-MM-DDTHH:mm
   defaultIsAllDay?: boolean;
+  defaultType?: EventType;
+  defaultSite?: Site | null;
+  defaultDivisionFilter?: string;
+  defaultMemberSelectorExpanded?: boolean;
+  zIndexClass?: string;
   offices?: OfficeMaster[];
   divisions?: DivisionMaster[];
   allUsers?: User[];
@@ -154,6 +159,11 @@ export function EventModal({
   defaultInitialDate,
   defaultEndDate,
   defaultIsAllDay,
+  defaultType,
+  defaultSite,
+  defaultDivisionFilter,
+  defaultMemberSelectorExpanded = false,
+  zIndexClass = 'z-50',
   offices = [],
   divisions = [],
   allUsers = [],
@@ -190,23 +200,32 @@ export function EventModal({
   const [siteFilterStatus, setSiteFilterStatus] = useState<'not_started' | 'in_progress' | 'all' | 'other'>('not_started');
   const [siteSearchQuery, setSiteSearchQuery] = useState('');
 
-  // 現場一覧のフェッチ (sites prop が空の場合の自動補完)
+  // 現場一覧のフェッチ (sites prop が空の場合の自動補完、defaultSite があれば確実に含める)
   useEffect(() => {
+    const mergeDefaultSite = (list: Site[]) => {
+      if (!defaultSite) return list;
+      if (list.some(s => String(s.id) === String(defaultSite.id))) return list;
+      return [defaultSite, ...list];
+    };
+
     if (sites && sites.length > 0) {
-      setInternalSites(sites);
+      setInternalSites(mergeDefaultSite(sites));
     } else {
+      if (defaultSite) {
+        setInternalSites([defaultSite]);
+      }
       let isMounted = true;
       fetch(`${API_BASE_URL}/sites`)
         .then(res => res.json())
         .then(data => {
           if (isMounted && data && Array.isArray(data.sites)) {
-            setInternalSites(data.sites);
+            setInternalSites(mergeDefaultSite(data.sites));
           }
         })
         .catch(err => console.warn('[EventModal] Failed to fetch sites:', err));
       return () => { isMounted = false; };
     }
-  }, [sites]);
+  }, [sites, defaultSite]);
 
 
   // 予定の所要時間（分単位）を保持するステート（初期値60分）
@@ -384,16 +403,28 @@ export function EventModal({
           setRecurrenceCount(10);
         }
       } else {
-        setTitle('');
-        setType('personal');
+        setTitle(defaultSite ? defaultSite.siteName : '');
+        setType(defaultSite ? (defaultType || 'construction') : (defaultType || 'personal'));
         setOffice('全社');
         setDivision('全部署');
         
-        // 現場情報の初期化
-        setSelectedSiteId(null);
-        setSelectedSiteCode(null);
-        setSelectedSiteName(null);
-        setConstructionPhase('new');
+        // 現場情報の初期化（defaultSite 指定時は自動で現場連携・乗り込み区分をプリセット）
+        if (defaultSite) {
+          setSelectedSiteId(defaultSite.id);
+          setSelectedSiteCode(defaultSite.siteCode || null);
+          setSelectedSiteName(defaultSite.siteName);
+          const hasExistingSiteEvents = (allEvents || []).some(
+            ev =>
+              (ev.siteId && String(ev.siteId) === String(defaultSite.id)) ||
+              (defaultSite.siteCode && ev.siteCode && ev.siteCode.trim().toLowerCase() === defaultSite.siteCode.trim().toLowerCase())
+          );
+          setConstructionPhase(defaultSite.status === 'in_progress' || hasExistingSiteEvents ? 'remaining' : 'new');
+        } else {
+          setSelectedSiteId(null);
+          setSelectedSiteCode(null);
+          setSelectedSiteName(null);
+          setConstructionPhase('new');
+        }
         setIsSiteSelectorOpen(false);
         setSiteSearchQuery('');
 
@@ -406,7 +437,7 @@ export function EventModal({
         setIsAllDay(useAllDay);
         setIsPrivate(false);
 
-        setLocation('');
+        setLocation(defaultSite?.address || '');
         setMemo('');
         setIsGoogleSynced(false);
         setAttachments([]);
@@ -414,6 +445,26 @@ export function EventModal({
         // 参加者の初期設定
         if (defaultAttendees && defaultAttendees.length > 0) {
           setSelectedAttendees(defaultAttendees);
+        } else if (defaultSite && allUsers.length > 0) {
+          const candidateIds = new Set<string>();
+          if (defaultSite.primaryWorkerId) candidateIds.add(String(defaultSite.primaryWorkerId));
+          if (defaultSite.coWorkers) {
+            defaultSite.coWorkers.forEach(c => {
+              if (c?.id) candidateIds.add(String(c.id));
+            });
+          }
+          const matchedWorkers = allUsers.filter(
+            u =>
+              candidateIds.has(String(u.id)) ||
+              (defaultSite.primaryWorkerName && u.name === defaultSite.primaryWorkerName)
+          );
+          if (matchedWorkers.length > 0) {
+            setSelectedAttendees(matchedWorkers);
+          } else if (currentUser) {
+            setSelectedAttendees([currentUser]);
+          } else {
+            setSelectedAttendees([]);
+          }
         } else if (currentUser) {
           setSelectedAttendees([currentUser]);
         } else {
@@ -885,7 +936,7 @@ export function EventModal({
           handleModalClose();
         }
       }}
-      className="fixed inset-0 bg-slate-900/40 flex items-center justify-center z-50 p-4 backdrop-blur-sm overflow-y-auto"
+      className={`fixed inset-0 bg-slate-900/40 flex items-center justify-center ${zIndexClass} p-4 backdrop-blur-sm overflow-y-auto`}
     >
       <div
         onClick={e => e.stopPropagation()}
@@ -1568,7 +1619,8 @@ export function EventModal({
               divisions={divisions}
               disabled={isIcal || isPrivate}
               label="参加メンバー設定"
-              defaultExpanded={false}
+              defaultExpanded={defaultMemberSelectorExpanded}
+              defaultDivisionFilter={defaultDivisionFilter}
             />
           </div>
 

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { User, OfficeMaster, DivisionMaster } from '../types';
 import { 
   Users, 
@@ -37,6 +37,7 @@ export interface MemberSelectorProps {
   placeholder?: string;
   className?: string;
   defaultExpanded?: boolean;
+  defaultDivisionFilter?: string;
 }
 
 export const MemberSelector: React.FC<MemberSelectorProps> = ({
@@ -48,12 +49,14 @@ export const MemberSelector: React.FC<MemberSelectorProps> = ({
   disabled = false,
   label = 'メンバー選択',
   className = '',
-  defaultExpanded = false
+  defaultExpanded = false,
+  defaultDivisionFilter,
 }) => {
   // 絞り込みフィルター状態（マスターIDまたは未登録文字列 / 'all'）
   const [selectedOffice, setSelectedOffice] = useState<string>('all');
   const [selectedDivision, setSelectedDivision] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const hasManualDivisionChangeRef = useRef(false);
   
   // 全拠点以下のメンバー選択エリアのトグル状態
   const [isExpanded, setIsExpanded] = useState<boolean>(defaultExpanded);
@@ -98,6 +101,34 @@ export const MemberSelector: React.FC<MemberSelectorProps> = ({
     });
     return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
   }, [divisions, allUsers]);
+
+  // 初期部署フィルター指定（例: '工務'）がある場合にマスターID主軸で初期選択を自動適用
+  useEffect(() => {
+    if (!defaultDivisionFilter || hasManualDivisionChangeRef.current) return;
+    const target = defaultDivisionFilter.trim();
+    if (!target) return;
+
+    const resolved = resolveDivision(target, divisions);
+    if (resolved && divisionOptions.some(opt => opt.id === String(resolved.id))) {
+      setSelectedDivision(String(resolved.id));
+      return;
+    }
+
+    const byMasterMatch = divisions.find(d => {
+      const codeUpper = (d.code || '').toUpperCase();
+      if (target === '工務' && (codeUpper === 'KOMU' || codeUpper === 'CON')) return true;
+      return d.name?.includes(target) || String(d.id) === target;
+    });
+    if (byMasterMatch && divisionOptions.some(opt => opt.id === String(byMasterMatch.id))) {
+      setSelectedDivision(String(byMasterMatch.id));
+      return;
+    }
+
+    const byOption = divisionOptions.find(opt => opt.id === target || opt.label.includes(target));
+    if (byOption) {
+      setSelectedDivision(byOption.id);
+    }
+  }, [defaultDivisionFilter, divisions, divisionOptions]);
 
   // 条件によるユーザーの絞り込み（マスターID照合＋後方互換）
   const filteredUsers = useMemo(() => {
@@ -303,7 +334,10 @@ export const MemberSelector: React.FC<MemberSelectorProps> = ({
               <Briefcase className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               <select
                 value={selectedDivision}
-                onChange={e => setSelectedDivision(e.target.value)}
+                onChange={e => {
+                  hasManualDivisionChangeRef.current = true;
+                  setSelectedDivision(e.target.value);
+                }}
                 disabled={disabled}
                 className="w-full text-xs pl-8 pr-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500 font-medium text-slate-700"
               >

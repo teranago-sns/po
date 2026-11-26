@@ -1,7 +1,7 @@
 /**
  * routes/sites.js
- * 寺岡オートドアSNS 現場管理・施工スケジュール・在庫DB部品連携 APIモジュール
- * 最終更新: 2026年11月19日 (現場検索時のEG台数フォールバック1台誤表示の解消、現場名・図面番号での先行登録対応)
+ * 寺岡オートドアSNS 現場管理・施工スケジュール・在庫DB部品連携・自動ドア自主検査書 APIモジュール
+ * 最終更新: 2026年11月26日 (自動ドア自主検査書・拠点別様式＆在庫自動適合ルール永続化API追加、外部在庫DBセンサー/明細拡張フィールド透過対応)
  */
 import { Router } from 'express';
 import sql from 'mssql';
@@ -12,6 +12,8 @@ import { dataDir } from '../config.js';
 
 const router = Router();
 const sitesFilePath = path.join(dataDir, 'sites.json');
+const selfInspectionsFilePath = path.join(dataDir, 'site_self_inspections.json');
+const selfInspectionConfigsFilePath = path.join(dataDir, 'self_inspection_office_configs.json');
 
 // NAS 02-施工図PDF ベースディレクトリの定義 (デフォルト: data/drawings または環境変数 DRAWINGS_DIR)
 const drawingsBaseDir = process.env.DRAWINGS_DIR || path.join(process.cwd(), 'data', 'drawings');
@@ -55,6 +57,84 @@ function saveSitesFile(data) {
     fs.writeFileSync(sitesFilePath, JSON.stringify(data, null, 2), 'utf8');
   } catch (e) {
     console.error('[Sites] Failed to save JSON file:', e);
+  }
+}
+
+function loadJsonArraySafe(filePath) {
+  if (!fs.existsSync(filePath)) return [];
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    console.error(`[Sites] Failed to read JSON file (${path.basename(filePath)}):`, e);
+    return [];
+  }
+}
+
+function saveJsonArraySafe(filePath, data) {
+  try {
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  } catch (e) {
+    console.error(`[Sites] Failed to save JSON file (${path.basename(filePath)}):`, e);
+  }
+}
+
+function safeParseJsonStr(raw, fallback) {
+  if (!raw || typeof raw !== 'string') return fallback;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed !== null && parsed !== undefined ? parsed : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+let selfInspectionTablesEnsured = false;
+
+async function ensureSelfInspectionTables(pool) {
+  if (!pool || selfInspectionTablesEnsured) return;
+  try {
+    await pool.request().query(`
+      IF OBJECT_ID('dbo.SiteSelfInspections', 'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.SiteSelfInspections (
+          siteId NVARCHAR(100) NOT NULL PRIMARY KEY,
+          id NVARCHAR(120) NOT NULL,
+          siteCode NVARCHAR(100) NULL,
+          siteName NVARCHAR(255) NULL,
+          drawingNo NVARCHAR(100) NULL,
+          inspectionDate NVARCHAR(20) NULL,
+          inspectorId NVARCHAR(100) NULL,
+          inspectorName NVARCHAR(100) NULL,
+          officeId NVARCHAR(100) NULL,
+          officeName NVARCHAR(100) NULL,
+          payloadJson NVARCHAR(MAX) NOT NULL,
+          updatedByName NVARCHAR(100) NULL,
+          createdAt DATETIME2 NOT NULL DEFAULT GETDATE(),
+          updatedAt DATETIME2 NOT NULL DEFAULT GETDATE()
+        );
+      END
+
+      IF OBJECT_ID('dbo.SelfInspectionOfficeConfigs', 'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.SelfInspectionOfficeConfigs (
+          officeId NVARCHAR(100) NOT NULL PRIMARY KEY,
+          officeCode NVARCHAR(50) NULL,
+          officeName NVARCHAR(100) NULL,
+          useCustomConfig BIT NOT NULL DEFAULT 0,
+          configJson NVARCHAR(MAX) NOT NULL,
+          updatedBy NVARCHAR(100) NULL,
+          updatedAt DATETIME2 NOT NULL DEFAULT GETDATE()
+        );
+      END
+    `);
+    selfInspectionTablesEnsured = true;
+  } catch (err) {
+    console.warn('[Sites] ensureSelfInspectionTables warning:', err.message);
   }
 }
 
@@ -345,11 +425,13 @@ function normalizeExternalItem(item) {
     if (pParts[1]) scheduledEndDate = pParts[1].trim().replace(/\//g, '-');
   }
 
-  // 部品データの正規化
+  // 部品データの正規化（主要部品・付属部品・センサー/電気錠など全明細を透過的に保持）
   const rawParts = item.parts || siteObj.parts || [];
-  const parts = Array.isArray(rawParts) ? rawParts.map(p => {
-    const isMajor = p.category === 'major' || p.type === 'main' || p.isMain === true || (!p.type && p.category !== 'sub');
+  const normalizePartRow = (p) => {
+    const explicitSub = p.category === 'sub' || p.type === 'sub' || p.isMain === false;
+    const isMajor = !explicitSub && (p.category === 'major' || p.type === 'main' || p.isMain === true || (!p.type && p.category !== 'sub'));
     return {
+      ...p,
       type: isMajor ? 'main' : 'sub',
       isMain: isMajor,
       id: p.id || '',
@@ -357,13 +439,19 @@ function normalizeExternalItem(item) {
       partCode: String(p.partCode || p.modelNumber || p.code || p.model || p.部品規格 || p.部品手配コード || '').trim(),
       partName: String(p.partName || p.name || p.品名 || '').trim(),
       partSpec: String(p.partSpec || p.部品規格 || '').trim(),
+      partCategory: p.partCategory || p.部品区分 || undefined,
       quantity: typeof p.quantity === 'number' ? p.quantity : (parseInt(p.count || p.qty || p.quantity || p.注文数量 || 1, 10) || 1),
       unit: p.unit || (isMajor ? '台' : '個'),
+      status: p.status || p.ステータス || p.stockStatus || '',
       inStockDate: normalizeExternalDateStr(p.inboundDate || p.inStockDate || p.nyukoDate || p.inDate || p.入庫日 || ''),
       outStockDate: normalizeExternalDateStr(p.outboundDate || p.outStockDate || p.syukkoDate || p.outDate || p.出庫日 || ''),
       note: p.note || p.bikou || p.stockStatus || ''
     };
-  }) : [];
+  };
+
+  const parts = Array.isArray(rawParts) ? rawParts.map(normalizePartRow) : [];
+  const rawAllParts = item.allParts || siteObj.allParts || item.components || siteObj.components || item.items || siteObj.items;
+  const allParts = Array.isArray(rawAllParts) ? rawAllParts.map(normalizePartRow) : undefined;
 
   // もし egCount が 0 の場合、主要部品の台数から自動算出（検索一覧等で台数・部品ともに未取得の場合は 0 のまま返し誤表示を防ぐ）
   const majorPartsCount = parts.filter(p => p.isMain).reduce((sum, p) => sum + (p.quantity || 1), 0);
@@ -384,7 +472,8 @@ function normalizeExternalItem(item) {
     period,
     scheduledStartDate,
     scheduledEndDate,
-    parts
+    parts,
+    ...(allParts ? { allParts } : {})
   };
 }
 
@@ -476,6 +565,325 @@ router.get(['/lookup/external', '/sites/lookup/external', '/external/lookup'], a
   }
 });
 
+
+// ==========================================
+// 2.5 自動ドア自主検査書・拠点別様式＆自動適合ルール API
+// （/:id より先に定義してルート衝突を防止）
+// ==========================================
+
+// 拠点別自主検査書様式設定 一覧取得
+router.get(['/self-inspections/configs', '/sites/self-inspections/configs'], async (req, res) => {
+  try {
+    const pool = await getPool();
+    if (pool) {
+      try {
+        await ensureSelfInspectionTables(pool);
+        const result = await pool.request().query(`
+          SELECT officeId, officeCode, officeName, useCustomConfig, configJson, updatedBy, updatedAt
+          FROM dbo.SelfInspectionOfficeConfigs
+          ORDER BY CASE WHEN officeId = 'default' THEN 0 ELSE 1 END, officeId ASC
+        `);
+        const configs = (result.recordset || []).map((row) => {
+          const parsed = safeParseJsonStr(row.configJson, {});
+          return {
+            ...parsed,
+            officeId: String(row.officeId),
+            officeCode: row.officeCode || parsed.officeCode || '',
+            officeName: row.officeName || parsed.officeName || '',
+            useCustomConfig: Boolean(row.useCustomConfig),
+            updatedBy: row.updatedBy || parsed.updatedBy || '',
+            updatedAt: row.updatedAt instanceof Date ? row.updatedAt.toISOString() : (row.updatedAt || parsed.updatedAt || '')
+          };
+        });
+        return res.json({ success: true, configs, source: 'mssql' });
+      } catch (dbErr) {
+        console.warn('[Sites SelfInspection] MSSQL fetch configs failed, falling back to JSON:', dbErr.message);
+      }
+    }
+
+    const configs = loadJsonArraySafe(selfInspectionConfigsFilePath);
+    return res.json({ success: true, configs, source: 'json' });
+  } catch (err) {
+    console.error('[Sites SelfInspection] Get configs error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 拠点別自主検査書様式設定 保存 (Upsert)
+router.put(['/self-inspections/configs/:officeId', '/sites/self-inspections/configs/:officeId'], async (req, res) => {
+  await handleUpsertSelfInspectionConfig(req, res);
+});
+router.post(['/self-inspections/configs/:officeId', '/sites/self-inspections/configs/:officeId'], async (req, res) => {
+  await handleUpsertSelfInspectionConfig(req, res);
+});
+
+async function handleUpsertSelfInspectionConfig(req, res) {
+  try {
+    const officeId = String(req.params.officeId || req.body?.officeId || '').trim();
+    if (!officeId) {
+      return res.status(400).json({ success: false, error: 'officeId は必須です' });
+    }
+    const body = req.body || {};
+    const nowIso = new Date().toISOString();
+    const configToSave = {
+      ...body,
+      officeId,
+      officeCode: String(body.officeCode || '').trim(),
+      officeName: String(body.officeName || (officeId === 'default' ? '全社共通（デフォルト）' : officeId)).trim(),
+      useCustomConfig: officeId === 'default' ? true : Boolean(body.useCustomConfig),
+      categories: Array.isArray(body.categories) ? body.categories : [],
+      checkItems: Array.isArray(body.checkItems) ? body.checkItems : [],
+      judgementOptions: Array.isArray(body.judgementOptions) ? body.judgementOptions : [],
+      autoMatchRules: Array.isArray(body.autoMatchRules) ? body.autoMatchRules : [],
+      updatedBy: String(body.updatedBy || '').trim(),
+      updatedAt: nowIso
+    };
+
+    const pool = await getPool();
+    if (pool) {
+      try {
+        await ensureSelfInspectionTables(pool);
+        const request = pool.request();
+        request.input('officeId', sql.NVarChar(100), officeId);
+        request.input('officeCode', sql.NVarChar(50), configToSave.officeCode || null);
+        request.input('officeName', sql.NVarChar(100), configToSave.officeName || null);
+        request.input('useCustomConfig', sql.Bit, configToSave.useCustomConfig ? 1 : 0);
+        request.input('configJson', sql.NVarChar(sql.MAX), JSON.stringify(configToSave));
+        request.input('updatedBy', sql.NVarChar(100), configToSave.updatedBy || null);
+
+        await request.query(`
+          MERGE INTO dbo.SelfInspectionOfficeConfigs AS Target
+          USING (SELECT @officeId AS officeId) AS Source
+          ON Target.officeId = Source.officeId
+          WHEN MATCHED THEN
+            UPDATE SET
+              officeCode = @officeCode,
+              officeName = @officeName,
+              useCustomConfig = @useCustomConfig,
+              configJson = @configJson,
+              updatedBy = @updatedBy,
+              updatedAt = GETDATE()
+          WHEN NOT MATCHED THEN
+            INSERT (officeId, officeCode, officeName, useCustomConfig, configJson, updatedBy, updatedAt)
+            VALUES (@officeId, @officeCode, @officeName, @useCustomConfig, @configJson, @updatedBy, GETDATE());
+        `);
+      } catch (dbErr) {
+        console.warn('[Sites SelfInspection] MSSQL save config failed (JSON fallback saved):', dbErr.message);
+      }
+    }
+
+    // Local JSON 二重永続化
+    const allConfigs = loadJsonArraySafe(selfInspectionConfigsFilePath);
+    const idx = allConfigs.findIndex((c) => String(c.officeId) === officeId);
+    if (idx >= 0) {
+      allConfigs[idx] = configToSave;
+    } else {
+      allConfigs.push(configToSave);
+    }
+    saveJsonArraySafe(selfInspectionConfigsFilePath, allConfigs);
+
+    return res.json({ success: true, config: configToSave });
+  } catch (err) {
+    console.error('[Sites SelfInspection] Save config error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// 自主検査書 一覧取得
+router.get(['/self-inspections', '/sites/self-inspections'], async (req, res) => {
+  try {
+    const { siteId, siteCode } = req.query;
+    const pool = await getPool();
+    if (pool) {
+      try {
+        await ensureSelfInspectionTables(pool);
+        let query = 'SELECT siteId, payloadJson, updatedAt FROM dbo.SiteSelfInspections WHERE 1=1';
+        const request = pool.request();
+        if (siteId) {
+          query += ' AND siteId = @siteId';
+          request.input('siteId', sql.NVarChar(100), String(siteId));
+        }
+        if (siteCode) {
+          query += ' AND siteCode = @siteCode';
+          request.input('siteCode', sql.NVarChar(100), String(siteCode));
+        }
+        query += ' ORDER BY updatedAt DESC';
+        const result = await request.query(query);
+        const records = (result.recordset || [])
+          .map((row) => safeParseJsonStr(row.payloadJson, null))
+          .filter(Boolean);
+        return res.json({ success: true, records, source: 'mssql' });
+      } catch (dbErr) {
+        console.warn('[Sites SelfInspection] MSSQL list failed, falling back to JSON:', dbErr.message);
+      }
+    }
+
+    let records = loadJsonArraySafe(selfInspectionsFilePath);
+    if (siteId) records = records.filter((r) => String(r.siteId) === String(siteId));
+    if (siteCode) records = records.filter((r) => String(r.siteCode || '') === String(siteCode));
+    return res.json({ success: true, records, source: 'json' });
+  } catch (err) {
+    console.error('[Sites SelfInspection] List error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 現場単位の自主検査書取得 (GET /api/sites/self-inspections/:siteId)
+router.get(['/self-inspections/:siteId', '/sites/self-inspections/:siteId'], async (req, res) => {
+  try {
+    const siteId = String(req.params.siteId || '').trim();
+    if (!siteId) {
+      return res.status(400).json({ success: false, error: 'siteId が必要です' });
+    }
+
+    const pool = await getPool();
+    if (pool) {
+      try {
+        await ensureSelfInspectionTables(pool);
+        const result = await pool.request()
+          .input('siteId', sql.NVarChar(100), siteId)
+          .query('SELECT payloadJson FROM dbo.SiteSelfInspections WHERE siteId = @siteId OR id = @siteId');
+        if (result.recordset && result.recordset.length > 0) {
+          const record = safeParseJsonStr(result.recordset[0].payloadJson, null);
+          return res.json({ success: true, record, source: 'mssql' });
+        }
+      } catch (dbErr) {
+        console.warn('[Sites SelfInspection] MSSQL get failed, falling back to JSON:', dbErr.message);
+      }
+    }
+
+    const records = loadJsonArraySafe(selfInspectionsFilePath);
+    const found = records.find((r) => String(r.siteId) === siteId || String(r.id) === siteId) || null;
+    return res.json({ success: true, record: found, source: 'json' });
+  } catch (err) {
+    console.error('[Sites SelfInspection] Get detail error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 現場単位の自主検査書 保存 / 更新 (PUT / POST /api/sites/self-inspections/:siteId)
+router.put(['/self-inspections/:siteId', '/sites/self-inspections/:siteId'], async (req, res) => {
+  await handleUpsertSelfInspection(req, res);
+});
+router.post(['/self-inspections', '/self-inspections/:siteId', '/sites/self-inspections', '/sites/self-inspections/:siteId'], async (req, res) => {
+  await handleUpsertSelfInspection(req, res);
+});
+
+async function handleUpsertSelfInspection(req, res) {
+  try {
+    const body = req.body || {};
+    const siteId = String(req.params.siteId || body.siteId || '').trim();
+    if (!siteId) {
+      return res.status(400).json({ success: false, error: 'siteId は必須です' });
+    }
+    if (!Array.isArray(body.doors)) {
+      return res.status(400).json({ success: false, error: 'doors 配列が必要です' });
+    }
+
+    const nowIso = new Date().toISOString();
+    const recordToSave = {
+      ...body,
+      id: body.id ? String(body.id) : `self-insp-${siteId}`,
+      siteId,
+      siteCode: String(body.siteCode || '').trim(),
+      siteName: String(body.siteName || '').trim(),
+      drawingNo: String(body.drawingNo || '').trim(),
+      inspectionDate: String(body.inspectionDate || '').trim(),
+      inspectorId: String(body.inspectorId || '').trim(),
+      inspectorName: String(body.inspectorName || '').trim(),
+      officeId: String(body.officeId || 'default').trim(),
+      officeName: String(body.officeName || '').trim(),
+      createdAt: body.createdAt || nowIso,
+      updatedAt: nowIso
+    };
+
+    const pool = await getPool();
+    if (pool) {
+      try {
+        await ensureSelfInspectionTables(pool);
+        const request = pool.request();
+        request.input('siteId', sql.NVarChar(100), siteId);
+        request.input('id', sql.NVarChar(120), recordToSave.id);
+        request.input('siteCode', sql.NVarChar(100), recordToSave.siteCode || null);
+        request.input('siteName', sql.NVarChar(255), recordToSave.siteName || null);
+        request.input('drawingNo', sql.NVarChar(100), recordToSave.drawingNo || null);
+        request.input('inspectionDate', sql.NVarChar(20), recordToSave.inspectionDate || null);
+        request.input('inspectorId', sql.NVarChar(100), recordToSave.inspectorId || null);
+        request.input('inspectorName', sql.NVarChar(100), recordToSave.inspectorName || null);
+        request.input('officeId', sql.NVarChar(100), recordToSave.officeId || null);
+        request.input('officeName', sql.NVarChar(100), recordToSave.officeName || null);
+        request.input('payloadJson', sql.NVarChar(sql.MAX), JSON.stringify(recordToSave));
+        request.input('updatedByName', sql.NVarChar(100), recordToSave.updatedByName || recordToSave.inspectorName || null);
+
+        await request.query(`
+          MERGE INTO dbo.SiteSelfInspections AS Target
+          USING (SELECT @siteId AS siteId) AS Source
+          ON Target.siteId = Source.siteId
+          WHEN MATCHED THEN
+            UPDATE SET
+              id = @id,
+              siteCode = @siteCode,
+              siteName = @siteName,
+              drawingNo = @drawingNo,
+              inspectionDate = @inspectionDate,
+              inspectorId = @inspectorId,
+              inspectorName = @inspectorName,
+              officeId = @officeId,
+              officeName = @officeName,
+              payloadJson = @payloadJson,
+              updatedByName = @updatedByName,
+              updatedAt = GETDATE()
+          WHEN NOT MATCHED THEN
+            INSERT (siteId, id, siteCode, siteName, drawingNo, inspectionDate, inspectorId, inspectorName, officeId, officeName, payloadJson, updatedByName, createdAt, updatedAt)
+            VALUES (@siteId, @id, @siteCode, @siteName, @drawingNo, @inspectionDate, @inspectorId, @inspectorName, @officeId, @officeName, @payloadJson, @updatedByName, GETDATE(), GETDATE());
+        `);
+      } catch (dbErr) {
+        console.warn('[Sites SelfInspection] MSSQL save failed (JSON fallback saved):', dbErr.message);
+      }
+    }
+
+    // Local JSON 二重永続化
+    const allRecords = loadJsonArraySafe(selfInspectionsFilePath);
+    const idx = allRecords.findIndex((r) => String(r.siteId) === siteId);
+    if (idx >= 0) {
+      allRecords[idx] = recordToSave;
+    } else {
+      allRecords.push(recordToSave);
+    }
+    saveJsonArraySafe(selfInspectionsFilePath, allRecords);
+
+    return res.json({ success: true, record: recordToSave });
+  } catch (err) {
+    console.error('[Sites SelfInspection] Save error:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// 自主検査書 削除
+router.delete(['/self-inspections/:siteId', '/sites/self-inspections/:siteId'], async (req, res) => {
+  try {
+    const siteId = String(req.params.siteId || '').trim();
+    const pool = await getPool();
+    if (pool) {
+      try {
+        await ensureSelfInspectionTables(pool);
+        await pool.request()
+          .input('siteId', sql.NVarChar(100), siteId)
+          .query('DELETE FROM dbo.SiteSelfInspections WHERE siteId = @siteId OR id = @siteId');
+      } catch (dbErr) {
+        console.warn('[Sites SelfInspection] MSSQL delete warning:', dbErr.message);
+      }
+    }
+    const allRecords = loadJsonArraySafe(selfInspectionsFilePath);
+    saveJsonArraySafe(
+      selfInspectionsFilePath,
+      allRecords.filter((r) => String(r.siteId) !== siteId && String(r.id) !== siteId)
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
 // ==========================================
 // 3. 現場詳細取得 (GET /api/sites/:id)

@@ -62,9 +62,11 @@ import {
   FileText,
   Eye,
   EyeOff,
-  ListChecks
+  ListChecks,
+  ClipboardCheck
 } from 'lucide-react';
 import { InspectionCheckItemMasterModal } from './inspection/InspectionCheckItemMasterModal';
+import { SelfInspectionConfigPanel } from './AdminPanel/SelfInspectionConfigPanel';
 import { User, OfficeMaster, DivisionMaster, PositionMaster, OfficeType, ApprovalFlowRule, ApprovalStepConfig, ApprovalApproverCandidate, ApplicationType, ApproverType, ItemMaster, WorkflowApplication, ApplicationStatus, UserInvitation, MenuVisibilitySettings, ToggleableMenuKey } from '../types';
 import { TOGGLEABLE_MENUS, DEFAULT_MENU_VISIBILITY, getMenuVisibilitySettings, getToggleableMenuLabel } from '../utils/menuVisibility';
 import { sortUsers, sortUsersByDivision } from '../utils/userSort';
@@ -167,7 +169,7 @@ export function AdminPanel({
   onUpdateItemMaster,
   onDeleteItemMaster,
 }: AdminPanelProps) {
-  const [activeSubTab, setActiveSubTab] = useState<'users' | 'offices' | 'maintenance_report' | 'driving_log_report' | 'inspection_items' | 'notification_templates' | 'divisions' | 'positions' | 'items' | 'approval_flows' | 'stamps' | 'logs' | 'system' | 'workflows_cleanup'>('users');
+  const [activeSubTab, setActiveSubTab] = useState<'users' | 'offices' | 'maintenance_report' | 'driving_log_report' | 'self_inspection_report' | 'inspection_items' | 'notification_templates' | 'divisions' | 'positions' | 'items' | 'approval_flows' | 'stamps' | 'logs' | 'system' | 'workflows_cleanup'>('users');
   const [isInspectionMasterOpen, setIsInspectionMasterOpen] = useState(false);
   const [confirmModal, setConfirmModal] = useState<ConfirmModalState>({ isOpen: false, title: '', message: '' });
   const [searchQuery, setSearchQuery] = useState('');
@@ -2290,6 +2292,18 @@ export function AdminPanel({
             運転記録簿様式（拠点別）
           </button>
           <button
+            onClick={() => setActiveSubTab('self_inspection_report')}
+            className={`px-3.5 py-2 text-xs font-bold rounded-xl flex items-center gap-1.5 transition-all cursor-pointer ${
+              activeSubTab === 'self_inspection_report'
+                ? 'bg-amber-600 text-white shadow-sm'
+                : 'text-slate-600 hover:text-amber-800 hover:bg-amber-50'
+            }`}
+            title="現場管理の自動ドア自主検査書のチェック項目・数値欄・判定記号・在庫自動適合ルールを拠点別にカスタマイズします"
+          >
+            <ClipboardCheck className="w-3.5 h-3.5" />
+            自主検査書様式（拠点別）
+          </button>
+          <button
             onClick={() => {
               setActiveSubTab('inspection_items');
               setIsInspectionMasterOpen(true);
@@ -3355,6 +3369,14 @@ export function AdminPanel({
       {/* SUB TAB: NOTIFICATION TEMPLATES PREVIEW & EDITOR */}
       {activeSubTab === 'notification_templates' && (
         <NotificationTemplatesAdmin currentUserName={currentUser?.name} />
+      )}
+
+      {/* SUB TAB: SELF INSPECTION REPORT CONFIG (OFFICE SPECIFIC) */}
+      {activeSubTab === 'self_inspection_report' && (
+        <SelfInspectionConfigPanel
+          offices={offices}
+          currentUser={currentUser}
+        />
       )}
 
       {/* SUB TAB: INSPECTION ITEMS MASTER CONFIG */}

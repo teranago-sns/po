@@ -4502,10 +4502,15 @@ export default function App() {
             <SiteManagement
               currentUser={userState}
               allUsers={usersList}
+              offices={offices}
+              divisions={divisions}
               events={events}
               initialSiteId={targetSiteId}
               onClearInitialSiteId={() => setTargetSiteId(undefined)}
               onNavigateToCalendar={handleNavigateToCalendar}
+              onAddEvent={handleAddEvent}
+              onUpdateEvent={handleUpdateEvent}
+              onDeleteEvent={handleDeleteEvent}
             />
           )}
           {activeTab === 'assets' && (

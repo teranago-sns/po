@@ -1856,7 +1856,7 @@ export function Chat({
   };
 
   // 写真選択またはドラッグ＆ドロップ時の共通振り分け処理 (最大10枚対応)
-  const handlePhotoFilesSelected = (files: File[]) => {
+  const handlePhotoFilesSelected = (files: File[], initialCaption?: string) => {
     const imageFiles = files.filter(f => f.type.startsWith('image/') || /\.(jpe?g|png|webp|gif)$/i.test(f.name));
     if (imageFiles.length === 0) return;
 
@@ -1872,7 +1872,7 @@ export function Chat({
     if (targetFiles.length === 1) {
       // 1枚のみの場合: 既存の単体写真プレビュー（キャプション付き）
       const singleFile = targetFiles[0];
-      handleProcessSinglePhoto(singleFile);
+      handleProcessSinglePhoto(singleFile, initialCaption);
     } else {
       // 複数枚（2〜10枚）の場合: 写真アルバムプレビューモーダル
       pendingAlbumPhotos.forEach(p => URL.revokeObjectURL(p.previewUrl));
@@ -1882,12 +1882,12 @@ export function Chat({
         previewUrl: URL.createObjectURL(file)
       }));
       setPendingAlbumPhotos(albumItems);
-      setAlbumCaption('');
+      setAlbumCaption(initialCaption || '');
     }
   };
 
   // 単体写真の2段階サムネイル生成＆アップロード
-  const handleProcessSinglePhoto = async (file: File) => {
+  const handleProcessSinglePhoto = async (file: File, initialCaption?: string) => {
     setIsChatUploading(true);
     try {
       const { thumbnailFile, highResFile } = await createImageVariants(file);
@@ -1900,12 +1900,13 @@ export function Chat({
 
       setPendingPhotoUrl(fullUrl);
       setPendingThumbnailUrl(thumbUrl);
-      setPhotoCaption('');
+      setPhotoCaption(initialCaption ?? '');
     } catch (err) {
       console.error(err);
       const localUrl = URL.createObjectURL(file);
       setPendingPhotoUrl(localUrl);
       setPendingThumbnailUrl(localUrl);
+      setPhotoCaption(initialCaption ?? '');
     } finally {
       setIsChatUploading(false);
     }
@@ -2021,11 +2022,11 @@ export function Chat({
     }
 
     if (imageFiles.length > 0) {
-      if (messageText.trim()) {
-        setPhotoCaption(messageText.trim());
+      const carryCaption = messageText.trim();
+      if (carryCaption) {
         setMessageText('');
       }
-      handlePhotoFilesSelected(imageFiles);
+      handlePhotoFilesSelected(imageFiles, carryCaption);
       if (otherFiles.length > 0) {
         await processChatUploadedFiles(otherFiles);
       }
@@ -2052,9 +2053,9 @@ export function Chat({
   useEffect(() => {
     const handleGlobalPaste = (e: ClipboardEvent) => {
       if (!activeRoom) return;
-      // 他のモーダルやインプット（トークルーム名変更、検索バー等）にフォーカスがある場合はスキップ
+      // テキストエリア（チャット入力欄自身の onPaste と重複発火するのを防ぐ）や他インプットにフォーカスがある場合はスキップ
       const activeEl = document.activeElement;
-      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA') && activeEl !== chatTextareaRef.current) {
+      if (activeEl && (activeEl.tagName === 'INPUT' || activeEl.tagName === 'TEXTAREA')) {
         return;
       }
       if (e.clipboardData) {
@@ -3158,7 +3159,11 @@ export function Chat({
             {/* 写真添付プレビューモーダル / ポップアップ (単体) */}
             {pendingPhotoUrl && (
               <div className="mb-2 p-2.5 bg-indigo-50/80 border border-indigo-200 rounded-xl flex flex-col sm:flex-row items-start sm:items-center gap-2.5">
-                <img src={pendingPhotoUrl || undefined} alt="送信プレビュー" className="w-14 h-14 sm:w-16 sm:h-16 rounded-lg object-cover border border-indigo-200 shrink-0" />
+                <img
+                  src={resolveFileUrl(pendingThumbnailUrl || pendingPhotoUrl)}
+                  alt="送信プレビュー"
+                  className="w-14 h-14 sm:w-16 sm:h-16 rounded-lg object-cover border border-indigo-200 bg-white shrink-0"
+                />
                 <div className="flex-1 w-full min-w-0">
                   <input
                     type="text"

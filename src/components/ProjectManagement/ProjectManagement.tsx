@@ -658,6 +658,15 @@ export const ProjectManagement: React.FC<ProjectManagementProps> = ({
     const prevCard = isEdit ? cards.find(c => c.id === payload.id) : undefined;
     const prevAssigneeSet = new Set((prevCard?.assigneeIds || []).map(String));
     const isMemoCard = payload.cardType === 'memo';
+    const targetBoardForSave =
+      boards.find(b => b.id === (payload.projectId || prevCard?.projectId)) || activeBoard;
+    const resolvedAssigneeIds = isMemoCard
+      ? []
+      : targetBoardForSave?.boardType === 'personal' &&
+        (!payload.assigneeIds || payload.assigneeIds.length === 0) &&
+        currentUser?.id
+      ? [String(currentUser.id)]
+      : payload.assigneeIds;
 
     const url = isEdit
       ? `${API_BASE_URL}/projects/cards/${encodeURIComponent(String(payload.id))}`
@@ -667,7 +676,7 @@ export const ProjectManagement: React.FC<ProjectManagementProps> = ({
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         ...payload,
-        assigneeIds: isMemoCard ? [] : payload.assigneeIds,
+        assigneeIds: resolvedAssigneeIds,
         createdBy: isEdit ? undefined : currentUser.id,
         createdByName: isEdit ? undefined : currentUser.name,
         updatedBy: currentUser.id,

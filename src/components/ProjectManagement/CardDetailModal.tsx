@@ -111,7 +111,13 @@ export const CardDetailModal: React.FC<CardDetailModalProps> = ({
   const [assigneeIds, setAssigneeIds] = useState<string[]>(() => {
     const resolvedType = card?.cardType || initialCardType || 'task';
     if (resolvedType === 'memo') return [];
-    return card?.assigneeIds ? card.assigneeIds.map(String) : [];
+    if (card?.assigneeIds && card.assigneeIds.length > 0) {
+      return card.assigneeIds.map(String);
+    }
+    if (board.boardType === 'personal' && currentUser?.id) {
+      return [String(currentUser.id)];
+    }
+    return [];
   });
   const [tags, setTags] = useState<string[]>(() => (card?.tags ? [...card.tags] : []));
   const [tagInput, setTagInput] = useState('');
@@ -390,7 +396,12 @@ export const CardDetailModal: React.FC<CardDetailModalProps> = ({
         priority: cardType === 'memo' ? 'none' : priority,
         dueDate: cardType === 'memo' ? undefined : dueDate || undefined,
         startDate: cardType === 'memo' ? undefined : startDate || undefined,
-        assigneeIds: cardType === 'memo' ? [] : assigneeIds,
+        assigneeIds:
+          cardType === 'memo'
+            ? []
+            : board.boardType === 'personal' && assigneeIds.length === 0 && currentUser?.id
+            ? [String(currentUser.id)]
+            : assigneeIds,
         tags,
         links,
         attachments,

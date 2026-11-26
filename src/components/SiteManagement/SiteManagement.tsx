@@ -5,9 +5,10 @@ import {
   Clock, AlertCircle, MapPin, ChevronRight, HardHat, FileSpreadsheet, ExternalLink
 } from 'lucide-react';
 import { Site, SiteStatus } from '../../types/site';
-import { User, CalendarEvent } from '../../types';
+import { User, CalendarEvent, OfficeMaster, DivisionMaster } from '../../types';
 import { API_BASE_URL } from '../../config/api';
 import { triggerOpenUserModal } from '../../utils/userModal';
+import { RecurrenceActionScope } from '../RecurrenceActionModal';
 import { SiteGanttView } from './SiteGanttView';
 import { WorkerScheduleView } from './WorkerScheduleView';
 import { SiteFormModal } from './SiteFormModal';
@@ -16,19 +17,29 @@ import { SiteDetailModal } from './SiteDetailModal';
 interface SiteManagementProps {
   currentUser: User;
   allUsers: User[];
+  offices?: OfficeMaster[];
+  divisions?: DivisionMaster[];
   events?: CalendarEvent[];
   initialSiteId?: string;
   onClearInitialSiteId?: () => void;
   onNavigateToCalendar?: (eventId: string, date?: string, targetUser?: User) => void;
+  onAddEvent?: (eventData: Omit<CalendarEvent, 'id'>) => Promise<void> | void;
+  onUpdateEvent?: (updatedEvent: CalendarEvent, scope?: RecurrenceActionScope, originalInstanceDate?: string) => Promise<void> | void;
+  onDeleteEvent?: (eventId: string, scope?: RecurrenceActionScope, instanceDate?: string) => Promise<void> | void;
 }
 
 export const SiteManagement: React.FC<SiteManagementProps> = ({ 
   currentUser, 
-  allUsers, 
+  allUsers,
+  offices = [],
+  divisions = [],
   events,
   initialSiteId,
   onClearInitialSiteId,
-  onNavigateToCalendar
+  onNavigateToCalendar,
+  onAddEvent,
+  onUpdateEvent,
+  onDeleteEvent,
 }) => {
   const [sites, setSites] = useState<Site[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -457,6 +468,7 @@ export const SiteManagement: React.FC<SiteManagementProps> = ({
       {isDetailOpen && selectedSite && (
         <SiteDetailModal
           site={selectedSite}
+          sites={sites}
           isOpen={isDetailOpen}
           onClose={() => {
             setIsDetailOpen(false);
@@ -466,8 +478,13 @@ export const SiteManagement: React.FC<SiteManagementProps> = ({
           onDeleteSite={handleSiteDeleted}
           currentUser={currentUser}
           allUsers={allUsers}
+          offices={offices}
+          divisions={divisions}
           events={events}
           onNavigateToCalendar={onNavigateToCalendar}
+          onAddEvent={onAddEvent}
+          onUpdateEvent={onUpdateEvent}
+          onDeleteEvent={onDeleteEvent}
         />
       )}
     </div>

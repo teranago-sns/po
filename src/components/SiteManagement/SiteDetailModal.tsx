@@ -3,28 +3,38 @@ import {
   X, Layers, Calendar, User as UserIcon, Building, MapPin, 
   ExternalLink, MessageSquare, Send, CheckCircle2, Clock, 
   FileText, Paperclip, Trash2, Edit3, Save, RefreshCw, AlertCircle, FileSpreadsheet, Download, Eye, HardHat,
-  Camera, Upload, UploadCloud, Image as ImageIcon, Loader2, Database, Search
+  Camera, Upload, UploadCloud, Image as ImageIcon, Loader2, Database, Search, LayoutDashboard, Plus
 } from 'lucide-react';
 import { Site, SiteMainPart, SiteSubPart, SiteComment, SiteStatus, PartStatus, SiteAttachment, ExternalSiteLookupResult } from '../../types/site';
-import { User, AttachmentFile, CalendarEvent } from '../../types';
+import { User, AttachmentFile, CalendarEvent, OfficeMaster, DivisionMaster } from '../../types';
 import { getAvatarUrl, handleAvatarError } from '../../utils/avatar';
 import { triggerOpenUserModal } from '../../utils/userModal';
 import { API_BASE_URL, appendAuthTokenToUrl } from '../../config/api';
 import { FilePreviewModal } from '../FilePreviewModal';
 import { ConfirmModal, ConfirmModalState } from '../ConfirmModal';
+import { EventModal } from '../EventModal';
+import { RecurrenceActionScope } from '../RecurrenceActionModal';
 import { getFittingLabel, cleanPartName, expandExternalSitePayload, mergeInventorySyncWithSite, deriveInventoryPartStatus, normalizeExternalDate } from '../../utils/siteUtils';
 import { uploadFile, resolveFileUrl } from '../../utils/fileUpload';
+import { SiteDashboardTab } from './SiteDashboardTab';
+import { SiteSelfInspectionTab } from './SiteSelfInspectionTab';
 
 interface SiteDetailModalProps {
   site: Site | null;
+  sites?: Site[];
   isOpen: boolean;
   onClose: () => void;
   onUpdateSite: (updatedSite: Site) => void;
   onDeleteSite: (siteId: string) => void;
   currentUser: User;
   allUsers: User[];
+  offices?: OfficeMaster[];
+  divisions?: DivisionMaster[];
   events?: CalendarEvent[];
   onNavigateToCalendar?: (eventId: string, date?: string, targetUser?: User) => void;
+  onAddEvent?: (eventData: Omit<CalendarEvent, 'id'>) => Promise<void> | void;
+  onUpdateEvent?: (updatedEvent: CalendarEvent, scope?: RecurrenceActionScope, originalInstanceDate?: string) => Promise<void> | void;
+  onDeleteEvent?: (eventId: string, scope?: RecurrenceActionScope, instanceDate?: string) => Promise<void> | void;
 }
 
 /**
@@ -130,17 +140,25 @@ export function getSiteDrawingList(site?: Site | null): string[] {
 
 export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
   site,
+  sites = [],
   isOpen,
   onClose,
   onUpdateSite,
   onDeleteSite,
   currentUser,
   allUsers,
+  offices = [],
+  divisions = [],
   events,
   onNavigateToCalendar,
+  onAddEvent,
+  onUpdateEvent,
+  onDeleteEvent,
 }) => {
-  const [activeTab, setActiveTab] = useState<'parts' | 'timeline' | 'schedule' | 'info' | 'export'>('parts');
+  const [activeTab, setActiveTab] = useState<'parts' | 'timeline' | 'schedule' | 'info' | 'export'>('info');
   const [fetchedEvents, setFetchedEvents] = useState<CalendarEvent[]>([]);
+  const [isScheduleModalOpen, setIsScheduleModalOpen] = useState(false);
+  const [editingScheduleEvent, setEditingScheduleEvent] = useState<CalendarEvent | null>(null);
 
   // 親から events が渡されていない場合は自動取得
   useEffect(() => {
@@ -820,17 +838,17 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
 
         {/* サブナビゲーションタブ */}
         <div className="flex border-b border-slate-200 bg-white px-5 text-xs font-bold text-slate-600 gap-6 overflow-x-auto">
-          {/* 1番目: 現場詳細情報・竣工予定 */}
+          {/* 1番目: ダッシュボード */}
           <button
             onClick={() => setActiveTab('info')}
-            className={`py-3 border-b-2 flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 ${
+            className={`py-3 border-b-2 flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 whitespace-nowrap ${
               activeTab === 'info'
                 ? 'border-indigo-600 text-indigo-700'
                 : 'border-transparent hover:text-slate-900'
             }`}
           >
-            <Building className="w-4 h-4 text-indigo-600" />
-            <span>現場詳細情報・竣工予定</span>
+            <LayoutDashboard className="w-4 h-4 text-indigo-600" />
+            <span>ダッシュボード</span>
           </button>
 
           {/* 2番目: 主要部品・施工進捗 */}
@@ -879,7 +897,7 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
             </span>
           </button>
 
-          {/* 5番目: 帳票・Excel・自主検査 */}
+          {/* 5番目: 自主検査書・Excel */}
           <button
             onClick={() => setActiveTab('export')}
             className={`py-3 border-b-2 flex items-center gap-1.5 transition-colors cursor-pointer shrink-0 ${
@@ -889,7 +907,7 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
             }`}
           >
             <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-            <span>帳票・Excel・自主検査</span>
+            <span>自主検査書・Excel</span>
           </button>
         </div>
 
@@ -935,54 +953,179 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
             </div>
           )}
 
-          {/* TAB 1: 主要部品 & 付属部品 */}
+          {/* TAB 2: 主要部品 & 付属部品 */}
           {activeTab === 'parts' && (
             <div className="space-y-6">
-              {/* 在庫DB入出庫ステータス監視バー */}
-              <div className="p-3 bg-indigo-50/60 border border-indigo-100 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
-                <div className="flex items-center gap-2 text-indigo-900">
-                  <Database className="w-4 h-4 text-indigo-600 shrink-0" />
-                  {currentSite.siteCode ? (
-                    <span>
-                      <strong>在庫入出庫監視:</strong> 現場コード{' '}
-                      <span className="font-mono font-bold bg-white px-1.5 py-0.5 rounded border border-indigo-200">
-                        {currentSite.siteCode}
-                      </span>
-                      {lastSyncedAt && (
-                        <span className="text-[11px] text-indigo-700 ml-2">
-                          最終確認: {lastSyncedAt} JST
-                        </span>
-                      )}
-                    </span>
-                  ) : (
-                    <span className="text-amber-800 font-semibold">
-                      現場コードが未連携のため、入庫日・出庫日の自動監視は停止中です。
-                    </span>
-                  )}
+              {/* 現場コード連携・在庫データベース情報取り込み / 入出庫同期カード */}
+              <div className="p-4 bg-indigo-50/50 rounded-xl border border-indigo-200/80 space-y-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <Database className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h5 className="font-bold text-sm text-indigo-950">
+                          現場コード同期・在庫情報取り込み
+                        </h5>
+                        {currentSite.siteCode && (
+                          <a
+                            href={`https://sql.teranago.synology.me/genba?code=${encodeURIComponent(currentSite.siteCode.trim())}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 font-mono font-bold text-xs bg-white hover:bg-indigo-100 text-indigo-800 px-2 py-0.5 rounded border border-indigo-200 transition-colors"
+                            title={`現場コード「${currentSite.siteCode}」の外部データを新規ウインドウで開く`}
+                          >
+                            <span>{currentSite.siteCode}</span>
+                            <ExternalLink className="w-3 h-3 text-indigo-500" />
+                          </a>
+                        )}
+                        {lastSyncedAt && (
+                          <span className="text-[11px] font-mono tabular-nums text-indigo-700">
+                            最終確認: {lastSyncedAt} JST
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[11px] text-indigo-700/90 mt-0.5">
+                        {currentSite.siteCode
+                          ? `現場コード「${currentSite.siteCode}」と連携中です（画面を開くたびに入庫日・出庫日を監視して自動更新します）。`
+                          : '現場コードが未連携のため自動監視は停止中です。現場コードを紐づけて在庫DBから部品・入出庫情報を一括取り込みできます。'}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {currentSite.siteCode && (
+                      <button
+                        type="button"
+                        onClick={() => syncInventoryStatus(currentSite, { manual: true })}
+                        disabled={isLoadingSubParts}
+                        className="px-3 py-1.5 bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSubParts ? 'animate-spin' : ''}`} />
+                        <span>今すぐ入出庫を同期</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setShowInventoryLinker((prev) => !prev)}
+                      className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {showInventoryLinker
+                        ? '閉じる'
+                        : currentSite.siteCode
+                          ? '別コードで取込・変更'
+                          : '現場コードを検索/連携'}
+                    </button>
+                  </div>
                 </div>
 
-                {currentSite.siteCode ? (
-                  <button
-                    type="button"
-                    onClick={() => syncInventoryStatus(currentSite, { manual: true })}
-                    disabled={isLoadingSubParts}
-                    className="px-3 py-1.5 bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 shadow-2xs"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSubParts ? 'animate-spin' : ''}`} />
-                    <span>入庫日・出庫日を最新確認</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setActiveTab('info');
-                      setShowInventoryLinker(true);
-                    }}
-                    className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
-                  >
-                    <Database className="w-3.5 h-3.5" />
-                    <span>現場コードを連携して在庫取込</span>
-                  </button>
+                {showInventoryLinker && (
+                  <div className="pt-3 border-t border-indigo-200/80 space-y-3">
+                    {/* 直接現場コード指定取込 */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="block text-[11px] font-bold text-indigo-900">
+                          ① 現場コードを直接指定して在庫取込
+                        </label>
+                        <div className="flex gap-1.5">
+                          <input
+                            type="text"
+                            value={inventoryCodeInput}
+                            onChange={(e) => setInventoryCodeInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                syncInventoryStatus(currentSite, { overrideSiteCode: inventoryCodeInput, manual: true });
+                              }
+                            }}
+                            placeholder="例: NHQ136A"
+                            className="flex-1 min-w-0 px-2.5 py-1.5 bg-white border border-indigo-200 rounded-lg text-xs font-mono font-bold text-slate-800 focus:ring-1 focus:ring-indigo-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => syncInventoryStatus(currentSite, { overrideSiteCode: inventoryCodeInput, manual: true })}
+                            disabled={isLoadingSubParts || !inventoryCodeInput.trim()}
+                            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white rounded-lg text-xs font-bold flex items-center gap-1 whitespace-nowrap transition-colors cursor-pointer"
+                          >
+                            {isLoadingSubParts ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
+                            <span>取込実行</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* キーワード検索で現場コードを探索 */}
+                      <div className="space-y-1">
+                        <label className="block text-[11px] font-bold text-indigo-900">
+                          ② 在庫DBから現場名・コードで検索して連携
+                        </label>
+                        <div className="flex gap-1.5">
+                          <input
+                            type="text"
+                            value={inventorySearchQuery}
+                            onChange={(e) => setInventorySearchQuery(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                handleSearchInventoryForSite();
+                              }
+                            }}
+                            placeholder={currentSite.siteName || '現場名やコードを入力...'}
+                            className="flex-1 min-w-0 px-2.5 py-1.5 bg-white border border-indigo-200 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleSearchInventoryForSite}
+                            disabled={isSearchingInventory || !inventorySearchQuery.trim()}
+                            className="px-3 py-1.5 bg-white hover:bg-indigo-100 disabled:opacity-50 text-indigo-700 border border-indigo-300 rounded-lg text-xs font-bold flex items-center gap-1 whitespace-nowrap transition-colors cursor-pointer"
+                          >
+                            {isSearchingInventory ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
+                            <span>検索</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {inventoryLookupError && (
+                      <p className="text-xs text-rose-600 font-semibold">{inventoryLookupError}</p>
+                    )}
+
+                    {inventorySearchResults.length > 0 && (
+                      <div className="bg-white border border-indigo-200 rounded-lg p-2 max-h-44 overflow-y-auto space-y-1">
+                        <div className="text-[11px] font-bold text-slate-500 px-2 py-0.5">
+                          在庫DB検索結果 ({inventorySearchResults.length}件) - クリックで現場コード連携＆在庫取込:
+                        </div>
+                        {inventorySearchResults.map((res, i) => {
+                          const codeVal = res.code || res.siteCode || '';
+                          const nameVal = res.name || res.siteName || '（名称未設定）';
+                          return (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => {
+                                if (codeVal) {
+                                  setInventoryCodeInput(codeVal);
+                                  setInventorySearchResults([]);
+                                  syncInventoryStatus(currentSite, { overrideSiteCode: codeVal, manual: true });
+                                }
+                              }}
+                              className="w-full text-left p-2 hover:bg-indigo-50 rounded-lg flex items-center justify-between gap-2 border border-slate-100 hover:border-indigo-200 transition-colors cursor-pointer"
+                            >
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="font-mono font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded">
+                                  {codeVal || '(コードなし)'}
+                                </span>
+                                <span className="font-bold text-slate-800">{nameVal}</span>
+                                {res.customerName && <span className="text-slate-500">({res.customerName})</span>}
+                                {res.egCount !== undefined && res.egCount > 0 ? (
+                                  <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">EG: {res.egCount}台</span>
+                                ) : null}
+                              </div>
+                              <span className="text-indigo-600 font-bold shrink-0 whitespace-nowrap">連携・取込 →</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
 
@@ -1006,14 +1149,11 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                       主要部品はまだ登録されていません。
                     </p>
                     <p className="text-[11px] text-slate-400">
-                      「現場詳細情報・竣工予定」タブから現場コードを連携すると、在庫データベースから主要部品・付属部品を自動取り込みできます。
+                      上の「現場コードを検索/連携」から現場コードを紐づけると、在庫データベースから主要部品・付属部品を自動取り込みできます。
                     </p>
                     <button
                       type="button"
-                      onClick={() => {
-                        setActiveTab('info');
-                        setShowInventoryLinker(true);
-                      }}
+                      onClick={() => setShowInventoryLinker(true)}
                       className="mt-1 inline-flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
                     >
                       <Database className="w-3.5 h-3.5" />
@@ -1724,703 +1864,54 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
             </div>
           )}
 
-          {/* TAB 1: 現場詳細情報 & 施工担当者 */}
+          {/* TAB 1: ダッシュボード（現場詳細・写真・図面・施工担当・直近コメント） */}
           {activeTab === 'info' && (
-            <div className="space-y-5">
-              {/* 現場詳細情報カード */}
-              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-3 text-xs">
-                <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-                  <h5 className="font-bold text-sm text-slate-800 flex items-center gap-2">
-                    <Building className="w-4 h-4 text-indigo-600" />
-                    <span>現場詳細情報</span>
-                  </h5>
-                  {!isEditingInfo ? (
-                    <button
-                      type="button"
-                      onClick={handleStartEditInfo}
-                      className="px-2.5 py-1 bg-white hover:bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
-                    >
-                      <Edit3 className="w-3.5 h-3.5" />
-                      <span>編集</span>
-                    </button>
-                  ) : (
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={handleSaveInfo}
-                        disabled={isSaving}
-                        className="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer shadow-2xs disabled:opacity-50"
-                      >
-                        <Save className="w-3.5 h-3.5" />
-                        <span>保存</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleCancelEditInfo}
-                        disabled={isSaving}
-                        className="px-2.5 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-bold transition-colors cursor-pointer"
-                      >
-                        キャンセル
-                      </button>
-                    </div>
-                  )}
-                </div>
-
-                {!isEditingInfo ? (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
-                    <div>
-                      <strong>現場コード:</strong>
-                      {currentSite.siteCode ? (
-                        <a
-                          href={`https://sql.teranago.synology.me/genba?code=${encodeURIComponent(currentSite.siteCode.trim())}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 font-mono bg-indigo-50 hover:bg-indigo-100 text-indigo-800 hover:text-indigo-950 px-1.5 py-0.5 rounded border border-indigo-200 hover:border-indigo-300 font-bold ml-1 transition-all cursor-pointer group/infocode"
-                          title={`現場コード「${currentSite.siteCode}」の外部データを新規ウインドウで開く`}
-                        >
-                          <span>{currentSite.siteCode}</span>
-                          <ExternalLink className="w-3 h-3 text-indigo-500 group-hover/infocode:text-indigo-800" />
-                        </a>
-                      ) : (
-                        <span className="text-slate-400 font-normal ml-1">未設定</span>
-                      )}
-                    </div>
-                    <div><strong>現場名:</strong> <span className="font-bold text-slate-900 ml-1">{currentSite.siteName}</span></div>
-                    <div><strong>元請 / 取引先:</strong> <span className="ml-1 text-slate-800">{currentSite.customerName || '未設定'}</span></div>
-                    <div><strong>図面番号:</strong> <span className="ml-1 font-mono text-slate-800">{currentSite.orderNo || '未設定'}</span></div>
-                    <div className="sm:col-span-2"><strong>施工場所:</strong> <span className="ml-1 text-slate-800">{currentSite.address || '未設定'}</span></div>
-                    <div><strong>EG台数:</strong> <span className="ml-1 font-bold text-indigo-700">{currentSite.egCount} 台</span></div>
-                    <div>
-                      <strong>主担当施工者:</strong>{' '}
-                      {currentSite.primaryWorkerName || currentSite.primaryWorkerId ? (
-                        <button
-                          type="button"
-                          onClick={() => triggerOpenUserModal(currentSite.primaryWorkerId || currentSite.primaryWorkerName)}
-                          className="ml-1 font-bold text-slate-800 hover:text-indigo-600 hover:underline transition-colors cursor-pointer"
-                          title="主担当施工者の社員詳細を表示"
-                        >
-                          {currentSite.primaryWorkerName}
-                        </button>
-                      ) : (
-                        <span className="ml-1 text-slate-800">未定</span>
-                      )}
-                    </div>
-                    <div><strong>工期（着工〜完工）:</strong> <span className="ml-1 text-slate-800">{currentSite.startDate || '未定'} 〜 {currentSite.endDate || '未定'}</span></div>
-                    <div><strong>主な施工日:</strong> <span className="ml-1 text-slate-800">{currentSite.constructionDate || '未定'}</span></div>
-                    <div className="sm:col-span-2"><strong>進捗状況:</strong> <span className="ml-1 font-bold">{
-                      currentSite.status === 'completed' ? '全施工完了' :
-                      currentSite.status === 'in_progress' ? '施工進行中' :
-                      currentSite.status === 'on_hold' ? '保留' : '未着手'
-                    }</span></div>
-                    {currentSite.notes && (
-                      <div className="sm:col-span-2 pt-2 mt-2 border-t border-slate-200">
-                        <strong>備考 / 特記事項:</strong>
-                        <p className="mt-0.5 text-slate-600 whitespace-pre-wrap">{currentSite.notes}</p>
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="space-y-3 text-xs">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      <div>
-                        <div className="flex items-center justify-between mb-0.5">
-                          <label className="block text-[11px] font-bold text-slate-700">現場コード</label>
-                          {(infoForm.siteCode || currentSite.siteCode) && (
-                            <a
-                              href={`https://sql.teranago.synology.me/genba?code=${encodeURIComponent(((infoForm.siteCode || currentSite.siteCode) || '').trim())}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-0.5 text-[10px] font-bold text-indigo-600 hover:text-indigo-800 hover:underline"
-                              title="現場データの外部確認画面を開く"
-                            >
-                              <span>外部確認</span>
-                              <ExternalLink className="w-2.5 h-2.5" />
-                            </a>
-                          )}
-                        </div>
-                        <div className="flex gap-1.5">
-                          <input
-                            type="text"
-                            value={infoForm.siteCode || ''}
-                            onChange={(e) => setInfoForm(prev => ({ ...prev, siteCode: e.target.value }))}
-                            placeholder="未連携時は空欄可"
-                            className="flex-1 min-w-0 px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono font-bold text-indigo-900 focus:ring-1 focus:ring-indigo-500"
-                          />
-                          {(infoForm.siteCode || '').trim() && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                const codeVal = (infoForm.siteCode || '').trim();
-                                const prevCode = (currentSite.siteCode || '').trim();
-                                if (codeVal) {
-                                  setIsEditingInfo(false);
-                                  syncInventoryStatus(
-                                    { ...currentSite, ...infoForm, siteCode: codeVal } as Site,
-                                    { overrideSiteCode: codeVal, previousSiteCode: prevCode, manual: true }
-                                  );
-                                }
-                              }}
-                              disabled={isLoadingSubParts}
-                              className="px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-[11px] font-bold whitespace-nowrap flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                              title="入力した現場コードで在庫DBから部品を取り込みます"
-                            >
-                              <RefreshCw className={`w-3 h-3 ${isLoadingSubParts ? 'animate-spin' : ''}`} />
-                              在庫取込
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">現場名</label>
-                        <input
-                          type="text"
-                          value={infoForm.siteName || ''}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, siteName: e.target.value }))}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">元請 / 取引先</label>
-                        <input
-                          type="text"
-                          value={infoForm.customerName || ''}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, customerName: e.target.value }))}
-                          placeholder="例: 株式会社〇〇建設"
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">図面番号</label>
-                        <input
-                          type="text"
-                          value={infoForm.orderNo || ''}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, orderNo: e.target.value }))}
-                          placeholder="例: DRW-2026-001"
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-mono text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-[11px] font-bold text-slate-700 mb-0.5">施工場所 / 住所</label>
-                      <input
-                        type="text"
-                        value={infoForm.address || ''}
-                        onChange={(e) => setInfoForm(prev => ({ ...prev, address: e.target.value }))}
-                        placeholder="例: 東京都千代田区〇〇 1-2-3"
-                        className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                      />
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">EG台数</label>
-                        <input
-                          type="number"
-                          min={1}
-                          value={infoForm.egCount ?? 1}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, egCount: Math.max(1, parseInt(e.target.value, 10) || 1) }))}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">着工日</label>
-                        <input
-                          type="date"
-                          value={infoForm.startDate || ''}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, startDate: e.target.value }))}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">完工日</label>
-                        <input
-                          type="date"
-                          value={infoForm.endDate || ''}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, endDate: e.target.value }))}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">主な施工日</label>
-                        <input
-                          type="date"
-                          value={infoForm.constructionDate || ''}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, constructionDate: e.target.value }))}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">主担当施工者</label>
-                        <select
-                          value={infoForm.primaryWorkerId || ''}
-                          onChange={(e) => {
-                            const u = allUsers.find(x => x.id === e.target.value);
-                            setInfoForm(prev => ({
-                              ...prev,
-                              primaryWorkerId: e.target.value,
-                              primaryWorkerName: u?.name || ''
-                            }));
-                          }}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        >
-                          <option value="">未割り当て</option>
-                          {allUsers.map(u => (
-                            <option key={u.id} value={u.id}>{u.name}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="block text-[11px] font-bold text-slate-700 mb-0.5">全体進捗</label>
-                        <select
-                          value={infoForm.status || 'not_started'}
-                          onChange={(e) => setInfoForm(prev => ({ ...prev, status: e.target.value as SiteStatus }))}
-                          className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-bold text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                        >
-                          <option value="not_started">未着手</option>
-                          <option value="in_progress">施工進行中</option>
-                          <option value="completed">全施工完了</option>
-                          <option value="on_hold">保留</option>
-                        </select>
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-[11px] font-bold text-slate-700 mb-0.5">備考 / 特記事項</label>
-                      <textarea
-                        rows={2}
-                        value={infoForm.notes || ''}
-                        onChange={(e) => setInfoForm(prev => ({ ...prev, notes: e.target.value }))}
-                        placeholder="特記事項や現場注意点を記入..."
-                        className="w-full px-2.5 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                      />
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              {/* 現場コード連携・在庫データベース情報取り込みカード */}
-              <div className="p-4 bg-indigo-50/50 rounded-xl border border-indigo-200/80 space-y-3 text-xs">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <Database className="w-4 h-4 text-indigo-600 shrink-0" />
-                    <div>
-                      <h5 className="font-bold text-sm text-indigo-950">
-                        現場コード連携・在庫情報取り込み / 入出庫同期
-                      </h5>
-                      <p className="text-[11px] text-indigo-700">
-                        {currentSite.siteCode
-                          ? `現在「${currentSite.siteCode}」と連携中です（画面を開くたびに入庫日・出庫日を監視して自動更新します）。`
-                          : '先行登録された現場に後から現場コードを紐づけ、在庫DBから部品・入出庫情報を一括取り込みできます。'}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    {currentSite.siteCode && (
-                      <button
-                        type="button"
-                        onClick={() => syncInventoryStatus(currentSite, { manual: true })}
-                        disabled={isLoadingSubParts}
-                        className="px-3 py-1.5 bg-white hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
-                      >
-                        <RefreshCw className={`w-3.5 h-3.5 ${isLoadingSubParts ? 'animate-spin' : ''}`} />
-                        <span>今すぐ入出庫を同期</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => setShowInventoryLinker(prev => !prev)}
-                      className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer"
-                    >
-                      {showInventoryLinker ? '閉じる' : (currentSite.siteCode ? '別コードで取込・変更' : '現場コードを検索/連携')}
-                    </button>
-                  </div>
-                </div>
-
-                {showInventoryLinker && (
-                  <div className="pt-2 border-t border-indigo-200/80 space-y-3">
-                    {/* 直接現場コード指定取込 */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <div className="space-y-1">
-                        <label className="block text-[11px] font-bold text-indigo-900">
-                          ① 現場コードを直接指定して在庫取込
-                        </label>
-                        <div className="flex gap-1.5">
-                          <input
-                            type="text"
-                            value={inventoryCodeInput}
-                            onChange={(e) => setInventoryCodeInput(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault();
-                                syncInventoryStatus(currentSite, { overrideSiteCode: inventoryCodeInput, manual: true });
-                              }
-                            }}
-                            placeholder="例: NHQ136A"
-                            className="flex-1 px-2.5 py-1.5 bg-white border border-indigo-200 rounded-lg text-xs font-mono font-bold text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => syncInventoryStatus(currentSite, { overrideSiteCode: inventoryCodeInput, manual: true })}
-                            disabled={isLoadingSubParts || !inventoryCodeInput.trim()}
-                            className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white rounded-lg text-xs font-bold flex items-center gap-1 whitespace-nowrap transition-colors cursor-pointer"
-                          >
-                            {isLoadingSubParts ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
-                            <span>取込実行</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      {/* キーワード検索で現場コードを探索 */}
-                      <div className="space-y-1">
-                        <label className="block text-[11px] font-bold text-indigo-900">
-                          ② 在庫DBから現場名・コードで検索して連携
-                        </label>
-                        <div className="flex gap-1.5">
-                          <input
-                            type="text"
-                            value={inventorySearchQuery}
-                            onChange={(e) => setInventorySearchQuery(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault();
-                                handleSearchInventoryForSite();
-                              }
-                            }}
-                            placeholder={currentSite.siteName || '現場名やコードを入力...'}
-                            className="flex-1 px-2.5 py-1.5 bg-white border border-indigo-200 rounded-lg text-xs text-slate-800 focus:ring-1 focus:ring-indigo-500"
-                          />
-                          <button
-                            type="button"
-                            onClick={handleSearchInventoryForSite}
-                            disabled={isSearchingInventory || !inventorySearchQuery.trim()}
-                            className="px-3 py-1.5 bg-white hover:bg-indigo-100 disabled:opacity-50 text-indigo-700 border border-indigo-300 rounded-lg text-xs font-bold flex items-center gap-1 whitespace-nowrap transition-colors cursor-pointer"
-                          >
-                            {isSearchingInventory ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Search className="w-3.5 h-3.5" />}
-                            <span>検索</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-
-                    {inventoryLookupError && (
-                      <p className="text-xs text-rose-600 font-semibold">{inventoryLookupError}</p>
-                    )}
-
-                    {inventorySearchResults.length > 0 && (
-                      <div className="bg-white border border-indigo-200 rounded-lg p-2 max-h-44 overflow-y-auto space-y-1">
-                        <div className="text-[11px] font-bold text-slate-500 px-2 py-0.5">
-                          在庫DB検索結果 ({inventorySearchResults.length}件) - クリックで現場コード連携＆在庫取込:
-                        </div>
-                        {inventorySearchResults.map((res, i) => {
-                          const codeVal = res.code || res.siteCode || '';
-                          const nameVal = res.name || res.siteName || '（名称未設定）';
-                          return (
-                            <button
-                              key={i}
-                              type="button"
-                              onClick={() => {
-                                if (codeVal) {
-                                  setInventoryCodeInput(codeVal);
-                                  setInventorySearchResults([]);
-                                  syncInventoryStatus(currentSite, { overrideSiteCode: codeVal, manual: true });
-                                }
-                              }}
-                              className="w-full text-left p-2 hover:bg-indigo-50 rounded-lg flex items-center justify-between gap-2 border border-slate-100 hover:border-indigo-200 transition-colors cursor-pointer"
-                            >
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className="font-mono font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded">
-                                  {codeVal || '(コードなし)'}
-                                </span>
-                                <span className="font-bold text-slate-800">{nameVal}</span>
-                                {res.customerName && <span className="text-slate-500">({res.customerName})</span>}
-                                {res.egCount !== undefined && res.egCount > 0 ? (
-                                  <span className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">EG: {res.egCount}台</span>
-                                ) : null}
-                              </div>
-                              <span className="text-indigo-600 font-bold shrink-0">連携・取込 →</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* 施工担当者 & 施工スケジュール */}
-              <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-3 text-xs">
-                <div className="flex items-center justify-between border-b border-slate-200 pb-2">
-                  <h5 className="font-bold text-sm text-slate-800 flex items-center gap-2">
-                    <HardHat className="w-4 h-4 text-amber-600" />
-                    <span>施工担当者 & 施工スケジュール</span>
-                  </h5>
-                  <span className="text-[10px] bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full font-bold">
-                    {siteEvents.length} 件の予定・実績
-                  </span>
-                </div>
-
-                {siteEvents.length === 0 ? (
-                  <div className="p-4 bg-white rounded-xl border border-slate-200 flex flex-col sm:flex-row items-center justify-between gap-3 shadow-2xs">
-                    <div className="flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-full bg-slate-100 text-slate-500 flex items-center justify-center shrink-0">
-                        <UserIcon className="w-5 h-5" />
-                      </div>
-                      <div>
-                        <div className="font-bold text-slate-800">
-                          主担当施工者:{' '}
-                          {currentSite.primaryWorkerName || currentSite.primaryWorkerId ? (
-                            <button
-                              type="button"
-                              onClick={() => triggerOpenUserModal(currentSite.primaryWorkerId || currentSite.primaryWorkerName)}
-                              className="hover:text-indigo-600 hover:underline transition-colors cursor-pointer"
-                              title="主担当施工者の社員詳細を表示"
-                            >
-                              {currentSite.primaryWorkerName}
-                            </button>
-                          ) : (
-                            '未割当'
-                          )}
-                        </div>
-                        <div className="text-[11px] text-slate-400 mt-0.5">
-                          カレンダー画面で本現場を選択して施工予定を追加できます
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (onNavigateToCalendar) {
-                          const primaryUser = allUsers.find(
-                            u =>
-                              (currentSite.primaryWorkerId && String(u.id) === String(currentSite.primaryWorkerId)) ||
-                              (currentSite.primaryWorkerName && u.name === currentSite.primaryWorkerName)
-                          );
-                          onClose();
-                          onNavigateToCalendar('', currentSite.constructionDate || currentSite.startDate, primaryUser);
-                        }
-                      }}
-                      className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold rounded-lg border border-indigo-200 flex items-center gap-1.5 transition-colors cursor-pointer text-xs shrink-0"
-                    >
-                      <Calendar className="w-3.5 h-3.5 text-indigo-600" />
-                      <span>カレンダーで開く</span>
-                      <ExternalLink className="w-3 h-3 text-indigo-600" />
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-3">
-                    {siteEvents.map((evt, idx) => {
-                      const startDate = new Date(evt.start);
-                      const endDate = evt.end ? new Date(evt.end) : null;
-                      const isPast = startDate.getTime() < Date.now();
-                      const phase = evt.constructionPhase || (
-                        evt.title.includes('新規') ? 'new' :
-                        evt.title.includes('出庫') ? 'shukko' :
-                        evt.title.includes('残') ? 'remaining' : undefined
-                      );
-
-                      const attendees = (evt.attendees && evt.attendees.length > 0)
-                        ? evt.attendees
-                        : (evt.createdBy ? [evt.createdBy] : []);
-
-                      const dateDisplay = startDate.toLocaleDateString('ja-JP', {
-                        timeZone: 'Asia/Tokyo',
-                        year: 'numeric',
-                        month: 'long',
-                        day: 'numeric',
-                        weekday: 'short'
-                      });
-
-                      const timeDisplay = evt.isAllDay
-                        ? '終日'
-                        : `${startDate.toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit' })}${
-                            endDate ? ` 〜 ${endDate.toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit' })}` : ''
-                          }`;
-
-                      return (
-                        <div
-                          key={evt.id || idx}
-                          className="p-3.5 bg-white border border-slate-200 hover:border-indigo-300 rounded-xl shadow-2xs hover:shadow-xs transition-all space-y-2.5"
-                        >
-                          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-2">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              {/* 乗り込み種別バッジ */}
-                              {phase === 'new' && (
-                                <span className="px-2.5 py-0.5 rounded-md text-xs font-black bg-emerald-600 text-white shadow-2xs">
-                                  【新規乗り込み】
-                                </span>
-                              )}
-                              {phase === 'remaining' && (
-                                <span className="px-2.5 py-0.5 rounded-md text-xs font-black bg-amber-500 text-white shadow-2xs">
-                                  【残工事】
-                                </span>
-                              )}
-                              {phase === 'shukko' && (
-                                <span className="px-2.5 py-0.5 rounded-md text-xs font-black bg-indigo-600 text-white shadow-2xs">
-                                  【出庫有】
-                                </span>
-                              )}
-                              {!phase && (
-                                <span className="px-2 py-0.5 rounded-md text-xs font-bold bg-slate-100 text-slate-700 border border-slate-200">
-                                  工事
-                                </span>
-                              )}
-
-                              {/* 状態バッジ */}
-                              {isPast ? (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
-                                  施工済（実績）
-                                </span>
-                              ) : (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-50 text-blue-700 border border-blue-200">
-                                  施工予定
-                                </span>
-                              )}
-
-                              <span className="font-extrabold text-sm text-slate-900">
-                                {evt.title}
-                              </span>
-                            </div>
-
-                            <div className="flex items-center gap-1.5 text-xs font-mono font-bold text-slate-700 bg-slate-50 px-2.5 py-1 rounded-lg border border-slate-200">
-                              <Clock className="w-3.5 h-3.5 text-indigo-500" />
-                              <span>{dateDisplay} {timeDisplay}</span>
-                            </div>
-                          </div>
-
-                          {/* 施工担当者 */}
-                          <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="text-slate-400 font-semibold flex items-center gap-1">
-                                <UserIcon className="w-3.5 h-3.5" />
-                                <span>施工担当者:</span>
-                              </span>
-                              {attendees.length > 0 ? (
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  {attendees.map(u => (
-                                    <button
-                                      key={u.id}
-                                      type="button"
-                                      onClick={() => triggerOpenUserModal(u)}
-                                      className="flex items-center gap-1.5 bg-slate-50 hover:bg-indigo-50 px-2.5 py-0.5 rounded-full border border-slate-200 hover:border-indigo-300 transition-colors cursor-pointer group/att"
-                                      title={`${u.name} さんの社員詳細を表示`}
-                                    >
-                                      <img
-                                        src={getAvatarUrl(u.avatarUrl)}
-                                        onError={handleAvatarError}
-                                        alt={u.name}
-                                        className="w-4 h-4 rounded-full object-cover"
-                                      />
-                                      <span className="font-bold text-slate-800 group-hover/att:text-indigo-700">{u.name}</span>
-                                      {u.department && (
-                                        <span className="text-[10px] text-slate-400">({u.department})</span>
-                                      )}
-                                    </button>
-                                  ))}
-                                </div>
-                              ) : (
-                                <span className="text-slate-400">未指定</span>
-                              )}
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (onNavigateToCalendar) {
-                                  const firstAtt = attendees[0];
-                                  const evtUser =
-                                    (firstAtt &&
-                                      allUsers.find(
-                                        u =>
-                                          String(u.id) === String(firstAtt.id) ||
-                                          (firstAtt.name && u.name === firstAtt.name)
-                                      )) ||
-                                    firstAtt ||
-                                    allUsers.find(
-                                      u =>
-                                        (currentSite.primaryWorkerId && String(u.id) === String(currentSite.primaryWorkerId)) ||
-                                        (currentSite.primaryWorkerName && u.name === currentSite.primaryWorkerName)
-                                    );
-                                  onClose();
-                                  onNavigateToCalendar(evt.id, evt.start, evtUser);
-                                }
-                              }}
-                              className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-200 shadow-2xs transition-all cursor-pointer"
-                              title="該当担当者のチーム予定表に移動してこの予定を表示"
-                            >
-                              <Calendar className="w-3.5 h-3.5 text-indigo-600" />
-                              <span>カレンダーで開く</span>
-                              <ExternalLink className="w-3 h-3 text-indigo-600" />
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* 現場削除 */}
-              <div className="pt-4 border-t border-slate-200 flex justify-end">
-                <button
-                  type="button"
-                  onClick={handleDelete}
-                  className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  この現場を削除
-                </button>
-              </div>
-            </div>
+            <SiteDashboardTab
+              currentSite={currentSite}
+              allUsers={allUsers}
+              siteEvents={siteEvents}
+              drawings={getSiteDrawingList(currentSite)}
+              normalizeDrawingPath={normalizeDrawingPath}
+              isImageAttachment={isImageAttachment}
+              isEditingInfo={isEditingInfo}
+              infoForm={infoForm}
+              setInfoForm={setInfoForm}
+              isSaving={isSaving}
+              onStartEditInfo={handleStartEditInfo}
+              onSaveInfo={handleSaveInfo}
+              onCancelEditInfo={handleCancelEditInfo}
+              commentInput={commentInput}
+              onCommentInputChange={setCommentInput}
+              isSubmittingComment={isSubmittingComment}
+              onAddComment={handleAddComment}
+              onSwitchTab={(tab, options) => {
+                setActiveTab(tab);
+                if (options?.openInventoryLinker) {
+                  setShowInventoryLinker(true);
+                }
+              }}
+              onOpenPreview={(file) => {
+                setPreviewFile(file);
+                setIsPreviewOpen(true);
+              }}
+              onOpenCalendarEvent={(eventId, date, targetUser) => {
+                if (onNavigateToCalendar) {
+                  onClose();
+                  onNavigateToCalendar(eventId, date, targetUser);
+                }
+              }}
+              onDeleteSite={handleDelete}
+            />
           )}
 
-          {/* TAB 4: 帳票・Excel・自主検査 */}
+          {/* TAB 4: 自主検査書・Excel */}
           {activeTab === 'export' && (
-            <div className="space-y-4">
-              <div className="p-4 bg-emerald-50/60 border border-emerald-200 rounded-xl space-y-2">
-                <h5 className="font-bold text-sm text-emerald-900 flex items-center gap-1.5">
-                  <FileSpreadsheet className="w-4 h-4 text-emerald-700" />
-                  CRM連携用 Excel/CSV データ出力
-                </h5>
-                <p className="text-xs text-emerald-700">
-                  本現場の基本情報、EG台数、1台ごとに分割展開された部品施工情報（出庫日・施工日・施工者・進捗）をCRM取り込み形式で出力します。
-                </p>
-                <div className="pt-2">
-                  <button
-                    onClick={handleExportCsv}
-                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
-                  >
-                    <Download className="w-4 h-4" />
-                    施工データ CSV (Excel対応) を出力
-                  </button>
-                </div>
-              </div>
-
-              <div className="p-4 bg-blue-50/60 border border-blue-200 rounded-xl space-y-2">
-                <h5 className="font-bold text-sm text-blue-900 flex items-center gap-1.5">
-                  <FileText className="w-4 h-4 text-blue-700" />
-                  自主検査床 PDF / 帳票出力プレビュー
-                </h5>
-                <p className="text-xs text-blue-700">
-                  施工後の自主検査床チェックリストおよび完了報告帳票の出力基盤です。
-                </p>
-                <div className="pt-1">
-                  <button
-                    onClick={() => window.print()}
-                    className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
-                  >
-                    <FileText className="w-4 h-4" />
-                    自主検査帳票を印刷 / PDFプレビュー
-                  </button>
-                </div>
-              </div>
-            </div>
+            <SiteSelfInspectionTab
+              currentSite={currentSite}
+              currentUser={currentUser}
+              offices={offices}
+              liveSubParts={subParts}
+            />
           )}
 
           {/* TAB 5: 施工スケジュール・実績タイムライン */}
@@ -2509,25 +2000,49 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                   <h4 className="font-extrabold text-sm text-slate-900 flex items-center gap-2">
                     <HardHat className="w-4 h-4 text-amber-600" />
                     <span>現場施工スケジュール・施工実績</span>
-                    <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                    <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-mono tabular-nums">
                       計 {siteEvents.length} 件
                     </span>
                   </h4>
                   <p className="text-xs text-slate-500 mt-1">
-                    カレンダーの工事予定で本現場が紐付けられたスケジュールです。いつ・誰が・どの乗り込み種別で施工したか（施工予定か）を確認できます。
+                    カレンダーの工事予定で本現場が紐付けられたスケジュールです。ここから工務メンバーを指定して直接スケジュール登録できます。
                   </p>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingScheduleEvent(null);
+                    setIsScheduleModalOpen(true);
+                  }}
+                  className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>施工予定を登録</span>
+                </button>
               </div>
 
               {siteEvents.length === 0 ? (
-                <div className="p-8 text-center bg-slate-50 border border-dashed border-slate-200 rounded-2xl">
-                  <div className="w-12 h-12 rounded-full bg-amber-50 text-amber-600 flex items-center justify-center mx-auto mb-3">
+                <div className="p-8 text-center bg-slate-50 border border-dashed border-slate-200 rounded-2xl space-y-3">
+                  <div className="w-12 h-12 rounded-full bg-amber-50 text-amber-600 flex items-center justify-center mx-auto">
                     <Calendar className="w-6 h-6" />
                   </div>
-                  <h5 className="font-bold text-sm text-slate-800">施工スケジュールはまだ登録されていません</h5>
-                  <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
-                    カレンダー画面の「予定を追加」から「工事」を選択し、現場名として「{currentSite.siteName}」を選択・登録すると、本画面に施工履歴・予定が自動集約されます。
-                  </p>
+                  <div>
+                    <h5 className="font-bold text-sm text-slate-800">施工スケジュールはまだ登録されていません</h5>
+                    <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto leading-relaxed">
+                      下のボタンから「{currentSite.siteName}」の施工日時・担当メンバー（工務初期フィルタ済）を指定して直接登録できます。
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEditingScheduleEvent(null);
+                      setIsScheduleModalOpen(true);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition-colors cursor-pointer shadow-2xs whitespace-nowrap"
+                  >
+                    <Plus className="w-4 h-4" />
+                    <span>施工予定を登録する</span>
+                  </button>
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -2659,8 +2174,22 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                           </div>
                         )}
 
-                        {/* カレンダー遷移アクション */}
-                        <div className="flex items-center justify-end pt-1 border-t border-slate-100">
+                        {/* カレンダー遷移・編集アクション */}
+                        <div className="flex items-center justify-end gap-2 pt-1 border-t border-slate-100">
+                          {!evt.isIcal && onUpdateEvent && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingScheduleEvent(evt);
+                                setIsScheduleModalOpen(true);
+                              }}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold text-slate-700 bg-white hover:bg-slate-50 rounded-lg border border-slate-200 transition-colors cursor-pointer whitespace-nowrap"
+                              title="この施工予定を編集"
+                            >
+                              <Edit3 className="w-3.5 h-3.5 text-slate-500" />
+                              <span>編集</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => {
@@ -2683,7 +2212,7 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                                 onNavigateToCalendar(evt.id, evt.start, evtUser);
                               }
                             }}
-                            className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-200 shadow-2xs hover:shadow-xs transition-all cursor-pointer"
+                            className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-bold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg border border-indigo-200 shadow-2xs hover:shadow-xs transition-all cursor-pointer whitespace-nowrap"
                             title="該当担当者のチーム予定表に移動してこの予定を表示"
                           >
                             <Calendar className="w-3.5 h-3.5 text-indigo-600" />
@@ -2751,6 +2280,81 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
       <ConfirmModal
         {...confirmModal}
         onClose={() => setConfirmModal((prev) => ({ ...prev, isOpen: false }))}
+      />
+
+      {/* 施工スケジュール新規登録・編集モーダル（EventModal流用・工務メンバー初期フィルタ） */}
+      <EventModal
+        isOpen={isScheduleModalOpen}
+        onClose={() => {
+          setIsScheduleModalOpen(false);
+          setEditingScheduleEvent(null);
+        }}
+        onSave={async (eventData, scope, originalInstanceDate) => {
+          const isEditingExisting = Boolean('id' in eventData && eventData.id);
+          if (isEditingExisting) {
+            if (onUpdateEvent) {
+              await onUpdateEvent(eventData as CalendarEvent, scope, originalInstanceDate);
+            }
+          } else if (onAddEvent) {
+            await onAddEvent(eventData as Omit<CalendarEvent, 'id'>);
+          } else {
+            try {
+              const payload = {
+                ...eventData,
+                category: eventData.type,
+                startAt: eventData.start,
+                endAt: eventData.end || eventData.start,
+                isAllDay: eventData.isAllDay ? 1 : 0,
+                createdBy: eventData.createdBy || currentUser,
+                createdById: (eventData.createdBy || currentUser)?.id,
+                userId: (eventData.createdBy || currentUser)?.id,
+              };
+              const res = await fetch(`${API_BASE_URL}/events`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+              if (res.ok) {
+                const json = await res.json();
+                const savedEvent: CalendarEvent = json.event || {
+                  ...(eventData as Omit<CalendarEvent, 'id'>),
+                  id: String(json.id || `e-site-${Date.now()}`),
+                  createdBy: eventData.createdBy || currentUser,
+                };
+                setFetchedEvents((prev) => [...prev, savedEvent]);
+              }
+            } catch (err) {
+              console.error('Failed to save site schedule event:', err);
+            }
+          }
+          setIsScheduleModalOpen(false);
+          setEditingScheduleEvent(null);
+        }}
+        onDelete={onDeleteEvent}
+        editingEvent={editingScheduleEvent}
+        defaultType="construction"
+        defaultSite={currentSite}
+        defaultInitialDate={(() => {
+          const cd = (currentSite.constructionDate || '').trim().slice(0, 10);
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(cd)) return undefined;
+          const todayJst = new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Asia/Tokyo',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).format(new Date());
+          return cd >= todayJst ? cd : undefined;
+        })()}
+        defaultIsAllDay={false}
+        defaultDivisionFilter="工務"
+        defaultMemberSelectorExpanded={true}
+        zIndexClass="z-[60]"
+        offices={offices}
+        divisions={divisions}
+        allUsers={allUsers}
+        currentUser={currentUser}
+        sites={sites.length > 0 ? sites : [currentSite]}
+        allEvents={(events && events.length > 0) ? events : fetchedEvents}
       />
     </div>
   );
