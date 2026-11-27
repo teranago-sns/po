@@ -24,7 +24,10 @@ export interface SiteMainPart {
 
 export interface SiteSubPart {
   id: string;
+  fittingNo?: string;
   partCode: string;
+  partSpec?: string;
+  partCategory?: string;
   partName: string;
   quantity: number;
   unit: string;

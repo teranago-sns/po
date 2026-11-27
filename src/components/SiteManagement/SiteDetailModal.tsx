@@ -3,7 +3,8 @@ import {
   X, Layers, Calendar, User as UserIcon, Building, MapPin, 
   ExternalLink, MessageSquare, Send, CheckCircle2, Clock, 
   FileText, Paperclip, Trash2, Edit3, Save, RefreshCw, AlertCircle, FileSpreadsheet, Download, Eye, HardHat,
-  Camera, Upload, UploadCloud, Image as ImageIcon, Loader2, Database, Search, LayoutDashboard, Plus
+  Camera, Upload, UploadCloud, Image as ImageIcon, Loader2, Database, Search, LayoutDashboard, Plus,
+  ChevronDown, ChevronRight
 } from 'lucide-react';
 import { Site, SiteMainPart, SiteSubPart, SiteComment, SiteStatus, PartStatus, SiteAttachment, ExternalSiteLookupResult } from '../../types/site';
 import { User, AttachmentFile, CalendarEvent, OfficeMaster, DivisionMaster } from '../../types';
@@ -14,7 +15,7 @@ import { FilePreviewModal } from '../FilePreviewModal';
 import { ConfirmModal, ConfirmModalState } from '../ConfirmModal';
 import { EventModal } from '../EventModal';
 import { RecurrenceActionScope } from '../RecurrenceActionModal';
-import { getFittingLabel, cleanPartName, expandExternalSitePayload, mergeInventorySyncWithSite, deriveInventoryPartStatus, normalizeExternalDate } from '../../utils/siteUtils';
+import { getFittingLabel, cleanPartName, expandExternalSitePayload, mergeInventorySyncWithSite, deriveInventoryPartStatus, normalizeExternalDate, groupSubPartsByFitting, normalizeFittingKey, SubPartFittingGroup } from '../../utils/siteUtils';
 import { uploadFile, resolveFileUrl } from '../../utils/fileUpload';
 import { SiteDashboardTab } from './SiteDashboardTab';
 import { SiteSelfInspectionTab } from './SiteSelfInspectionTab';
@@ -219,12 +220,136 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
   // 付属部品の外部在庫DBリアルタイム取得・入出庫ステータス監視
   const [subParts, setSubParts] = useState<SiteSubPart[]>(site?.subPartsCache || []);
   const [isLoadingSubParts, setIsLoadingSubParts] = useState(false);
+  const [expandedSubPartGroups, setExpandedSubPartGroups] = useState<Record<string, boolean>>({});
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [syncNotice, setSyncNotice] = useState<{
     type: 'success' | 'info' | 'warning';
     message: string;
     timestamp: string;
   } | null>(null);
+
+  const subPartGroups = useMemo(
+    () => groupSubPartsByFitting(subParts, currentSite?.mainParts || []),
+    [subParts, currentSite?.mainParts]
+  );
+
+  const matchedSubPartGroups = useMemo(
+    () => subPartGroups.filter((g) => g.matchedMainPart),
+    [subPartGroups]
+  );
+
+  const unmatchedSubPartGroups = useMemo(
+    () => subPartGroups.filter((g) => !g.matchedMainPart),
+    [subPartGroups]
+  );
+
+  const unmatchedSubPartsTotalCount = useMemo(
+    () => unmatchedSubPartGroups.reduce((sum, g) => sum + g.counts.total, 0),
+    [unmatchedSubPartGroups]
+  );
+
+  // 各主要部品インデックスに紐づく付属部品グループ（同一建具符号が複数台ある場合は先頭行に1回だけ紐づけ）
+  const mainPartSubGroupByIdx = useMemo(() => {
+    const map = new Map<number, SubPartFittingGroup>();
+    const mainPartsList = currentSite?.mainParts || [];
+    const byKey = new Map(matchedSubPartGroups.map((g) => [g.key, g]));
+    const assignedKeys = new Set<string>();
+    mainPartsList.forEach((mp, idx) => {
+      const rawFit = String(mp.fittingNo || '').trim() || getFittingLabel(mp, idx, currentSite?.egCount || mainPartsList.length);
+      const key = normalizeFittingKey(rawFit);
+      if (key && byKey.has(key) && !assignedKeys.has(key)) {
+        assignedKeys.add(key);
+        map.set(idx, byKey.get(key)!);
+      }
+    });
+    return map;
+  }, [currentSite?.mainParts, currentSite?.egCount, matchedSubPartGroups]);
+
+  const allMatchedSubGroupsExpanded =
+    matchedSubPartGroups.length > 0 && matchedSubPartGroups.every((g) => Boolean(expandedSubPartGroups[g.key]));
+
+  const allUnmatchedSubGroupsExpanded =
+    unmatchedSubPartGroups.length > 0 && unmatchedSubPartGroups.every((g) => Boolean(expandedSubPartGroups[g.key]));
+
+  const toggleSubPartGroup = (groupKey: string) => {
+    setExpandedSubPartGroups((prev) => ({ ...prev, [groupKey]: !prev[groupKey] }));
+  };
+
+  const handleToggleAllMatchedSubPartGroups = () => {
+    setExpandedSubPartGroups((prev) => {
+      const next = { ...prev };
+      matchedSubPartGroups.forEach((g) => {
+        next[g.key] = !allMatchedSubGroupsExpanded;
+      });
+      return next;
+    });
+  };
+
+  const handleToggleAllUnmatchedSubPartGroups = () => {
+    setExpandedSubPartGroups((prev) => {
+      const next = { ...prev };
+      unmatchedSubPartGroups.forEach((g) => {
+        next[g.key] = !allUnmatchedSubGroupsExpanded;
+      });
+      return next;
+    });
+  };
+
+  const renderSubPartCardGrid = (items: SiteSubPart[], keyPrefix: string) => (
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+      {items.map((sub, i) => {
+        const subStatus = deriveInventoryPartStatus(sub.inStockDate, sub.outStockDate);
+        const specOrCode = (sub.partSpec || sub.partCode || '').trim();
+        const showSpecOrCode = Boolean(specOrCode && specOrCode !== sub.partName);
+        const showCategory = Boolean(sub.partCategory && sub.partCategory.trim());
+        return (
+          <div
+            key={sub.id || `${keyPrefix}-${i}`}
+            className="bg-white p-2 rounded-lg border border-slate-200 text-xs shadow-2xs space-y-1"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div className="font-bold text-slate-800 leading-snug break-words min-w-0">
+                {sub.partName}
+              </div>
+              <span
+                className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 whitespace-nowrap ${
+                  subStatus === 'stock_out'
+                    ? 'bg-blue-100 text-blue-800'
+                    : subStatus === 'stock_in'
+                      ? 'bg-amber-100 text-amber-800'
+                      : 'bg-slate-100 text-slate-600'
+                }`}
+              >
+                {subStatus === 'stock_out' ? '出庫済' : subStatus === 'stock_in' ? '入庫済' : '入庫待ち'}
+              </span>
+            </div>
+            {(showCategory || showSpecOrCode) && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                {showCategory && (
+                  <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 whitespace-nowrap">
+                    {sub.partCategory}
+                  </span>
+                )}
+                {showSpecOrCode && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 text-slate-600 break-all">
+                    {specOrCode}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] text-slate-500 pt-0.5 border-t border-slate-100">
+              <span className="font-semibold text-slate-700 whitespace-nowrap">
+                数量: {sub.quantity}{sub.unit}
+              </span>
+              <span className="text-slate-400">
+                入庫: {normalizeExternalDate(sub.inStockDate) || '未定'} / 出庫: {normalizeExternalDate(sub.outStockDate) || '未定'}
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 
   // 後付け現場コード連携・在庫検索ステート
   const [showInventoryLinker, setShowInventoryLinker] = useState(false);
@@ -260,6 +385,7 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
       setSyncNotice(null);
       setLastSyncedAt(null);
       setSubParts(site.subPartsCache || []);
+      setExpandedSubPartGroups({});
       setInventoryCodeInput(site.siteCode || '');
       setInventorySearchQuery('');
       setInventorySearchResults([]);
@@ -1129,9 +1255,9 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                 )}
               </div>
 
-              {/* 主要部品 (1台ずつ分割管理) */}
+              {/* 主要部品 (1台ずつ分割管理・建具ごとの付属部品トグル付) */}
               <div className="space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <h4 className="font-bold text-sm text-slate-800 flex items-center gap-1.5">
                       <Layers className="w-4 h-4 text-indigo-600" />
@@ -1141,6 +1267,15 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                       現場コード連携時はモーダルを開くたびに入庫日・出庫日・進捗を監視して自動更新します。
                     </p>
                   </div>
+                  {matchedSubPartGroups.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleToggleAllMatchedSubPartGroups}
+                      className="text-[11px] font-semibold px-2.5 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      {allMatchedSubGroupsExpanded ? '付属部品をすべて閉じる' : '付属部品をすべて展開'}
+                    </button>
+                  )}
                 </div>
 
                 {currentSite.mainParts.length === 0 ? (
@@ -1162,169 +1297,274 @@ export const SiteDetailModal: React.FC<SiteDetailModalProps> = ({
                   </div>
                 ) : (
                   <div className="border border-slate-200 rounded-xl overflow-hidden divide-y divide-slate-100 shadow-2xs">
-                    {currentSite.mainParts.map((part, idx) => (
-                      <div key={part.id || idx} className="p-3 bg-white hover:bg-slate-50/50 transition-colors">
-                        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                          <div className="flex items-center gap-3">
-                            {/* 建具番号 (tateguNo) バッジ & インライン編集 */}
-                            <div className="relative group shrink-0">
-                              <input
-                                type="text"
-                                value={part.fittingNo || ''}
-                                placeholder={getFittingLabel(part, idx, currentSite.egCount)}
-                                title="建具番号 (例: AD1, W-1) をクリックして変更・編集可能"
-                                onChange={(e) => handleUpdatePart(part.id, { fittingNo: e.target.value })}
-                                className="w-20 px-2 py-1 text-center font-bold text-xs text-indigo-700 bg-indigo-50/90 hover:bg-white focus:bg-white border border-indigo-200 focus:border-indigo-500 rounded-md shadow-2xs transition-all focus:ring-1 focus:ring-indigo-400 outline-none cursor-pointer"
-                              />
-                              <span className="text-[9px] font-bold text-indigo-500 absolute -top-2 left-1.5 px-0.5 bg-white scale-90 origin-left pointer-events-none">
-                                建具
-                              </span>
-                            </div>
+                    {currentSite.mainParts.map((part, idx) => {
+                      const attachedSubGroup = mainPartSubGroupByIdx.get(idx);
+                      const isAttachedExpanded = attachedSubGroup
+                        ? Boolean(expandedSubPartGroups[attachedSubGroup.key])
+                        : false;
 
-                            <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2">
-                              <span className="text-sm font-bold text-slate-900">
-                                {cleanPartName(part.partName)}
-                              </span>
-                              {(part.partSpec || part.partCode) && (
-                                <span className="text-xs font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md w-fit font-medium">
-                                  {part.partSpec || part.partCode}
+                      return (
+                        <div key={part.id || idx} className="p-3 bg-white hover:bg-slate-50/40 transition-colors">
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                            <div className="flex items-center gap-3">
+                              {/* 建具番号 (tateguNo) バッジ & 真下の付属部品トグル */}
+                              <div className="flex flex-col items-stretch gap-1 shrink-0 w-20">
+                                <div className="relative group">
+                                  <input
+                                    type="text"
+                                    value={part.fittingNo || ''}
+                                    placeholder={getFittingLabel(part, idx, currentSite.egCount)}
+                                    title="建具番号 (例: AD1, W-1) をクリックして変更・編集可能"
+                                    onChange={(e) => handleUpdatePart(part.id, { fittingNo: e.target.value })}
+                                    className="w-20 px-2 py-1 text-center font-bold text-xs text-indigo-700 bg-indigo-50/90 hover:bg-white focus:bg-white border border-indigo-200 focus:border-indigo-500 rounded-md shadow-2xs transition-all focus:ring-1 focus:ring-indigo-400 outline-none cursor-pointer"
+                                  />
+                                  <span className="text-[9px] font-bold text-indigo-500 absolute -top-2 left-1.5 px-0.5 bg-white scale-90 origin-left pointer-events-none">
+                                    建具
+                                  </span>
+                                </div>
+                                {attachedSubGroup && (
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleSubPartGroup(attachedSubGroup.key)}
+                                    title={`建具 ${attachedSubGroup.label} の付属部品 (${attachedSubGroup.counts.total}点) を${isAttachedExpanded ? '閉じる' : '展開'}`}
+                                    className={`w-full px-1 py-0.5 rounded border text-[10px] font-bold flex items-center justify-center gap-0.5 transition-colors cursor-pointer whitespace-nowrap ${
+                                      isAttachedExpanded
+                                        ? 'bg-indigo-600 text-white border-indigo-600'
+                                        : 'bg-slate-50 hover:bg-indigo-50 text-slate-600 hover:text-indigo-700 border-slate-200 hover:border-indigo-300'
+                                    }`}
+                                  >
+                                    {isAttachedExpanded ? (
+                                      <ChevronDown className="w-3 h-3 shrink-0" />
+                                    ) : (
+                                      <ChevronRight className="w-3 h-3 shrink-0" />
+                                    )}
+                                    <span>付属 {attachedSubGroup.counts.total}</span>
+                                  </button>
+                                )}
+                              </div>
+
+                              <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-2">
+                                <span className="text-sm font-bold text-slate-900">
+                                  {cleanPartName(part.partName)}
                                 </span>
-                              )}
-                              {part.serialNo && (
-                                <span className="text-[10px] text-slate-400 font-mono">機番: {part.serialNo}</span>
-                              )}
-                            </div>
-                          </div>
-
-                          {/* 各部品の施工設定コントロール */}
-                          <div className="flex flex-wrap items-center gap-2 text-xs">
-                            {/* 入庫日 */}
-                            <div className="flex items-center gap-1 bg-amber-50/60 border border-amber-200 px-2 py-1 rounded">
-                              <span className="text-[10px] text-amber-700 font-semibold">入庫:</span>
-                              <input
-                                type="date"
-                                value={normalizeExternalDate(part.inStockDate) || ''}
-                                onChange={(e) => handleUpdatePart(part.id, { inStockDate: e.target.value })}
-                                className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer text-slate-700"
-                              />
+                                {(part.partSpec || part.partCode) && (
+                                  <span className="text-xs font-mono text-slate-600 bg-slate-100 border border-slate-200 px-2 py-0.5 rounded-md w-fit font-medium">
+                                    {part.partSpec || part.partCode}
+                                  </span>
+                                )}
+                                {part.serialNo && (
+                                  <span className="text-[10px] text-slate-400 font-mono">機番: {part.serialNo}</span>
+                                )}
+                              </div>
                             </div>
 
-                            {/* 出庫日 */}
-                            <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 px-2 py-1 rounded">
-                              <span className="text-[10px] text-slate-500 font-semibold">出庫:</span>
-                              <input
-                                type="date"
-                                value={normalizeExternalDate(part.outStockDate) || ''}
-                                onChange={(e) => handleUpdatePart(part.id, { outStockDate: e.target.value })}
-                                className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer text-slate-700"
-                              />
-                            </div>
+                            {/* 各部品の施工設定コントロール */}
+                            <div className="flex flex-wrap items-center gap-2 text-xs">
+                              {/* 入庫日 */}
+                              <div className="flex items-center gap-1 bg-amber-50/60 border border-amber-200 px-2 py-1 rounded">
+                                <span className="text-[10px] text-amber-700 font-semibold">入庫:</span>
+                                <input
+                                  type="date"
+                                  value={normalizeExternalDate(part.inStockDate) || ''}
+                                  onChange={(e) => handleUpdatePart(part.id, { inStockDate: e.target.value })}
+                                  className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer text-slate-700"
+                                />
+                              </div>
 
-                            {/* 施工日 */}
-                            <div className="flex items-center gap-1 bg-indigo-50/60 border border-indigo-200 px-2 py-1 rounded">
-                              <span className="text-[10px] text-indigo-700 font-bold">施工:</span>
-                              <input
-                                type="date"
-                                value={normalizeExternalDate(part.constructionDate) || ''}
-                                onChange={(e) => handleUpdatePart(part.id, { constructionDate: e.target.value })}
-                                className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer font-bold text-indigo-900"
-                              />
-                            </div>
+                              {/* 出庫日 */}
+                              <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 px-2 py-1 rounded">
+                                <span className="text-[10px] text-slate-500 font-semibold">出庫:</span>
+                                <input
+                                  type="date"
+                                  value={normalizeExternalDate(part.outStockDate) || ''}
+                                  onChange={(e) => handleUpdatePart(part.id, { outStockDate: e.target.value })}
+                                  className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer text-slate-700"
+                                />
+                              </div>
 
-                            {/* 担当者 */}
-                            <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 px-2 py-1 rounded">
-                              <span className="text-[10px] text-slate-500 font-semibold">担当:</span>
+                              {/* 施工日 */}
+                              <div className="flex items-center gap-1 bg-indigo-50/60 border border-indigo-200 px-2 py-1 rounded">
+                                <span className="text-[10px] text-indigo-700 font-bold">施工:</span>
+                                <input
+                                  type="date"
+                                  value={normalizeExternalDate(part.constructionDate) || ''}
+                                  onChange={(e) => handleUpdatePart(part.id, { constructionDate: e.target.value })}
+                                  className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer font-bold text-indigo-900"
+                                />
+                              </div>
+
+                              {/* 担当者 */}
+                              <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 px-2 py-1 rounded">
+                                <span className="text-[10px] text-slate-500 font-semibold">担当:</span>
+                                <select
+                                  value={part.workerId || currentSite.primaryWorkerId || ''}
+                                  onChange={(e) => {
+                                    const u = allUsers.find(x => x.id === e.target.value);
+                                    handleUpdatePart(part.id, {
+                                      workerId: e.target.value,
+                                      workerName: u?.name || ''
+                                    });
+                                  }}
+                                  className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer font-medium text-slate-800"
+                                >
+                                  <option value="">未割当</option>
+                                  {allUsers.map(u => (
+                                    <option key={u.id} value={u.id}>{u.name}</option>
+                                  ))}
+                                </select>
+                              </div>
+
+                              {/* 進捗ステータス */}
                               <select
-                                value={part.workerId || currentSite.primaryWorkerId || ''}
-                                onChange={(e) => {
-                                  const u = allUsers.find(x => x.id === e.target.value);
-                                  handleUpdatePart(part.id, {
-                                    workerId: e.target.value,
-                                    workerName: u?.name || ''
-                                  });
-                                }}
-                                className="text-[11px] bg-transparent border-none p-0 focus:ring-0 cursor-pointer font-medium text-slate-800"
+                                value={part.status}
+                                onChange={(e) => handleUpdatePart(part.id, { status: e.target.value as PartStatus })}
+                                className={`text-xs font-bold px-2 py-1 rounded border cursor-pointer ${
+                                  part.status === 'constructed' ? 'bg-indigo-100 text-indigo-800 border-indigo-300' :
+                                  part.status === 'inspected' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
+                                  part.status === 'stock_out' ? 'bg-blue-100 text-blue-800 border-blue-300' :
+                                  part.status === 'stock_in' ? 'bg-amber-100 text-amber-800 border-amber-300' :
+                                  'bg-slate-100 text-slate-600 border-slate-200'
+                                }`}
                               >
-                                <option value="">未割当</option>
-                                {allUsers.map(u => (
-                                  <option key={u.id} value={u.id}>{u.name}</option>
-                                ))}
+                                <option value="waiting_stock">入庫待ち</option>
+                                <option value="stock_in">入庫済</option>
+                                <option value="stock_out">出庫済</option>
+                                <option value="constructed">施工済</option>
+                                <option value="inspected">自主検査済</option>
                               </select>
                             </div>
-
-                            {/* 進捗ステータス */}
-                            <select
-                              value={part.status}
-                              onChange={(e) => handleUpdatePart(part.id, { status: e.target.value as PartStatus })}
-                              className={`text-xs font-bold px-2 py-1 rounded border cursor-pointer ${
-                                part.status === 'constructed' ? 'bg-indigo-100 text-indigo-800 border-indigo-300' :
-                                part.status === 'inspected' ? 'bg-emerald-100 text-emerald-800 border-emerald-300' :
-                                part.status === 'stock_out' ? 'bg-blue-100 text-blue-800 border-blue-300' :
-                                part.status === 'stock_in' ? 'bg-amber-100 text-amber-800 border-amber-300' :
-                                'bg-slate-100 text-slate-600 border-slate-200'
-                              }`}
-                            >
-                              <option value="waiting_stock">入庫待ち</option>
-                              <option value="stock_in">入庫済</option>
-                              <option value="stock_out">出庫済</option>
-                              <option value="constructed">施工済</option>
-                              <option value="inspected">自主検査済</option>
-                            </select>
                           </div>
+
+                          {/* 該当建具の付属部品（トグル展開時のみ真下に表示） */}
+                          {attachedSubGroup && isAttachedExpanded && (
+                            <div className="mt-2.5 pt-2.5 px-3 pb-3 -mx-3 -mb-3 border-t border-indigo-100 bg-slate-50/80 space-y-2">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="text-[11px] font-bold text-indigo-800">
+                                  建具 {attachedSubGroup.label} の付属部品（{attachedSubGroup.counts.total}点）
+                                </span>
+                                <div className="flex items-center gap-1.5">
+                                  {attachedSubGroup.counts.stockOut > 0 && (
+                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 whitespace-nowrap">
+                                      出庫済 {attachedSubGroup.counts.stockOut}
+                                    </span>
+                                  )}
+                                  {attachedSubGroup.counts.stockIn > 0 && (
+                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 whitespace-nowrap">
+                                      入庫済 {attachedSubGroup.counts.stockIn}
+                                    </span>
+                                  )}
+                                  {attachedSubGroup.counts.waiting > 0 && (
+                                    <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-200/80 text-slate-600 whitespace-nowrap">
+                                      待ち {attachedSubGroup.counts.waiting}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                              {renderSubPartCardGrid(attachedSubGroup.items, `main-${attachedSubGroup.key}`)}
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
 
-              {/* 付属部品 (在庫DB都度照会・表示) */}
+              {/* その他の付属部品一覧（建具符号なし・EG対象外） */}
               <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     <h5 className="font-bold text-xs text-slate-700">
-                      付属部品一覧 (在庫データベース連携・自動監視)
+                      その他の付属部品一覧（建具符号なし・EG対象外）
                     </h5>
+                    {unmatchedSubPartsTotalCount > 0 && (
+                      <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-slate-200/80 text-slate-700 whitespace-nowrap">
+                        計 {unmatchedSubPartsTotalCount}点
+                      </span>
+                    )}
                     {isLoadingSubParts && (
                       <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-600" />
                     )}
                   </div>
-                  <span className="text-[10px] text-slate-400">
-                    ※ 現場コード連動時に入庫日・出庫日を最新化します
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {unmatchedSubPartGroups.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleToggleAllUnmatchedSubPartGroups}
+                        className="text-[11px] font-semibold px-2.5 py-1 rounded-md border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 transition-colors cursor-pointer whitespace-nowrap"
+                      >
+                        {allUnmatchedSubGroupsExpanded ? 'すべて閉じる' : 'すべて展開'}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {subParts.length === 0 ? (
                   <div className="text-xs text-slate-400 italic">
                     付属部品データはありません。
                   </div>
+                ) : unmatchedSubPartGroups.length === 0 ? (
+                  <div className="text-xs text-slate-500">
+                    すべての付属部品（計 {subParts.length}点）は上の各建具の真下に紐づけて表示しています。
+                  </div>
                 ) : (
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                    {subParts.map((sub, i) => {
-                      const subStatus = deriveInventoryPartStatus(sub.inStockDate, sub.outStockDate);
+                  <div className="space-y-2">
+                    {unmatchedSubPartGroups.map((group) => {
+                      const isExpanded = Boolean(expandedSubPartGroups[group.key]);
                       return (
-                        <div key={i} className="bg-white p-2.5 rounded-lg border border-slate-200 text-xs shadow-2xs space-y-1">
-                          <div className="flex items-center justify-between gap-1">
-                            <div className="font-bold text-slate-800 truncate">{sub.partCode || '型番未設定'}</div>
-                            <span
-                              className={`text-[9px] font-bold px-1.5 py-0.5 rounded shrink-0 ${
-                                subStatus === 'stock_out'
-                                  ? 'bg-blue-100 text-blue-800'
-                                  : subStatus === 'stock_in'
-                                    ? 'bg-amber-100 text-amber-800'
-                                    : 'bg-slate-100 text-slate-600'
-                              }`}
-                            >
-                              {subStatus === 'stock_out' ? '出庫済' : subStatus === 'stock_in' ? '入庫済' : '入庫待ち'}
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-slate-500 truncate">{sub.partName}</div>
-                          <div className="text-[10px] text-slate-500 pt-0.5 space-y-0.5">
-                            <div>数量: {sub.quantity}{sub.unit}</div>
-                            <div className="text-slate-400">
-                              入庫: {normalizeExternalDate(sub.inStockDate) || '未定'} / 出庫: {normalizeExternalDate(sub.outStockDate) || '未定'}
+                        <div
+                          key={group.key}
+                          className="bg-white border border-slate-200 rounded-lg overflow-hidden shadow-2xs"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => toggleSubPartGroup(group.key)}
+                            className="w-full px-3 py-2 flex items-center justify-between gap-3 text-left hover:bg-slate-50/80 transition-colors cursor-pointer"
+                          >
+                            <div className="flex items-center gap-2 min-w-0">
+                              {isExpanded ? (
+                                <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
+                              ) : (
+                                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
+                              )}
+                              <span
+                                className={`text-xs font-bold px-2 py-0.5 rounded border shrink-0 whitespace-nowrap ${
+                                  group.fittingNo
+                                    ? 'bg-amber-50 text-amber-800 border-amber-200'
+                                    : 'bg-slate-100 text-slate-600 border-slate-200'
+                                }`}
+                              >
+                                {group.fittingNo ? `建具 ${group.label}（EGなし）` : group.label}
+                              </span>
                             </div>
-                          </div>
+
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className="text-[11px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded whitespace-nowrap">
+                                {group.counts.total}点
+                              </span>
+                              {group.counts.stockOut > 0 && (
+                                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 whitespace-nowrap">
+                                  出庫済 {group.counts.stockOut}
+                                </span>
+                              )}
+                              {group.counts.stockIn > 0 && (
+                                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 whitespace-nowrap">
+                                  入庫済 {group.counts.stockIn}
+                                </span>
+                              )}
+                              {group.counts.waiting > 0 && (
+                                <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 whitespace-nowrap">
+                                  待ち {group.counts.waiting}
+                                </span>
+                              )}
+                            </div>
+                          </button>
+
+                          {isExpanded && (
+                            <div className="px-3 pb-3 pt-2 border-t border-slate-100 bg-slate-50/50">
+                              {renderSubPartCardGrid(group.items, `other-${group.key}`)}
+                            </div>
+                          )}
                         </div>
                       );
                     })}

@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.26.8',
-  date: '2026-11-26',
-  releaseNumber: 8,
+  version: '2026.11.27.1',
+  date: '2026-11-27',
+  releaseNumber: 1,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.26 #8 (JST)',
-  description: '自動ドア自主検査書の入力・A4印刷（5台ごと改ページ）・72列CRM連携Excel(.xlsx)出力・在庫DB自動適合・拠点別様式カスタマイズ（管理画面＋NAS永続化）を実装'
+  display: 'v2026.11.27 #1 (JST)',
+  description: '各建具（主要部品）の真下に該当建具の付属部品トグル・展開表示を配置し、建具符号なし・EG対象外の付属部品を下部一覧へ集約'
 } as const;

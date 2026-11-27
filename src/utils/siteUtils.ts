@@ -211,11 +211,19 @@ export function expandExternalSitePayload(
         });
       }
     } else {
+      const pFittingNo = String(
+        p.fittingNo || p.建具番号 || p.tateguNo || p.tategu_no || p.tategu || p.建具符号 || p.fitting_no || p.fitting || ''
+      ).trim();
+      const pPartSpec = String(p.partSpec || p.部品規格 || '').trim();
       const pCode = String(p.partCode || p.modelNumber || p.code || p.model || '').trim();
-      const pName = String(p.partName || p.name || '付属部品').trim();
+      const pName = String(p.partName || p.name || p.品名 || '付属部品').trim();
+      const pCategory = String(p.partCategory || p.部品区分 || '').trim();
       subs.push({
         id: p.id ? String(p.id) : `sub-live-${idx}`,
+        fittingNo: pFittingNo || undefined,
         partCode: pCode,
+        partSpec: pPartSpec || undefined,
+        partCategory: pCategory || undefined,
         partName: pName,
         quantity: qty,
         unit: p.unit || '個',
@@ -495,13 +503,13 @@ export function mergeInventorySyncWithSite(
     }
   }
 
-  // 付属部品の入庫日・出庫日・数量変化を検知してキャッシュも更新
+  // 付属部品の入庫日・出庫日・数量・建具符号変化を検知してキャッシュも更新
   const prevSubCache = currentSite.subPartsCache || [];
   const toSubSig = (arr: SiteSubPart[]) =>
     arr
       .map(
         (s) =>
-          `${s.partCode}|${s.partName}|${s.quantity}|${normalizeExternalDate(s.inStockDate)}|${normalizeExternalDate(s.outStockDate)}`
+          `${s.fittingNo || ''}|${s.partCode}|${s.partSpec || ''}|${s.partName}|${s.quantity}|${normalizeExternalDate(s.inStockDate)}|${normalizeExternalDate(s.outStockDate)}`
       )
       .join('||');
 
@@ -511,12 +519,13 @@ export function mergeInventorySyncWithSite(
 
   if (hasSubChanges) {
     // 何件の付属部品に日付・構成変更があったか算出
-    const prevMap = new Map(prevSubCache.map((s) => [`${s.partCode}|${s.partName}`, s]));
+    const prevMap = new Map(prevSubCache.map((s) => [`${s.fittingNo || ''}|${s.partCode}|${s.partName}`, s]));
     let diffCount = 0;
     for (const ns of expanded.subParts) {
-      const old = prevMap.get(`${ns.partCode}|${ns.partName}`);
+      const old = prevMap.get(`${ns.fittingNo || ''}|${ns.partCode}|${ns.partName}`);
       if (
         !old ||
+        (old.fittingNo || '') !== (ns.fittingNo || '') ||
         normalizeExternalDate(old.inStockDate) !== normalizeExternalDate(ns.inStockDate) ||
         normalizeExternalDate(old.outStockDate) !== normalizeExternalDate(ns.outStockDate) ||
         old.quantity !== ns.quantity
@@ -592,3 +601,146 @@ export function mergeInventorySyncWithSite(
     summaryMessage: summaryParts.join(' / '),
   };
 }
+
+export interface SubPartFittingGroup {
+  key: string;
+  fittingNo: string;
+  label: string;
+  mainPartSummary?: string;
+  matchedMainPart: boolean;
+  items: SiteSubPart[];
+  counts: {
+    total: number;
+    stockOut: number;
+    stockIn: number;
+    waiting: number;
+  };
+}
+
+export function normalizeFittingKey(raw?: string | null): string {
+  if (!raw) return '';
+  return String(raw)
+    .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .replace(/[－ー―‐]/g, '-')
+    .trim()
+    .toUpperCase();
+}
+
+function resolveSubPartFittingNo(sub: SiteSubPart): string {
+  const direct = String(
+    sub.fittingNo || (sub as any).tateguNo || (sub as any).建具番号 || (sub as any).建具符号 || ''
+  ).trim();
+  if (direct) return direct;
+  const noteStr = String(sub.note || '');
+  const m = noteStr.match(/建具(?:番号|符号)?\s*[:：]\s*([A-Za-z0-9０-９_-]+)/);
+  if (m && m[1]) return m[1].trim();
+  return '';
+}
+
+/**
+ * 付属部品一覧を建具符号（fittingNo）ごとにグループ化し、主要部品の並び順に合わせて整理する
+ */
+export function groupSubPartsByFitting(
+  subParts: SiteSubPart[],
+  mainParts: SiteMainPart[] = []
+): SubPartFittingGroup[] {
+  if (!Array.isArray(subParts) || subParts.length === 0) return [];
+
+  const mainOrder: string[] = [];
+  const mainMetaByKey = new Map<string, { label: string; summary: string }>();
+
+  mainParts.forEach((mp, idx) => {
+    const rawFit = String(mp.fittingNo || '').trim() || getFittingLabel(mp, idx, mainParts.length);
+    const key = normalizeFittingKey(rawFit);
+    if (!key) return;
+    if (!mainMetaByKey.has(key)) {
+      mainOrder.push(key);
+      mainMetaByKey.set(key, {
+        label: rawFit,
+        summary: cleanPartName(mp.partName || ''),
+      });
+    }
+  });
+
+  const bucketMap = new Map<string, { fittingNo: string; items: SiteSubPart[] }>();
+  const unassignedItems: SiteSubPart[] = [];
+
+  for (const sub of subParts) {
+    const fNo = resolveSubPartFittingNo(sub);
+    const key = normalizeFittingKey(fNo);
+    if (!key) {
+      unassignedItems.push(sub);
+      continue;
+    }
+    const existing = bucketMap.get(key);
+    if (existing) {
+      existing.items.push(sub);
+    } else {
+      bucketMap.set(key, { fittingNo: fNo, items: [sub] });
+    }
+  }
+
+  const buildGroup = (
+    key: string,
+    fittingNo: string,
+    label: string,
+    items: SiteSubPart[],
+    matchedMainPart: boolean,
+    mainPartSummary?: string
+  ): SubPartFittingGroup => {
+    let stockOut = 0;
+    let stockIn = 0;
+    let waiting = 0;
+    for (const item of items) {
+      const st = deriveInventoryPartStatus(item.inStockDate, item.outStockDate);
+      if (st === 'stock_out') stockOut++;
+      else if (st === 'stock_in') stockIn++;
+      else waiting++;
+    }
+    return {
+      key,
+      fittingNo,
+      label,
+      mainPartSummary,
+      matchedMainPart,
+      items,
+      counts: {
+        total: items.length,
+        stockOut,
+        stockIn,
+        waiting,
+      },
+    };
+  };
+
+  const groups: SubPartFittingGroup[] = [];
+  const consumedKeys = new Set<string>();
+
+  // 1. 主要部品に存在する建具符号の順に追加
+  for (const key of mainOrder) {
+    const bucket = bucketMap.get(key);
+    if (!bucket) continue;
+    consumedKeys.add(key);
+    const meta = mainMetaByKey.get(key);
+    groups.push(
+      buildGroup(key, meta?.label || bucket.fittingNo, meta?.label || bucket.fittingNo, bucket.items, true, meta?.summary)
+    );
+  }
+
+  // 2. 主要部品（EG）に含まれないが建具符号がある付属部品グループを自然順で追加
+  const extraEntries = Array.from(bucketMap.entries())
+    .filter(([key]) => !consumedKeys.has(key))
+    .sort((a, b) => a[1].fittingNo.localeCompare(b[1].fittingNo, 'ja', { numeric: true }));
+
+  for (const [key, bucket] of extraEntries) {
+    groups.push(buildGroup(key, bucket.fittingNo, bucket.fittingNo, bucket.items, false));
+  }
+
+  // 3. 建具符号が付いていない共通付属部品
+  if (unassignedItems.length > 0) {
+    groups.push(buildGroup('__unassigned__', '', '建具符号なし（共通）', unassignedItems, false));
+  }
+
+  return groups;
+}
+
