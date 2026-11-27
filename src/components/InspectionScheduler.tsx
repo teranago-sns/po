@@ -73,10 +73,15 @@ import {
   InspectionPosterType,
   InspectionWorkNoticeType,
   InspectionWebEntryType,
+  InspectionTimeSlotType,
+  getInspectionTimeSlotType,
+  resolveCalendarTimesForItem,
+  formatInspectionTimeLabel,
   parseInspectionExcel,
   generateSampleInspectionExcel,
   generateDemoInspectionItems,
   saveSiteMasterEntry,
+  fetchSiteMastersFromServer,
   applyMasterToItem,
   batchApplyMasterToItems,
   duplicateInspectionItem,
@@ -357,6 +362,7 @@ export function InspectionScheduler({
     posterType: 'none',
     workNoticeType: 'none',
     webEntryType: 'none',
+    timeSlotType: 'custom',
   });
 
   // メンバー登録時の部署フィルター（デフォルト：保守メンバーのみ）
@@ -426,7 +432,9 @@ export function InspectionScheduler({
         setCrmDataList(list);
       }
     });
-  }, []);
+    // サーバー保存の現場コード主軸マスターを最新取得（旧ローカルキャッシュも自動移行）
+    fetchSiteMastersFromServer(currentUser?.name).catch(() => {});
+  }, [currentUser?.name]);
 
   const crmByJobNoMap = useMemo(() => {
     const map = new Map<string, CrmInspectionData>();
@@ -933,13 +941,24 @@ export function InspectionScheduler({
     const otherItems = currentItems.filter((i) => !(i.status === 'placed' && i.assignedDate === dateKey));
 
     const updatedSameDay = sameDay.map((item) => {
-      // 既存の時間が設定されていれば維持、なければすべて9:00〜10:00を初期値とする
-      const startStr = item.assignedStartTime || '09:00';
-      let endStr = item.assignedEndTime;
-      if (!endStr) {
-        const [h, m] = startStr.split(':').map(Number);
-        const endH = Math.min(23, h + 1);
-        endStr = `${String(endH).padStart(2, '0')}:${String(m || 0).padStart(2, '0')}`;
+      const slotType = getInspectionTimeSlotType(item);
+      let startStr: string;
+      let endStr: string;
+      if (slotType === 'undecided' || slotType === 'am') {
+        startStr = '09:00';
+        endStr = '10:00';
+      } else if (slotType === 'pm') {
+        startStr = '13:00';
+        endStr = '14:00';
+      } else {
+        // 既存の時間が設定されていれば維持、なければすべて9:00〜10:00を初期値とする
+        startStr = item.assignedStartTime || '09:00';
+        endStr = item.assignedEndTime || '';
+        if (!endStr) {
+          const [h, m] = startStr.split(':').map(Number);
+          const endH = Math.min(23, h + 1);
+          endStr = `${String(endH).padStart(2, '0')}:${String(m || 0).padStart(2, '0')}`;
+        }
       }
       return {
         ...item,
@@ -947,6 +966,7 @@ export function InspectionScheduler({
         assignedDate: dateKey,
         assignedStartTime: startStr,
         assignedEndTime: endStr,
+        timeSlotType: slotType,
       };
     });
 
@@ -974,8 +994,9 @@ export function InspectionScheduler({
 
     if (!matchedEvent) return;
 
-    const startH = newStartTime || updatedItem.assignedStartTime || '09:00';
-    const endH = newEndTime || updatedItem.assignedEndTime || '10:00';
+    const resolvedTimes = resolveCalendarTimesForItem(updatedItem);
+    const startH = newStartTime || resolvedTimes.startTime;
+    const endH = newEndTime || resolvedTimes.endTime;
 
     const safeStartIso = ensureJstIsoString(`${newDateKey}T${startH}:00`);
     const safeEndIso = ensureJstIsoString(`${newDateKey}T${endH}:00`);
@@ -1008,9 +1029,15 @@ export function InspectionScheduler({
   }, [events, onUpdateEvent]);
 
   // ------------------------------------------
-  // 時間の30分刻み直接更新ハンドラー（仮配置＆確定済みの未ロック現場に対応）
+  // 時間帯区分（時間指定 / 未定 / AM / PM）＆ 30分刻み時間更新ハンドラー
+  // 未定: 09:00〜10:00 / AM: 09:00〜10:00 / PM: 13:00〜14:00 でカレンダー登録・同期
   // ------------------------------------------
-  const handleUpdateItemTime = (itemId: string, newStart: string, newEnd?: string) => {
+  const handleUpdateItemTimeSlot = (
+    itemId: string,
+    slotType: InspectionTimeSlotType,
+    newStart?: string,
+    newEnd?: string
+  ) => {
     const targetItem = items.find((i) => i.id === itemId);
     if (targetItem && targetItem.status === 'registered') {
       if (isItemReportLocked(targetItem)) {
@@ -1021,37 +1048,68 @@ export function InspectionScheduler({
 
     setItems((prev) =>
       prev.map((item) => {
-        if (item.id === itemId) {
-          let calculatedEnd = newEnd;
-          if (!calculatedEnd) {
-            const [h, m] = newStart.split(':').map(Number);
+        if (item.id !== itemId) return item;
+
+        let resolvedStart: string;
+        let resolvedEnd: string;
+
+        if (slotType === 'undecided' || slotType === 'am') {
+          resolvedStart = '09:00';
+          resolvedEnd = '10:00';
+        } else if (slotType === 'pm') {
+          resolvedStart = '13:00';
+          resolvedEnd = '14:00';
+        } else {
+          resolvedStart = newStart || item.assignedStartTime || '09:00';
+          if (newEnd) {
+            resolvedEnd = newEnd;
+          } else if (newStart) {
+            const [h, m] = resolvedStart.split(':').map(Number);
             const endH = Math.min(23, h + 1);
-            calculatedEnd = `${String(endH).padStart(2, '0')}:${String(m || 0).padStart(2, '0')}`;
+            resolvedEnd = `${String(endH).padStart(2, '0')}:${String(m || 0).padStart(2, '0')}`;
+          } else {
+            resolvedEnd = item.assignedEndTime || '10:00';
           }
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
-              siteCode: item.siteCode,
-              siteName: item.siteName,
-              metaA: item.metaA,
-              lastPlacedStartTime: newStart,
-              lastPlacedEndTime: calculatedEnd,
-            });
-          }
-
-          // 確定済みアイテムならカレンダーイベント本体も即座に同期更新
-          if (item.status === 'registered' && item.assignedDate) {
-            syncCalendarEventForMovedItem(item, item.assignedDate, newStart, calculatedEnd);
-          }
-
-          return {
-            ...item,
-            assignedStartTime: newStart,
-            assignedEndTime: calculatedEnd,
-          };
         }
-        return item;
+
+        const nextMetaA: InspectionMetaA = {
+          ...item.metaA,
+          timeSlotType: slotType,
+        };
+
+        if (item.siteCode || item.jobNo) {
+          saveSiteMasterEntry(item.siteCode || item.jobNo, {
+            siteCode: item.siteCode,
+            jobNo: item.jobNo,
+            siteName: item.siteName,
+            metaA: nextMetaA,
+            lastPlacedStartTime: resolvedStart,
+            lastPlacedEndTime: resolvedEnd,
+            updatedBy: currentUser?.name,
+          });
+        }
+
+        const updatedItem: InspectionItem = {
+          ...item,
+          timeSlotType: slotType,
+          metaA: nextMetaA,
+          assignedStartTime: resolvedStart,
+          assignedEndTime: resolvedEnd,
+        };
+
+        // 確定済みアイテムならカレンダーイベント本体も即座に同期更新
+        if (item.status === 'registered' && item.assignedDate) {
+          syncCalendarEventForMovedItem(updatedItem, item.assignedDate, resolvedStart, resolvedEnd);
+        }
+
+        return updatedItem;
       })
     );
+  };
+
+  // 時間の30分刻み直接更新ハンドラー（時間指定モードとして更新）
+  const handleUpdateItemTime = (itemId: string, newStart: string, newEnd?: string) => {
+    handleUpdateItemTimeSlot(itemId, 'custom', newStart, newEnd);
   };
 
   // ------------------------------------------
@@ -1072,11 +1130,13 @@ export function InspectionScheduler({
             ...item.metaA,
             faxStatus: next,
           };
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
+          if (item.siteCode || item.jobNo) {
+            saveSiteMasterEntry(item.siteCode || item.jobNo, {
               siteCode: item.siteCode,
+              jobNo: item.jobNo,
               siteName: item.siteName,
               metaA: newMetaA,
+              updatedBy: currentUser?.name,
             });
           }
           return {
@@ -1104,11 +1164,13 @@ export function InspectionScheduler({
             ...item.metaA,
             mailStatus: next,
           };
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
+          if (item.siteCode || item.jobNo) {
+            saveSiteMasterEntry(item.siteCode || item.jobNo, {
               siteCode: item.siteCode,
+              jobNo: item.jobNo,
               siteName: item.siteName,
               metaA: newMetaA,
+              updatedBy: currentUser?.name,
             });
           }
           return {
@@ -1135,11 +1197,13 @@ export function InspectionScheduler({
             ...item.metaA,
             telStatus: next,
           };
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
+          if (item.siteCode || item.jobNo) {
+            saveSiteMasterEntry(item.siteCode || item.jobNo, {
               siteCode: item.siteCode,
+              jobNo: item.jobNo,
               siteName: item.siteName,
               metaA: newMetaA,
+              updatedBy: currentUser?.name,
             });
           }
           return {
@@ -1163,11 +1227,13 @@ export function InspectionScheduler({
             ...item.metaA,
             posterDone: nextDone,
           };
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
+          if (item.siteCode || item.jobNo) {
+            saveSiteMasterEntry(item.siteCode || item.jobNo, {
               siteCode: item.siteCode,
+              jobNo: item.jobNo,
               siteName: item.siteName,
               metaA: newMetaA,
+              updatedBy: currentUser?.name,
             });
           }
           return {
@@ -1191,11 +1257,13 @@ export function InspectionScheduler({
             ...item.metaA,
             workNoticeDone: nextDone,
           };
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
+          if (item.siteCode || item.jobNo) {
+            saveSiteMasterEntry(item.siteCode || item.jobNo, {
               siteCode: item.siteCode,
+              jobNo: item.jobNo,
               siteName: item.siteName,
               metaA: newMetaA,
+              updatedBy: currentUser?.name,
             });
           }
           return {
@@ -1219,11 +1287,13 @@ export function InspectionScheduler({
             ...item.metaA,
             webEntryDone: nextDone,
           };
-          if (item.jobNo) {
-            saveSiteMasterEntry(item.jobNo, {
+          if (item.siteCode || item.jobNo) {
+            saveSiteMasterEntry(item.siteCode || item.jobNo, {
               siteCode: item.siteCode,
+              jobNo: item.jobNo,
               siteName: item.siteName,
               metaA: newMetaA,
+              updatedBy: currentUser?.name,
             });
           }
           return {
@@ -1251,33 +1321,71 @@ export function InspectionScheduler({
       workNoticeDone: item.metaA?.workNoticeDone || false,
       webEntryType: item.metaA?.webEntryType || 'none',
       webEntryDone: item.metaA?.webEntryDone || false,
+      timeSlotType: getInspectionTimeSlotType(item),
     });
   };
 
   // 備考・メタデータ詳細モーダルを保存
   const handleSaveMetaModal = () => {
     if (!metaModalItem) return;
-    const newMetaA = {
+    const isLockedRegistered = metaModalItem.status === 'registered' && isItemReportLocked(metaModalItem);
+    const prevSlot = getInspectionTimeSlotType(metaModalItem);
+    const nextSlot: InspectionTimeSlotType = isLockedRegistered
+      ? prevSlot
+      : (metaDraft.timeSlotType || 'custom');
+
+    const newMetaA: InspectionMetaA = {
       ...metaModalItem.metaA,
       ...metaDraft,
+      timeSlotType: nextSlot,
     };
-    if (metaModalItem.jobNo) {
-      saveSiteMasterEntry(metaModalItem.jobNo, {
+
+    const resolvedTimes = resolveCalendarTimesForItem({
+      timeSlotType: nextSlot,
+      assignedStartTime: metaModalItem.assignedStartTime,
+      assignedEndTime: metaModalItem.assignedEndTime,
+    });
+
+    if (metaModalItem.siteCode || metaModalItem.jobNo) {
+      saveSiteMasterEntry(metaModalItem.siteCode || metaModalItem.jobNo, {
         siteCode: metaModalItem.siteCode,
+        jobNo: metaModalItem.jobNo,
         siteName: metaModalItem.siteName,
         metaA: newMetaA,
+        lastPlacedStartTime: resolvedTimes.startTime,
+        lastPlacedEndTime: resolvedTimes.endTime,
+        updatedBy: currentUser?.name,
       });
     }
+
+    const updatedTarget: InspectionItem = {
+      ...metaModalItem,
+      metaA: newMetaA,
+      timeSlotType: nextSlot,
+      ...(metaModalItem.assignedDate || metaModalItem.status === 'placed' || metaModalItem.status === 'registered'
+        ? {
+            assignedStartTime: resolvedTimes.startTime,
+            assignedEndTime: resolvedTimes.endTime,
+          }
+        : {}),
+    };
+
+    if (
+      metaModalItem.status === 'registered' &&
+      metaModalItem.assignedDate &&
+      !isLockedRegistered &&
+      prevSlot !== nextSlot
+    ) {
+      syncCalendarEventForMovedItem(
+        updatedTarget,
+        metaModalItem.assignedDate,
+        resolvedTimes.startTime,
+        resolvedTimes.endTime
+      );
+    }
+
     setItems((prev) =>
-      prev.map((item) => {
-        if (item.id === metaModalItem.id) {
-          return {
-            ...item,
-            metaA: newMetaA,
-          };
-        }
-        return item;
-      })
+      prev.map((item) => (item.id === metaModalItem.id ? updatedTarget : item))
     );
     setMetaModalItem(null);
   };
@@ -1290,6 +1398,9 @@ export function InspectionScheduler({
     reader.onload = async (e) => {
       const buffer = e.target?.result as ArrayBuffer;
       if (!buffer) return;
+
+      // 読込直前にサーバー最新の現場コードマスターを同期してからExcelを解析
+      await fetchSiteMastersFromServer(currentUser?.name).catch(() => {});
 
       const result = parseInspectionExcel(buffer, allUsers);
       if (result.error) {
@@ -1681,11 +1792,10 @@ export function InspectionScheduler({
         return;
       }
 
-      const startH = targetItem.assignedStartTime || '09:00';
-      const endH = targetItem.assignedEndTime || '10:00';
+      const { startTime: startH, endTime: endH } = resolveCalendarTimesForItem(targetItem);
 
       setItems((prev) =>
-        prev.map((i) => (i.id === itemId ? { ...i, assignedDate: newDateKey } : i))
+        prev.map((i) => (i.id === itemId ? { ...i, assignedDate: newDateKey, assignedStartTime: startH, assignedEndTime: endH } : i))
       );
 
       // カレンダーイベント本体を即座に連動更新
@@ -1765,11 +1875,10 @@ export function InspectionScheduler({
         return;
       }
       const newDateKey = targetItem.assignedDate;
-      const startH = droppedItem.assignedStartTime || '09:00';
-      const endH = droppedItem.assignedEndTime || '10:00';
+      const { startTime: startH, endTime: endH } = resolveCalendarTimesForItem(droppedItem);
 
       setItems((prev) =>
-        prev.map((i) => (i.id === droppedItemId ? { ...i, assignedDate: newDateKey } : i))
+        prev.map((i) => (i.id === droppedItemId ? { ...i, assignedDate: newDateKey, assignedStartTime: startH, assignedEndTime: endH } : i))
       );
 
       syncCalendarEventForMovedItem(droppedItem, newDateKey, startH, endH);
@@ -2033,11 +2142,14 @@ export function InspectionScheduler({
       const rawDate = (item.assignedDate || '').trim();
       const datePart = rawDate.includes('T') ? rawDate.split('T')[0] : rawDate;
 
-      const rawStart = (item.assignedStartTime || '09:00').trim();
+      const slotType = getInspectionTimeSlotType(item);
+      const resolvedTimes = resolveCalendarTimesForItem(item);
+
+      const rawStart = (resolvedTimes.startTime || '09:00').trim();
       const [sh, sm] = rawStart.includes(':') ? rawStart.split(':') : ['09', '00'];
       const startTime = `${String(Number(sh) || 9).padStart(2, '0')}:${String(Number(sm) || 0).padStart(2, '0')}`;
 
-      const rawEnd = (item.assignedEndTime || '10:00').trim();
+      const rawEnd = (resolvedTimes.endTime || '10:00').trim();
       const [eh, em] = rawEnd.includes(':') ? rawEnd.split(':') : ['10', '00'];
       const endTime = `${String(Number(eh) || 10).padStart(2, '0')}:${String(Number(em) || 0).padStart(2, '0')}`;
 
@@ -2051,6 +2163,7 @@ export function InspectionScheduler({
       const memoLines = [
         `【作業No】${item.jobNo || '未設定'}`,
         item.siteCode ? `【現場コード】${item.siteCode}` : '',
+        slotType !== 'custom' ? `【時間帯】${slotType === 'undecided' ? '未定' : slotType.toUpperCase()}` : '',
         `【台数】${item.quantity}台`,
         item.workName ? `【作業名】${item.workName}${item.workCategory ? ` (区分: ${item.workCategory})` : ''}` : '',
         item.contractNo ? `【契約No】${item.contractNo}` : '',
@@ -2102,11 +2215,16 @@ export function InspectionScheduler({
 
     const updatedItems = items.map((i) => {
       if (itemEventMap.has(i.id)) {
+        const slotType = getInspectionTimeSlotType(i);
+        const resolvedTimes = resolveCalendarTimesForItem(i);
         return {
           ...i,
           status: 'registered' as const,
           isConfirmed: true,
           eventId: itemEventMap.get(i.id),
+          timeSlotType: slotType,
+          assignedStartTime: resolvedTimes.startTime,
+          assignedEndTime: resolvedTimes.endTime,
           draftSavedAt: new Date().toISOString(),
         };
       }
@@ -2117,6 +2235,157 @@ export function InspectionScheduler({
     saveDraftDirect(activeDraftKey, updatedItems, 'assign_date');
     setCompletedCount(createdEvents.length);
     setCurrentStep('completed');
+  };
+
+  // ------------------------------------------
+  // 共通UIヘルパー: 時間帯区分＆時間変更ポップオーバー（時間指定 / 未定 / AM / PM）
+  // カード上の入力欄を増やさず、既存の左上時間ボタンから直接切替可能
+  // ------------------------------------------
+  const renderTimePickerPopover = (item: InspectionItem, titleLabel = '時間帯・時間変更') => {
+    const slotType = getInspectionTimeSlotType(item);
+    const slotOptions: { id: InspectionTimeSlotType; label: string; activeCls: string }[] = [
+      { id: 'custom', label: '時間指定', activeCls: 'bg-indigo-600 text-white border-indigo-600' },
+      { id: 'undecided', label: '未定', activeCls: 'bg-slate-700 text-white border-slate-700' },
+      { id: 'am', label: 'AM', activeCls: 'bg-sky-600 text-white border-sky-600' },
+      { id: 'pm', label: 'PM', activeCls: 'bg-amber-600 text-white border-amber-600' },
+    ];
+    const slotCalendarHint =
+      slotType === 'undecided'
+        ? 'カレンダー登録: 09:00〜10:00（未定）'
+        : slotType === 'am'
+        ? 'カレンダー登録: 09:00〜10:00（AM）'
+        : slotType === 'pm'
+        ? 'カレンダー登録: 13:00〜14:00（PM）'
+        : null;
+
+    return (
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="absolute left-0 top-full mt-1.5 z-30 bg-white rounded-xl border border-slate-200 shadow-xl p-3 w-64 space-y-2 ring-1 ring-slate-900/10 text-xs animate-in fade-in zoom-in-95 duration-100"
+      >
+        <div className="flex items-center justify-between pb-1 border-b border-slate-100">
+          <span className="font-bold text-slate-800 flex items-center gap-1">
+            <Clock className="w-3.5 h-3.5 text-indigo-600" />
+            {titleLabel}
+          </span>
+          <button
+            type="button"
+            onClick={() => setEditingTimeItemId(null)}
+            className="text-slate-400 hover:text-slate-600 text-xs font-bold px-1 cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* 時間帯区分クイック切替（時間指定 / 未定 / AM / PM） */}
+        <div className="grid grid-cols-4 gap-1">
+          {slotOptions.map((opt) => (
+            <button
+              key={opt.id}
+              type="button"
+              onClick={() => {
+                if (opt.id === 'custom') {
+                  handleUpdateItemTimeSlot(
+                    item.id,
+                    'custom',
+                    item.assignedStartTime || '09:00',
+                    item.assignedEndTime || '10:00'
+                  );
+                } else {
+                  handleUpdateItemTimeSlot(item.id, opt.id);
+                  setEditingTimeItemId(null);
+                }
+              }}
+              className={`px-1 py-1 rounded-lg text-[11px] font-bold border transition-colors cursor-pointer whitespace-nowrap ${
+                slotType === opt.id
+                  ? `${opt.activeCls} shadow-2xs`
+                  : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+              }`}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
+
+        {slotCalendarHint && (
+          <div className="px-2 py-1 bg-slate-50 border border-slate-200/80 rounded-lg text-[10px] font-semibold text-slate-600">
+            {slotCalendarHint}
+          </div>
+        )}
+
+        {/* 時間指定（30分刻み） */}
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="text-[10px] font-bold text-slate-500 block mb-1">
+              開始時刻
+            </label>
+            <select
+              value={item.assignedStartTime || '09:00'}
+              onChange={(e) => handleUpdateItemTime(item.id, e.target.value)}
+              className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold focus:ring-2 focus:ring-indigo-500"
+            >
+              {TIME_OPTIONS_30MIN.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label className="text-[10px] font-bold text-slate-500 block mb-1">
+              終了時刻
+            </label>
+            <select
+              value={item.assignedEndTime || '10:00'}
+              onChange={(e) => handleUpdateItemTime(item.id, item.assignedStartTime || '09:00', e.target.value)}
+              className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold focus:ring-2 focus:ring-indigo-500"
+            >
+              {TIME_OPTIONS_30MIN.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* クイックプリセットボタン */}
+        <div className="pt-1 border-t border-slate-100 flex items-center justify-between gap-1 flex-wrap">
+          {['09:00', '10:30', '13:00', '14:30', '16:00'].map((preset) => (
+            <button
+              key={preset}
+              type="button"
+              onClick={() => {
+                handleUpdateItemTime(item.id, preset);
+                setEditingTimeItemId(null);
+              }}
+              className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 font-mono text-[10px] font-bold rounded text-slate-600 transition-colors cursor-pointer"
+            >
+              {preset}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  // 時間帯区分に応じたボタン配色クラス
+  const getTimeBadgeColorClass = (
+    item: InspectionItem,
+    defaultCls: string
+  ): string => {
+    const slotType = getInspectionTimeSlotType(item);
+    if (slotType === 'undecided') {
+      return 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300';
+    }
+    if (slotType === 'am') {
+      return 'bg-sky-50 hover:bg-sky-100 text-sky-800 border-sky-300';
+    }
+    if (slotType === 'pm') {
+      return 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300';
+    }
+    return defaultCls;
   };
 
   // ------------------------------------------
@@ -3503,7 +3772,7 @@ export function InspectionScheduler({
                             <div className="w-full flex items-center justify-between gap-1 flex-wrap">
                               <span className="text-indigo-800 font-bold flex items-center gap-1 bg-indigo-50 px-2 py-0.5 rounded text-[11px] border border-indigo-100">
                                 <CalendarIcon className="w-3 h-3 text-indigo-600" />
-                                仮: {item.assignedDate?.slice(5)} ({item.assignedStartTime})
+                                仮: {item.assignedDate?.slice(5)} ({formatInspectionTimeLabel(item, true)})
                               </span>
                               <button
                                 onClick={() => handleRemoveFromCalendar(item.id)}
@@ -3524,7 +3793,7 @@ export function InspectionScheduler({
                               ) : (
                                 <span className="text-emerald-900 font-bold flex items-center gap-1 bg-emerald-100 px-2 py-0.5 rounded text-[11px] border border-emerald-300" title="確定済み（ドラッグしてカレンダーの別日へドロップ可能）">
                                   <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                                  確定済: {item.assignedDate?.slice(5)} ({item.assignedStartTime})
+                                  確定済: {item.assignedDate?.slice(5)} ({formatInspectionTimeLabel(item, true)})
                                 </span>
                               )}
                               {!isReportLocked && (
@@ -3781,7 +4050,7 @@ export function InspectionScheduler({
                                   {/* カード上部: 左上に時間変更ボタン ＆ 右上にステータスボタン群/解除ボタン */}
                                   <div>
                                     <div className="flex items-center justify-between gap-1 mb-1.5 relative">
-                                      {/* 左上: 時間直接変更ボタン (30分刻み) */}
+                                      {/* 左上: 時間・時間帯区分（未定/AM/PM/時間指定）変更ボタン */}
                                       <div className="relative">
                                         <button
                                           type="button"
@@ -3789,94 +4058,19 @@ export function InspectionScheduler({
                                             e.stopPropagation();
                                             setEditingTimeItemId(isEditingTime ? null : placed.id);
                                           }}
-                                          className="px-2 py-0.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-mono font-bold rounded-lg border border-emerald-200 transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
-                                          title="クリックして時間を直接変更 (30分刻み)"
+                                          className={`px-2 py-0.5 text-xs font-mono font-bold rounded-lg border transition-colors cursor-pointer flex items-center gap-1 shadow-2xs whitespace-nowrap ${getTimeBadgeColorClass(
+                                            placed,
+                                            'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
+                                          )}`}
+                                          title="クリックして時間帯（未定/AM/PM）や開始・終了時間を変更"
                                         >
-                                          <Clock className="w-3 h-3 text-emerald-600" />
-                                          <span>{placed.assignedStartTime || '09:00'} - {placed.assignedEndTime || '10:00'}</span>
-                                          <ChevronDown className="w-3 h-3 text-emerald-600" />
+                                          <Clock className="w-3 h-3 opacity-75" />
+                                          <span>{formatInspectionTimeLabel(placed)}</span>
+                                          <ChevronDown className="w-3 h-3 opacity-75" />
                                         </button>
 
-                                        {/* 30分刻みの時間クイック選択ポップオーバー */}
-                                        {isEditingTime && (
-                                          <div
-                                            onClick={(e) => e.stopPropagation()}
-                                            className="absolute left-0 top-full mt-1.5 z-30 bg-white rounded-xl border border-slate-200 shadow-xl p-3 w-64 space-y-2 ring-1 ring-slate-900/10 text-xs animate-in fade-in zoom-in-95 duration-100"
-                                          >
-                                            <div className="flex items-center justify-between pb-1 border-b border-slate-100">
-                                              <span className="font-bold text-slate-800 flex items-center gap-1">
-                                                <Clock className="w-3.5 h-3.5 text-indigo-600" />
-                                                時間変更 (30分刻み)
-                                              </span>
-                                              <button
-                                                type="button"
-                                                onClick={() => setEditingTimeItemId(null)}
-                                                className="text-slate-400 hover:text-slate-600 text-xs font-bold px-1"
-                                              >
-                                                ✕
-                                              </button>
-                                            </div>
-
-                                            <div className="grid grid-cols-2 gap-2">
-                                              <div>
-                                                <label className="text-[10px] font-bold text-slate-500 block mb-1">
-                                                  開始時刻
-                                                </label>
-                                                <select
-                                                  value={placed.assignedStartTime || '09:00'}
-                                                  onChange={(e) => {
-                                                    const newStart = e.target.value;
-                                                    handleUpdateItemTime(placed.id, newStart);
-                                                  }}
-                                                  className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold focus:ring-2 focus:ring-indigo-500"
-                                                >
-                                                  {TIME_OPTIONS_30MIN.map((t) => (
-                                                    <option key={t} value={t}>
-                                                      {t}
-                                                    </option>
-                                                  ))}
-                                                </select>
-                                              </div>
-
-                                              <div>
-                                                <label className="text-[10px] font-bold text-slate-500 block mb-1">
-                                                  終了時刻
-                                                </label>
-                                                <select
-                                                  value={placed.assignedEndTime || '10:00'}
-                                                  onChange={(e) => {
-                                                    const newEnd = e.target.value;
-                                                    handleUpdateItemTime(placed.id, placed.assignedStartTime || '09:00', newEnd);
-                                                  }}
-                                                  className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold focus:ring-2 focus:ring-indigo-500"
-                                                >
-                                                  {TIME_OPTIONS_30MIN.map((t) => (
-                                                    <option key={t} value={t}>
-                                                      {t}
-                                                    </option>
-                                                  ))}
-                                                </select>
-                                              </div>
-                                            </div>
-
-                                            {/* クイックプリセットボタン */}
-                                            <div className="pt-1 border-t border-slate-100 flex items-center justify-between gap-1 flex-wrap">
-                                              {['09:00', '10:30', '13:00', '14:30', '16:00'].map((preset) => (
-                                                <button
-                                                  key={preset}
-                                                  type="button"
-                                                  onClick={() => {
-                                                    handleUpdateItemTime(placed.id, preset);
-                                                    setEditingTimeItemId(null);
-                                                  }}
-                                                  className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 font-mono text-[10px] font-bold rounded text-slate-600 transition-colors"
-                                                >
-                                                  {preset}
-                                                </button>
-                                              ))}
-                                            </div>
-                                          </div>
-                                        )}
+                                        {/* 時間帯区分＆30分刻みの時間クイック選択ポップオーバー */}
+                                        {isEditingTime && renderTimePickerPopover(placed, '時間帯・時間変更')}
                                       </div>
 
                                       <div className="flex items-center gap-1">
@@ -4163,12 +4357,12 @@ export function InspectionScheduler({
                               >
                                 <div>
                                   <div className="flex items-center justify-between gap-1 mb-1.5 relative">
-                                    {/* 時間バッジ（未ロックなら30分刻みで変更可能） */}
+                                    {/* 時間バッジ（未ロックなら時間帯区分・30分刻みで変更可能） */}
                                     <div className="relative">
                                       {isReportLocked ? (
-                                        <span className="px-2 py-0.5 bg-slate-200 text-slate-700 font-mono font-bold rounded text-xs flex items-center gap-1" title="点検報告書が提出済のため時間変更不可">
+                                        <span className="px-2 py-0.5 bg-slate-200 text-slate-700 font-mono font-bold rounded text-xs flex items-center gap-1 whitespace-nowrap" title="点検報告書が提出済のため時間変更不可">
                                           <Lock className="w-3 h-3 text-slate-500" />
-                                          {reg.assignedStartTime || '09:00'} - {reg.assignedEndTime || '10:00'}
+                                          {formatInspectionTimeLabel(reg)}
                                         </span>
                                       ) : (
                                         <button
@@ -4177,85 +4371,20 @@ export function InspectionScheduler({
                                             e.stopPropagation();
                                             setEditingTimeItemId(isEditingTime ? null : reg.id);
                                           }}
-                                          className="px-2 py-0.5 bg-white hover:bg-emerald-100 text-emerald-900 text-xs font-mono font-bold rounded-lg border border-emerald-300 transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
-                                          title="クリックして時間を直接変更 (30分刻み)"
+                                          className={`px-2 py-0.5 text-xs font-mono font-bold rounded-lg border transition-colors cursor-pointer flex items-center gap-1 shadow-2xs whitespace-nowrap ${getTimeBadgeColorClass(
+                                            reg,
+                                            'bg-white hover:bg-emerald-100 text-emerald-900 border-emerald-300'
+                                          )}`}
+                                          title="クリックして時間帯（未定/AM/PM）や開始・終了時間を変更"
                                         >
-                                          <Clock className="w-3 h-3 text-emerald-600" />
-                                          <span>{reg.assignedStartTime || '09:00'} - {reg.assignedEndTime || '10:00'}</span>
-                                          <ChevronDown className="w-3 h-3 text-emerald-600" />
+                                          <Clock className="w-3 h-3 opacity-75" />
+                                          <span>{formatInspectionTimeLabel(reg)}</span>
+                                          <ChevronDown className="w-3 h-3 opacity-75" />
                                         </button>
                                       )}
 
                                       {/* 時間クイック選択ポップオーバー */}
-                                      {!isReportLocked && isEditingTime && (
-                                        <div
-                                          onClick={(e) => e.stopPropagation()}
-                                          className="absolute left-0 top-full mt-1.5 z-30 bg-white rounded-xl border border-slate-200 shadow-xl p-3 w-64 space-y-2 ring-1 ring-slate-900/10 text-xs animate-in fade-in zoom-in-95 duration-100"
-                                        >
-                                          <div className="flex items-center justify-between pb-1 border-b border-slate-100">
-                                            <span className="font-bold text-slate-800 flex items-center gap-1">
-                                              <Clock className="w-3.5 h-3.5 text-indigo-600" />
-                                              確定予定の時間変更
-                                            </span>
-                                            <button
-                                              type="button"
-                                              onClick={() => setEditingTimeItemId(null)}
-                                              className="text-slate-400 hover:text-slate-600 text-xs font-bold px-1"
-                                            >
-                                              ✕
-                                            </button>
-                                          </div>
-
-                                          <div className="grid grid-cols-2 gap-2">
-                                            <div>
-                                              <label className="text-[10px] font-bold text-slate-500 block mb-1">開始時刻</label>
-                                              <select
-                                                value={reg.assignedStartTime || '09:00'}
-                                                onChange={(e) => {
-                                                  const newStart = e.target.value;
-                                                  handleUpdateItemTime(reg.id, newStart);
-                                                }}
-                                                className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold focus:ring-2 focus:ring-indigo-500"
-                                              >
-                                                {TIME_OPTIONS_30MIN.map((t) => (
-                                                  <option key={t} value={t}>{t}</option>
-                                                ))}
-                                              </select>
-                                            </div>
-                                            <div>
-                                              <label className="text-[10px] font-bold text-slate-500 block mb-1">終了時刻</label>
-                                              <select
-                                                value={reg.assignedEndTime || '10:00'}
-                                                onChange={(e) => {
-                                                  const newEnd = e.target.value;
-                                                  handleUpdateItemTime(reg.id, reg.assignedStartTime || '09:00', newEnd);
-                                                }}
-                                                className="w-full px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold focus:ring-2 focus:ring-indigo-500"
-                                              >
-                                                {TIME_OPTIONS_30MIN.map((t) => (
-                                                  <option key={t} value={t}>{t}</option>
-                                                ))}
-                                              </select>
-                                            </div>
-                                          </div>
-
-                                          <div className="pt-1 border-t border-slate-100 flex items-center justify-between gap-1 flex-wrap">
-                                            {['09:00', '10:30', '13:00', '14:30', '16:00'].map((preset) => (
-                                              <button
-                                                key={preset}
-                                                type="button"
-                                                onClick={() => {
-                                                  handleUpdateItemTime(reg.id, preset);
-                                                  setEditingTimeItemId(null);
-                                                }}
-                                                className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 font-mono text-[10px] font-bold rounded text-slate-600 transition-colors"
-                                              >
-                                                {preset}
-                                              </button>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      )}
+                                      {!isReportLocked && isEditingTime && renderTimePickerPopover(reg, '確定予定の時間帯・時間変更')}
                                     </div>
 
                                     {/* 右上ステータスバッジ */}
@@ -4651,7 +4780,7 @@ export function InspectionScheduler({
                                   <span>{item.assignedDate}</span>
                                 </div>
                                 <div className="text-slate-500 font-mono text-[11px]">
-                                  {item.assignedStartTime || '09:00'} - {item.assignedEndTime || '10:00'}
+                                  {formatInspectionTimeLabel(item)}
                                 </div>
                               </div>
                             ) : (
@@ -4673,79 +4802,23 @@ export function InspectionScheduler({
                                   />
                                 </div>
 
-                                {/* 時間変更ボタン ＆ 30分刻みポップオーバー */}
+                                {/* 時間帯・時間変更ボタン ＆ ポップオーバー */}
                                 <div className="relative">
                                   <button
                                     type="button"
                                     onClick={() => setEditingTimeItemId(isEditingTime ? null : item.id)}
-                                    className="px-2 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-700 font-mono text-[11px] font-bold rounded-lg border border-slate-200 transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
-                                    title="クリックして開始・終了時間を直接変更 (30分刻み)"
+                                    className={`px-2 py-0.5 font-mono text-[11px] font-bold rounded-lg border transition-colors cursor-pointer flex items-center gap-1 shadow-2xs whitespace-nowrap ${getTimeBadgeColorClass(
+                                      item,
+                                      'bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-700 border-slate-200'
+                                    )}`}
+                                    title="クリックして時間帯（未定/AM/PM）や開始・終了時間を変更"
                                   >
-                                    <Clock className="w-3 h-3 text-slate-500" />
-                                    <span>{item.assignedStartTime || '09:00'} - {item.assignedEndTime || '10:00'}</span>
-                                    <ChevronDown className="w-2.5 h-2.5 text-slate-400" />
+                                    <Clock className="w-3 h-3 opacity-75" />
+                                    <span>{formatInspectionTimeLabel(item)}</span>
+                                    <ChevronDown className="w-2.5 h-2.5 opacity-75" />
                                   </button>
 
-                                  {isEditingTime && (
-                                    <div
-                                      onClick={(e) => e.stopPropagation()}
-                                      className="absolute left-0 top-full mt-1 z-30 bg-white rounded-xl border border-slate-200 shadow-xl p-3 w-60 space-y-2 ring-1 ring-slate-900/10 text-xs animate-in fade-in zoom-in-95 duration-100"
-                                    >
-                                      <div className="flex items-center justify-between pb-1 border-b border-slate-100">
-                                        <span className="font-bold text-slate-800">時間変更 (30分刻み)</span>
-                                        <button
-                                          type="button"
-                                          onClick={() => setEditingTimeItemId(null)}
-                                          className="text-slate-400 hover:text-slate-600 text-xs font-bold px-1"
-                                        >
-                                          ✕
-                                        </button>
-                                      </div>
-
-                                      <div className="grid grid-cols-2 gap-2">
-                                        <div>
-                                          <label className="text-[10px] font-bold text-slate-500 block mb-0.5">開始時刻</label>
-                                          <select
-                                            value={item.assignedStartTime || '09:00'}
-                                            onChange={(e) => handleUpdateItemTime(item.id, e.target.value)}
-                                            className="w-full px-1.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold"
-                                          >
-                                            {TIME_OPTIONS_30MIN.map((t) => (
-                                              <option key={t} value={t}>{t}</option>
-                                            ))}
-                                          </select>
-                                        </div>
-                                        <div>
-                                          <label className="text-[10px] font-bold text-slate-500 block mb-0.5">終了時刻</label>
-                                          <select
-                                            value={item.assignedEndTime || '10:00'}
-                                            onChange={(e) => handleUpdateItemTime(item.id, item.assignedStartTime || '09:00', e.target.value)}
-                                            className="w-full px-1.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold"
-                                          >
-                                            {TIME_OPTIONS_30MIN.map((t) => (
-                                              <option key={t} value={t}>{t}</option>
-                                            ))}
-                                          </select>
-                                        </div>
-                                      </div>
-
-                                      <div className="pt-1 border-t border-slate-100 flex items-center justify-between gap-1 flex-wrap">
-                                        {['09:00', '10:30', '13:00', '14:30', '16:00'].map((preset) => (
-                                          <button
-                                            key={preset}
-                                            type="button"
-                                            onClick={() => {
-                                              handleUpdateItemTime(item.id, preset);
-                                              setEditingTimeItemId(null);
-                                            }}
-                                            className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 font-mono text-[10px] font-bold rounded text-slate-600"
-                                          >
-                                            {preset}
-                                          </button>
-                                        ))}
-                                      </div>
-                                    </div>
-                                  )}
+                                  {isEditingTime && renderTimePickerPopover(item, '時間帯・時間変更')}
                                 </div>
                               </div>
                             )}
@@ -5265,11 +5338,11 @@ export function InspectionScheduler({
                                 <div className="relative">
                                   {isReportLocked ? (
                                     <span
-                                      className="px-2 py-0.5 bg-slate-200 text-slate-700 text-[11px] font-mono font-bold rounded-lg border border-slate-300 flex items-center gap-1"
+                                      className="px-2 py-0.5 bg-slate-200 text-slate-700 text-[11px] font-mono font-bold rounded-lg border border-slate-300 flex items-center gap-1 whitespace-nowrap"
                                       title="点検報告書が提出済のため時間変更不可"
                                     >
                                       <Lock className="w-3 h-3 text-slate-500" />
-                                      {item.assignedStartTime || '09:00'} - {item.assignedEndTime || '10:00'}
+                                      {formatInspectionTimeLabel(item)}
                                     </span>
                                   ) : (
                                     <>
@@ -5279,73 +5352,19 @@ export function InspectionScheduler({
                                           e.stopPropagation();
                                           setEditingTimeItemId(isEditingTime ? null : item.id);
                                         }}
-                                        className="px-2 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-800 text-[11px] font-mono font-bold rounded-lg border border-slate-200 transition-colors cursor-pointer flex items-center gap-1 shadow-2xs"
-                                        title="クリックして時間を直接変更 (30分刻み)"
+                                        className={`px-2 py-0.5 text-[11px] font-mono font-bold rounded-lg border transition-colors cursor-pointer flex items-center gap-1 shadow-2xs whitespace-nowrap ${getTimeBadgeColorClass(
+                                          item,
+                                          'bg-slate-100 hover:bg-indigo-50 hover:text-indigo-700 text-slate-800 border-slate-200'
+                                        )}`}
+                                        title="クリックして時間帯（未定/AM/PM）や開始・終了時間を変更"
                                       >
-                                        <Clock className="w-3 h-3 text-indigo-600" />
-                                        <span>{item.assignedStartTime || '09:00'} - {item.assignedEndTime || '10:00'}</span>
-                                        <ChevronDown className="w-2.5 h-2.5 text-slate-400" />
+                                        <Clock className="w-3 h-3 opacity-75" />
+                                        <span>{formatInspectionTimeLabel(item)}</span>
+                                        <ChevronDown className="w-2.5 h-2.5 opacity-75" />
                                       </button>
 
                                       {/* 時間ポップオーバー */}
-                                      {isEditingTime && (
-                                        <div
-                                          onClick={(e) => e.stopPropagation()}
-                                          className="absolute left-0 top-full mt-1 z-30 bg-white rounded-xl border border-slate-200 shadow-xl p-3 w-60 space-y-2 ring-1 ring-slate-900/10 text-xs animate-in fade-in zoom-in-95 duration-100"
-                                        >
-                                          <div className="flex items-center justify-between pb-1 border-b border-slate-100">
-                                            <span className="font-bold text-slate-800">時間変更 (30分刻み)</span>
-                                            <button
-                                              type="button"
-                                              onClick={() => setEditingTimeItemId(null)}
-                                              className="text-slate-400 hover:text-slate-600 text-xs font-bold px-1"
-                                            >
-                                              ✕
-                                            </button>
-                                          </div>
-                                          <div className="grid grid-cols-2 gap-2">
-                                            <div>
-                                              <label className="text-[10px] font-bold text-slate-500 block mb-0.5">開始時刻</label>
-                                              <select
-                                                value={item.assignedStartTime || '09:00'}
-                                                onChange={(e) => handleUpdateItemTime(item.id, e.target.value)}
-                                                className="w-full px-1.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold"
-                                              >
-                                                {TIME_OPTIONS_30MIN.map((t) => (
-                                                  <option key={t} value={t}>{t}</option>
-                                                ))}
-                                              </select>
-                                            </div>
-                                            <div>
-                                              <label className="text-[10px] font-bold text-slate-500 block mb-0.5">終了時刻</label>
-                                              <select
-                                                value={item.assignedEndTime || '10:00'}
-                                                onChange={(e) => handleUpdateItemTime(item.id, item.assignedStartTime || '09:00', e.target.value)}
-                                                className="w-full px-1.5 py-1 bg-slate-50 border border-slate-200 rounded-lg text-xs font-mono font-bold"
-                                              >
-                                                {TIME_OPTIONS_30MIN.map((t) => (
-                                                  <option key={t} value={t}>{t}</option>
-                                                ))}
-                                              </select>
-                                            </div>
-                                          </div>
-                                          <div className="pt-1 border-t border-slate-100 flex items-center justify-between gap-1 flex-wrap">
-                                            {['09:00', '10:30', '13:00', '14:30', '16:00'].map((preset) => (
-                                              <button
-                                                key={preset}
-                                                type="button"
-                                                onClick={() => {
-                                                  handleUpdateItemTime(item.id, preset);
-                                                  setEditingTimeItemId(null);
-                                                }}
-                                                className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 font-mono text-[10px] font-bold rounded text-slate-600 transition-colors"
-                                              >
-                                                {preset}
-                                              </button>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      )}
+                                      {isEditingTime && renderTimePickerPopover(item, '時間帯・時間変更')}
                                     </>
                                   )}
                                 </div>
@@ -5649,7 +5668,15 @@ export function InspectionScheduler({
               <div className="grid grid-cols-3 gap-2">
                 <span className="font-bold text-slate-500">点検予定日時:</span>
                 <span className="col-span-2 font-black text-indigo-950 font-mono">
-                  {activeDetailItem.assignedDate || '未配置'} {activeDetailItem.assignedStartTime || '09:00'} - {activeDetailItem.assignedEndTime || '10:00'}
+                  {activeDetailItem.assignedDate || '未配置'} {formatInspectionTimeLabel(activeDetailItem)}
+                  {getInspectionTimeSlotType(activeDetailItem) !== 'custom' && (() => {
+                    const resolved = resolveCalendarTimesForItem(activeDetailItem);
+                    return (
+                      <span className="ml-1.5 text-[11px] font-medium text-slate-500">
+                        (カレンダー登録: {resolved.startTime} - {resolved.endTime})
+                      </span>
+                    );
+                  })()}
                 </span>
               </div>
               <div className="grid grid-cols-3 gap-2">
@@ -6027,6 +6054,50 @@ export function InspectionScheduler({
                   className="w-full px-3 py-2 bg-amber-50/40 border border-amber-200 rounded-xl text-slate-900 placeholder:text-slate-400 focus:ring-2 focus:ring-amber-500 focus:border-amber-500 font-medium"
                 />
               </div>
+
+              {/* 1.5 時間帯区分（未定 / AM / PM / 時間指定） */}
+              {(() => {
+                const isSlotLocked = metaModalItem.status === 'registered' && isItemReportLocked(metaModalItem);
+                const currentSlot = metaDraft.timeSlotType || 'custom';
+                return (
+                  <div className="bg-slate-50 px-3.5 py-2.5 rounded-2xl border border-slate-200/80 space-y-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-bold text-slate-800 flex items-center gap-1.5">
+                        <Clock className="w-3.5 h-3.5 text-indigo-600" />
+                        時間帯区分
+                      </span>
+                      <div className="flex items-center gap-1">
+                        {[
+                          { id: 'custom', label: '時間指定', activeCls: 'bg-indigo-600 text-white' },
+                          { id: 'undecided', label: '未定', activeCls: 'bg-slate-700 text-white' },
+                          { id: 'am', label: 'AM', activeCls: 'bg-sky-600 text-white' },
+                          { id: 'pm', label: 'PM', activeCls: 'bg-amber-600 text-white' },
+                        ].map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            disabled={isSlotLocked}
+                            onClick={() => setMetaDraft({ ...metaDraft, timeSlotType: opt.id as InspectionTimeSlotType })}
+                            className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all whitespace-nowrap ${
+                              isSlotLocked ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'
+                            } ${
+                              currentSlot === opt.id
+                                ? `${opt.activeCls} shadow-xs`
+                                : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-100'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="text-[10px] text-slate-500 flex items-center justify-between">
+                      <span>カレンダー登録時: 未定・AM＝9:00〜10:00 / PM＝13:00〜14:00</span>
+                      {isSlotLocked && <span className="text-slate-600 font-bold">報告書受領済のため変更不可</span>}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* 2. ステータスボタン系 (クリックで状態が変わる系) */}
               <div className="bg-slate-50 p-3.5 rounded-2xl border border-slate-200/80 space-y-3">

@@ -815,4 +815,310 @@ router.get(['/inspection/carry-overs', '/inspection/carry-overs/:targetYearMonth
   }
 });
 
+// ==========================================
+// 点検スケジューラー: 現場コード主軸マスター (備考・連絡/手配区分・時間帯)
+// SQL Server (dbo.InspectionSiteMasters) & Local JSON (inspection_site_masters.json) 二重永続化
+// ==========================================
+const inspectionSiteMastersPath = path.join(dataDir, 'inspection_site_masters.json');
+let cachedInspectionSiteMasters = null;
+let isInspectionSiteMastersEnsured = false;
+
+function normalizeSiteMasterKey(raw) {
+  if (raw === null || raw === undefined) return '';
+  return String(raw)
+    .replace(/[０-９Ａ-Ｚａ-ｚ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .trim()
+    .slice(0, 100);
+}
+
+function sanitizeSiteMasterMetaA(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const allowedFaxMail = new Set(['none', 'required', 'sent', 'confirmed']);
+  const allowedTel = new Set(['none', 'required', 'confirmed']);
+  const allowedPoster = new Set(['none', 'direct', 'mail', 'fax', 'post', 'postal']);
+  const allowedWorkNotice = new Set(['none', 'mail', 'fax']);
+  const allowedWebEntry = new Set(['none', 'required']);
+  const allowedTimeSlot = new Set(['custom', 'undecided', 'am', 'pm']);
+  const cleaned = {};
+
+  if (typeof raw.remarks === 'string') cleaned.remarks = raw.remarks.slice(0, 4000);
+  if (typeof raw.faxStatus === 'string' && allowedFaxMail.has(raw.faxStatus)) cleaned.faxStatus = raw.faxStatus;
+  if (typeof raw.mailStatus === 'string' && allowedFaxMail.has(raw.mailStatus)) cleaned.mailStatus = raw.mailStatus;
+  if (typeof raw.telStatus === 'string' && allowedTel.has(raw.telStatus)) cleaned.telStatus = raw.telStatus;
+  if (typeof raw.posterType === 'string' && allowedPoster.has(raw.posterType)) cleaned.posterType = raw.posterType;
+  if (typeof raw.posterDone === 'boolean') cleaned.posterDone = raw.posterDone;
+  if (typeof raw.workNoticeType === 'string' && allowedWorkNotice.has(raw.workNoticeType)) cleaned.workNoticeType = raw.workNoticeType;
+  if (typeof raw.workNoticeDone === 'boolean') cleaned.workNoticeDone = raw.workNoticeDone;
+  if (typeof raw.webEntryType === 'string' && allowedWebEntry.has(raw.webEntryType)) cleaned.webEntryType = raw.webEntryType;
+  if (typeof raw.webEntryDone === 'boolean') cleaned.webEntryDone = raw.webEntryDone;
+  if (typeof raw.timeSlotType === 'string' && allowedTimeSlot.has(raw.timeSlotType)) cleaned.timeSlotType = raw.timeSlotType;
+
+  return cleaned;
+}
+
+async function loadInspectionSiteMastersFromFile() {
+  if (cachedInspectionSiteMasters !== null) {
+    return cachedInspectionSiteMasters;
+  }
+  try {
+    if (!fs.existsSync(inspectionSiteMastersPath)) {
+      cachedInspectionSiteMasters = {};
+      return cachedInspectionSiteMasters;
+    }
+    const rawText = await fs.promises.readFile(inspectionSiteMastersPath, 'utf8');
+    const parsed = safeParseJSON(rawText, {});
+    cachedInspectionSiteMasters = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    return cachedInspectionSiteMasters;
+  } catch (e) {
+    cachedInspectionSiteMasters = {};
+    return cachedInspectionSiteMasters;
+  }
+}
+
+async function saveInspectionSiteMastersToFile(mastersMap) {
+  cachedInspectionSiteMasters = mastersMap && typeof mastersMap === 'object' && !Array.isArray(mastersMap) ? mastersMap : {};
+  try {
+    await fs.promises.writeFile(inspectionSiteMastersPath, JSON.stringify(cachedInspectionSiteMasters, null, 2), 'utf8');
+  } catch (e) {
+    console.error('Failed to save inspection site masters to file:', e);
+  }
+}
+
+const ensureInspectionSiteMastersTable = async (pool) => {
+  if (!pool || isInspectionSiteMastersEnsured) return;
+  try {
+    await pool.request().query(`
+      IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'InspectionSiteMasters' AND schema_id = SCHEMA_ID('dbo'))
+      BEGIN
+        CREATE TABLE dbo.InspectionSiteMasters (
+          siteCode NVARCHAR(100) NOT NULL PRIMARY KEY,
+          jobNo NVARCHAR(100) NULL,
+          siteName NVARCHAR(300) NULL,
+          metaAJson NVARCHAR(MAX) NULL,
+          lastPlacedStartTime VARCHAR(20) NULL,
+          lastPlacedEndTime VARCHAR(20) NULL,
+          updatedBy NVARCHAR(100) NULL,
+          updatedAt DATETIME2 NOT NULL DEFAULT GETDATE()
+        );
+      END
+    `);
+    isInspectionSiteMastersEnsured = true;
+  } catch (e) {
+    console.warn('[SQL] ensureInspectionSiteMastersTable warning:', e.message);
+  }
+};
+
+function mergeSiteMasterRecord(existing, incoming) {
+  const siteCode = normalizeSiteMasterKey(incoming.siteCode || incoming.masterKey || existing?.siteCode || incoming.jobNo);
+  const jobNo = normalizeSiteMasterKey(incoming.jobNo || existing?.jobNo || '');
+  const siteName = typeof incoming.siteName === 'string' && incoming.siteName.trim()
+    ? incoming.siteName.trim().slice(0, 300)
+    : (existing?.siteName || undefined);
+  const incomingMetaA = sanitizeSiteMasterMetaA(incoming.metaA);
+  const mergedMetaA = incomingMetaA
+    ? { ...(existing?.metaA || {}), ...incomingMetaA }
+    : (existing?.metaA || undefined);
+  const lastPlacedStartTime = typeof incoming.lastPlacedStartTime === 'string' && incoming.lastPlacedStartTime.trim()
+    ? incoming.lastPlacedStartTime.trim().slice(0, 20)
+    : existing?.lastPlacedStartTime;
+  const lastPlacedEndTime = typeof incoming.lastPlacedEndTime === 'string' && incoming.lastPlacedEndTime.trim()
+    ? incoming.lastPlacedEndTime.trim().slice(0, 20)
+    : existing?.lastPlacedEndTime;
+  const updatedBy = typeof incoming.updatedBy === 'string' && incoming.updatedBy.trim()
+    ? incoming.updatedBy.trim().slice(0, 100)
+    : (existing?.updatedBy || undefined);
+  const updatedAt = typeof incoming.updatedAt === 'string' && !Number.isNaN(Date.parse(incoming.updatedAt))
+    ? incoming.updatedAt
+    : new Date().toISOString();
+
+  return {
+    siteCode,
+    jobNo: jobNo || siteCode,
+    siteName,
+    metaA: mergedMetaA,
+    lastPlacedStartTime,
+    lastPlacedEndTime,
+    updatedBy,
+    updatedAt,
+  };
+}
+
+async function upsertSiteMasterToSql(pool, record) {
+  await ensureInspectionSiteMastersTable(pool);
+  const metaAJson = record.metaA ? JSON.stringify(record.metaA) : null;
+  await pool.request()
+    .input('siteCode', sql.NVarChar(100), record.siteCode)
+    .input('jobNo', sql.NVarChar(100), record.jobNo || null)
+    .input('siteName', sql.NVarChar(300), record.siteName || null)
+    .input('metaAJson', sql.NVarChar(sql.MAX), metaAJson)
+    .input('lastPlacedStartTime', sql.VarChar(20), record.lastPlacedStartTime || null)
+    .input('lastPlacedEndTime', sql.VarChar(20), record.lastPlacedEndTime || null)
+    .input('updatedBy', sql.NVarChar(100), record.updatedBy || null)
+    .query(`
+      IF EXISTS (SELECT 1 FROM dbo.InspectionSiteMasters WHERE siteCode = @siteCode)
+      BEGIN
+        UPDATE dbo.InspectionSiteMasters
+        SET jobNo = COALESCE(@jobNo, jobNo),
+            siteName = COALESCE(@siteName, siteName),
+            metaAJson = COALESCE(@metaAJson, metaAJson),
+            lastPlacedStartTime = COALESCE(@lastPlacedStartTime, lastPlacedStartTime),
+            lastPlacedEndTime = COALESCE(@lastPlacedEndTime, lastPlacedEndTime),
+            updatedBy = COALESCE(@updatedBy, updatedBy),
+            updatedAt = GETDATE()
+        WHERE siteCode = @siteCode
+      END
+      ELSE
+      BEGIN
+        INSERT INTO dbo.InspectionSiteMasters (siteCode, jobNo, siteName, metaAJson, lastPlacedStartTime, lastPlacedEndTime, updatedBy, updatedAt)
+        VALUES (@siteCode, @jobNo, @siteName, @metaAJson, @lastPlacedStartTime, @lastPlacedEndTime, @updatedBy, GETDATE())
+      END
+    `);
+}
+
+// 現場マスター一覧取得
+router.get(['/inspection/site-masters', '/api/inspection/site-masters'], async (req, res) => {
+  try {
+    const fileMasters = await loadInspectionSiteMastersFromFile();
+    const mergedMasters = { ...fileMasters };
+    let storage = Object.keys(fileMasters).length > 0 ? 'file' : 'none';
+
+    try {
+      const pool = await getPool();
+      if (pool) {
+        await ensureInspectionSiteMastersTable(pool);
+        const sqlRes = await pool.request().query('SELECT * FROM dbo.InspectionSiteMasters');
+        if (sqlRes.recordset && sqlRes.recordset.length > 0) {
+          for (const row of sqlRes.recordset) {
+            const key = normalizeSiteMasterKey(row.siteCode);
+            if (!key) continue;
+            const parsedMeta = row.metaAJson ? safeParseJSON(row.metaAJson, undefined) : undefined;
+            mergedMasters[key] = {
+              siteCode: key,
+              jobNo: row.jobNo || key,
+              siteName: row.siteName || undefined,
+              metaA: parsedMeta,
+              lastPlacedStartTime: row.lastPlacedStartTime || undefined,
+              lastPlacedEndTime: row.lastPlacedEndTime || undefined,
+              updatedBy: row.updatedBy || undefined,
+              updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : new Date().toISOString(),
+            };
+          }
+          storage = 'sql';
+        }
+      }
+    } catch (sqlErr) {
+      console.warn('[SQL] Site masters fetch notice, using file fallback:', sqlErr.message);
+    }
+
+    res.json({
+      masters: mergedMasters,
+      count: Object.keys(mergedMasters).length,
+      storage,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 現場マスター単件・複数保存（現場コード主軸）
+const handleSaveSiteMaster = async (req, res) => {
+  try {
+    const body = req.body || {};
+    const rawEntries = Array.isArray(body.entries)
+      ? body.entries
+      : (body.masters && typeof body.masters === 'object' && !Array.isArray(body.masters))
+      ? Object.entries(body.masters).map(([k, v]) => ({ ...(v || {}), siteCode: v?.siteCode || k }))
+      : [body];
+
+    const fileMasters = { ...(await loadInspectionSiteMastersFromFile()) };
+    const savedRecords = [];
+    let savedToSql = false;
+
+    let pool = null;
+    try {
+      pool = await getPool();
+      if (pool) {
+        await ensureInspectionSiteMastersTable(pool);
+      }
+    } catch (sqlErr) {
+      console.warn('[SQL] Site master pool unavailable, falling back to file:', sqlErr.message);
+    }
+
+    for (const entry of rawEntries) {
+      if (!entry || typeof entry !== 'object') continue;
+      const key = normalizeSiteMasterKey(entry.siteCode || entry.masterKey || entry.jobNo);
+      if (!key) continue;
+
+      let existing = fileMasters[key] || null;
+
+      // SQL 側に最新がある場合はマージ元に採用
+      if (pool) {
+        try {
+          const existingSql = await pool.request()
+            .input('siteCode', sql.NVarChar(100), key)
+            .query('SELECT * FROM dbo.InspectionSiteMasters WHERE siteCode = @siteCode');
+          if (existingSql.recordset && existingSql.recordset.length > 0) {
+            const row = existingSql.recordset[0];
+            existing = {
+              siteCode: key,
+              jobNo: row.jobNo || key,
+              siteName: row.siteName || undefined,
+              metaA: row.metaAJson ? safeParseJSON(row.metaAJson, undefined) : undefined,
+              lastPlacedStartTime: row.lastPlacedStartTime || undefined,
+              lastPlacedEndTime: row.lastPlacedEndTime || undefined,
+              updatedBy: row.updatedBy || undefined,
+              updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : undefined,
+            };
+          }
+        } catch (_) {}
+      }
+
+      // bulk移行時は既存の方が新しければ上書きスキップ
+      if (body.onlyIfNewer && existing?.updatedAt && entry.updatedAt) {
+        const existingTs = Date.parse(existing.updatedAt);
+        const incomingTs = Date.parse(entry.updatedAt);
+        if (!Number.isNaN(existingTs) && !Number.isNaN(incomingTs) && existingTs >= incomingTs) {
+          continue;
+        }
+      }
+
+      const merged = mergeSiteMasterRecord(existing, { ...entry, siteCode: key });
+      fileMasters[key] = merged;
+
+      if (pool) {
+        try {
+          await upsertSiteMasterToSql(pool, merged);
+          savedToSql = true;
+        } catch (sqlErr) {
+          console.warn('[SQL] Site master upsert warning:', sqlErr.message);
+        }
+      }
+
+      savedRecords.push(merged);
+    }
+
+    if (savedRecords.length === 0 && !body.onlyIfNewer) {
+      return res.status(400).json({ error: '有効な現場コード（siteCode）が必要です。' });
+    }
+
+    await saveInspectionSiteMastersToFile(fileMasters);
+
+    res.json({
+      success: true,
+      savedCount: savedRecords.length,
+      entry: savedRecords.length === 1 ? savedRecords[0] : undefined,
+      storage: savedToSql ? 'sql' : 'file',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+router.post(['/inspection/site-masters', '/api/inspection/site-masters'], handleSaveSiteMaster);
+router.put(['/inspection/site-masters', '/api/inspection/site-masters'], handleSaveSiteMaster);
+router.post(['/inspection/site-masters/bulk', '/api/inspection/site-masters/bulk'], (req, res) => {
+  req.body = { ...(req.body || {}), onlyIfNewer: req.body?.onlyIfNewer !== false };
+  return handleSaveSiteMaster(req, res);
+});
+
 export default router;

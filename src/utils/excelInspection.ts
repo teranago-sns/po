@@ -1,6 +1,7 @@
 import * as XLSX from 'xlsx';
 import ExcelJS from 'exceljs';
 import { User, CalendarEvent } from '../types';
+import { API_BASE_URL } from '../config/api';
 
 export type InspectionFaxStatus = 'none' | 'required' | 'sent' | 'confirmed';
 export type InspectionMailStatus = 'none' | 'required' | 'sent' | 'confirmed';
@@ -8,6 +9,7 @@ export type InspectionTelStatus = 'none' | 'required' | 'confirmed';
 export type InspectionPosterType = 'none' | 'direct' | 'mail' | 'fax' | 'post' | 'postal';
 export type InspectionWorkNoticeType = 'none' | 'mail' | 'fax';
 export type InspectionWebEntryType = 'none' | 'required';
+export type InspectionTimeSlotType = 'custom' | 'undecided' | 'am' | 'pm';
 
 export interface InspectionMetaA {
   remarks?: string;                         // 備考
@@ -20,26 +22,105 @@ export interface InspectionMetaA {
   workNoticeDone?: boolean;                 // 作業届 済フラグ (false: 未済/赤, true: 済/濃い緑)
   webEntryType?: InspectionWebEntryType;    // WEB入力 (なし/必要)
   webEntryDone?: boolean;                   // WEB入力 済フラグ (false: 未済/赤, true: 済/濃い緑)
+  timeSlotType?: InspectionTimeSlotType;    // 時間帯区分 (時間指定/未定/AM/PM)
+}
+
+/** アイテムの時間帯区分を取得（未設定の既存データは 'custom' 扱い） */
+export function getInspectionTimeSlotType(item?: {
+  timeSlotType?: InspectionTimeSlotType;
+  metaA?: InspectionMetaA;
+}): InspectionTimeSlotType {
+  return item?.timeSlotType || item?.metaA?.timeSlotType || 'custom';
+}
+
+/**
+ * カレンダー登録用の開始・終了時刻を解決する
+ * - 未定: 09:00〜10:00
+ * - AM: 09:00〜10:00
+ * - PM: 13:00〜14:00
+ * - 時間指定: assignedStartTime〜assignedEndTime
+ */
+export function resolveCalendarTimesForItem(item: {
+  timeSlotType?: InspectionTimeSlotType;
+  metaA?: InspectionMetaA;
+  assignedStartTime?: string;
+  assignedEndTime?: string;
+}): { startTime: string; endTime: string } {
+  const slot = getInspectionTimeSlotType(item);
+  if (slot === 'undecided' || slot === 'am') {
+    return { startTime: '09:00', endTime: '10:00' };
+  }
+  if (slot === 'pm') {
+    return { startTime: '13:00', endTime: '14:00' };
+  }
+  return {
+    startTime: item.assignedStartTime || '09:00',
+    endTime: item.assignedEndTime || '10:00',
+  };
+}
+
+/** カード・一覧・詳細表示用の時間帯ラベルを生成する */
+export function formatInspectionTimeLabel(
+  item: {
+    timeSlotType?: InspectionTimeSlotType;
+    metaA?: InspectionMetaA;
+    assignedStartTime?: string;
+    assignedEndTime?: string;
+  },
+  compact = false
+): string {
+  const slot = getInspectionTimeSlotType(item);
+  if (slot === 'undecided') return '未定';
+  if (slot === 'am') return 'AM';
+  if (slot === 'pm') return 'PM';
+  const start = item.assignedStartTime || '09:00';
+  const end = item.assignedEndTime || '10:00';
+  return compact ? start : `${start} - ${end}`;
 }
 
 export interface SiteInspectionMasterEntry {
-  jobNo: string;
-  siteCode?: string;
+  siteCode?: string;            // 主軸キー: 現場コード
+  jobNo: string;                // 最終参照の作業No（後方互換・補助）
   siteName?: string;
   metaA?: InspectionMetaA;
   lastPlacedStartTime?: string; // 例: '09:00'
   lastPlacedEndTime?: string;   // 例: '10:00'
+  updatedBy?: string;
   updatedAt: string;
 }
 
 const MASTER_STORAGE_KEY = 'inspection_site_master_cache';
+
+/** 現場コード・キー文字列の正規化（前後空白除去・全角英数→半角化） */
+export function normalizeSiteCode(raw?: string | number | null): string {
+  if (raw === null || raw === undefined) return '';
+  return String(raw)
+    .replace(/[０-９Ａ-Ｚａ-ｚ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .trim();
+}
+
+/** 先頭ゼロ揺れ吸収用（例: '015150' と '15150' を同一現場コードとして照合可能にする） */
+function stripLeadingZeros(code: string): string {
+  const stripped = code.replace(/^0+/, '');
+  return stripped || code;
+}
+
+/** 保存キー決定: 現場コードを最優先し、未設定時のみ作業Noへフォールバック */
+export function resolveSiteMasterKey(siteCode?: string, jobNo?: string): string {
+  const normSiteCode = normalizeSiteCode(siteCode);
+  if (normSiteCode) return normSiteCode;
+  return normalizeSiteCode(jobNo);
+}
 
 /** 全現場の最新メタデータ＆仮配置時間マスターキャッシュを取得 */
 export function getAllSiteMasters(): Record<string, SiteInspectionMasterEntry> {
   try {
     const raw = localStorage.getItem(MASTER_STORAGE_KEY);
     if (raw) {
-      return JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed;
+      }
     }
   } catch (err) {
     console.warn('Failed to load site master cache:', err);
@@ -47,34 +128,216 @@ export function getAllSiteMasters(): Record<string, SiteInspectionMasterEntry> {
   return {};
 }
 
-/** 現場ごとの最新メタデータ＆仮配置時間マスターを保存・更新する */
+/** ローカルキャッシュへマスターマップを保存 */
+function writeLocalSiteMasters(masters: Record<string, SiteInspectionMasterEntry>) {
+  try {
+    localStorage.setItem(MASTER_STORAGE_KEY, JSON.stringify(masters));
+  } catch (err) {
+    console.warn('Failed to write site master cache:', err);
+  }
+}
+
+/**
+ * 現場コード主軸でマスターを検索（先頭ゼロ揺れ・旧作業Noキーにも後方互換対応）
+ */
+export function findSiteMasterEntry(
+  masters: Record<string, SiteInspectionMasterEntry>,
+  target: { siteCode?: string; jobNo?: string }
+): SiteInspectionMasterEntry | undefined {
+  const normSiteCode = normalizeSiteCode(target.siteCode);
+  const normJobNo = normalizeSiteCode(target.jobNo);
+
+  // 1. 現場コード完全一致（最優先）
+  if (normSiteCode && masters[normSiteCode]) {
+    return masters[normSiteCode];
+  }
+
+  // 2. 現場コードの数値先頭ゼロ揺れ一致 / 旧データ（jobNoキー配下のsiteCode）からの一致
+  if (normSiteCode) {
+    const strippedTarget = stripLeadingZeros(normSiteCode);
+    for (const [key, entry] of Object.entries(masters)) {
+      if (!entry) continue;
+      const entrySiteCode = normalizeSiteCode(entry.siteCode);
+      if (entrySiteCode && (entrySiteCode === normSiteCode || stripLeadingZeros(entrySiteCode) === strippedTarget)) {
+        return entry;
+      }
+      const normKey = normalizeSiteCode(key);
+      if (normKey && stripLeadingZeros(normKey) === strippedTarget) {
+        return entry;
+      }
+    }
+  }
+
+  // 3. 後方互換: 現場コードがない行や旧データ向けの作業No一致
+  if (normJobNo && masters[normJobNo]) {
+    return masters[normJobNo];
+  }
+
+  return undefined;
+}
+
+/**
+ * サーバーから全現場マスター（現場コード主軸）を取得してローカルキャッシュへ同期する。
+ * ローカルに旧ブラウザ保存分のデータが残っている場合は、現場コードキーへ正規化してサーバーへ自動移行する。
+ */
+export async function fetchSiteMastersFromServer(
+  updatedBy?: string
+): Promise<Record<string, SiteInspectionMasterEntry>> {
+  const localMasters = getAllSiteMasters();
+
+  // ローカルキャッシュを現場コード主軸に正規化（旧jobNoキーで保存されていた分もsiteCodeキーへ統合）
+  const normalizedLocal: Record<string, SiteInspectionMasterEntry> = {};
+  for (const [rawKey, entry] of Object.entries(localMasters)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const key = resolveSiteMasterKey(entry.siteCode, entry.jobNo || rawKey);
+    if (!key) continue;
+    const prev = normalizedLocal[key];
+    const prevTs = prev?.updatedAt ? Date.parse(prev.updatedAt) : 0;
+    const curTs = entry.updatedAt ? Date.parse(entry.updatedAt) : 0;
+    if (!prev || curTs >= prevTs) {
+      normalizedLocal[key] = {
+        ...entry,
+        siteCode: normalizeSiteCode(entry.siteCode) || key,
+        jobNo: normalizeSiteCode(entry.jobNo) || key,
+      };
+    }
+  }
+
+  try {
+    const res = await fetch(`${API_BASE_URL}/inspection/site-masters`, {
+      headers: { Accept: 'application/json' },
+    });
+
+    if (!res.ok) {
+      writeLocalSiteMasters(normalizedLocal);
+      return normalizedLocal;
+    }
+
+    const data = await res.json();
+    const serverMastersRaw =
+      data && data.masters && typeof data.masters === 'object' && !Array.isArray(data.masters)
+        ? (data.masters as Record<string, SiteInspectionMasterEntry>)
+        : {};
+
+    const merged: Record<string, SiteInspectionMasterEntry> = {};
+
+    // サーバー側のレコードをベースに構築
+    for (const [rawKey, entry] of Object.entries(serverMastersRaw)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const key = resolveSiteMasterKey(entry.siteCode, entry.jobNo || rawKey);
+      if (!key) continue;
+      merged[key] = {
+        ...entry,
+        siteCode: normalizeSiteCode(entry.siteCode) || key,
+        jobNo: normalizeSiteCode(entry.jobNo) || key,
+      };
+    }
+
+    // ローカルにのみ存在するレコード、またはローカルの方が新しいレコードを検出してサーバーへ移行
+    const toMigrate: SiteInspectionMasterEntry[] = [];
+    for (const [key, localEntry] of Object.entries(normalizedLocal)) {
+      const serverEntry = merged[key];
+      const serverTs = serverEntry?.updatedAt ? Date.parse(serverEntry.updatedAt) : 0;
+      const localTs = localEntry.updatedAt ? Date.parse(localEntry.updatedAt) : 0;
+
+      if (!serverEntry || localTs > serverTs) {
+        const entryToPush: SiteInspectionMasterEntry = {
+          ...localEntry,
+          siteCode: normalizeSiteCode(localEntry.siteCode) || key,
+          updatedBy: localEntry.updatedBy || updatedBy,
+        };
+        merged[key] = entryToPush;
+        toMigrate.push(entryToPush);
+      }
+    }
+
+    writeLocalSiteMasters(merged);
+
+    if (toMigrate.length > 0) {
+      fetch(`${API_BASE_URL}/inspection/site-masters/bulk`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          entries: toMigrate,
+          onlyIfNewer: true,
+        }),
+      }).catch((err) => {
+        console.warn('Failed to migrate local site masters to server:', err);
+      });
+    }
+
+    return merged;
+  } catch (err) {
+    console.warn('Failed to fetch site masters from server, using local cache:', err);
+    writeLocalSiteMasters(normalizedLocal);
+    return normalizedLocal;
+  }
+}
+
+/**
+ * 現場ごとの最新メタデータ＆仮配置時間マスターを保存・更新する
+ * - 現場コード（siteCode）を主軸キーとして保存（現場コード未設定時のみ jobNo をキーに使用）
+ * - ローカルキャッシュへ即時反映しつつ、サーバー（SQL Server & JSON）へ非同期永続化
+ */
 export function saveSiteMasterEntry(
-  jobNo: string,
+  primaryKeyOrJobNo: string,
   data: {
     siteCode?: string;
+    jobNo?: string;
     siteName?: string;
     metaA?: InspectionMetaA;
     lastPlacedStartTime?: string;
     lastPlacedEndTime?: string;
+    updatedBy?: string;
   }
 ) {
-  if (!jobNo) return;
+  const normSiteCode = normalizeSiteCode(data.siteCode);
+  const normJobNo = normalizeSiteCode(data.jobNo || (normSiteCode ? '' : primaryKeyOrJobNo));
+  const masterKey = resolveSiteMasterKey(normSiteCode, normJobNo || primaryKeyOrJobNo);
+  if (!masterKey) return;
+
   try {
     const masters = getAllSiteMasters();
-    const existing = masters[jobNo] || { jobNo, updatedAt: new Date().toISOString() };
+    const existing =
+      masters[masterKey] ||
+      findSiteMasterEntry(masters, { siteCode: normSiteCode, jobNo: normJobNo || primaryKeyOrJobNo }) || {
+        siteCode: normSiteCode || masterKey,
+        jobNo: normJobNo || masterKey,
+        updatedAt: new Date().toISOString(),
+      };
 
     const mergedMetaA = data.metaA ? { ...(existing.metaA || {}), ...data.metaA } : existing.metaA;
+    const nowIso = new Date().toISOString();
 
-    masters[jobNo] = {
+    const nextEntry: SiteInspectionMasterEntry = {
       ...existing,
-      siteCode: data.siteCode || existing.siteCode,
+      siteCode: normSiteCode || existing.siteCode || masterKey,
+      jobNo: normJobNo || existing.jobNo || masterKey,
       siteName: data.siteName || existing.siteName,
       metaA: mergedMetaA,
       lastPlacedStartTime: data.lastPlacedStartTime !== undefined ? data.lastPlacedStartTime : existing.lastPlacedStartTime,
       lastPlacedEndTime: data.lastPlacedEndTime !== undefined ? data.lastPlacedEndTime : existing.lastPlacedEndTime,
-      updatedAt: new Date().toISOString(),
+      updatedBy: data.updatedBy || existing.updatedBy,
+      updatedAt: nowIso,
     };
-    localStorage.setItem(MASTER_STORAGE_KEY, JSON.stringify(masters));
+
+    masters[masterKey] = nextEntry;
+    writeLocalSiteMasters(masters);
+
+    // サーバー（SQL Server & JSON）へ永続同期
+    fetch(`${API_BASE_URL}/inspection/site-masters`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify(nextEntry),
+    }).catch((err) => {
+      console.warn('Failed to sync site master entry to server:', err);
+    });
   } catch (err) {
     console.warn('Failed to save site master entry:', err);
   }
@@ -83,11 +346,12 @@ export function saveSiteMasterEntry(
 /**
  * 過去マスターから新月度アイテムへメタデータ（A）と仮配置時間を引き継ぐ
  * 【重要ルール】
+ * - 現場コード（siteCode）を主軸に同一現場を判定する（未設定時のみ作業Noへフォールバック）
  * - 「済」のステータスはコピー時に元に戻り（未済・必要に戻る）、済のままコピーされるケースは絶対にない。
  * - 備考・貼紙区分・作業届区分・WEB入力区分・仮配置時間はそのまま引き継ぐ。
  */
 export function applyMasterToItem(item: InspectionItem, master?: SiteInspectionMasterEntry): InspectionItem {
-  const masterEntry = master || (item.jobNo ? getAllSiteMasters()[item.jobNo] : null) || (item.siteCode ? getAllSiteMasters()[item.siteCode] : null);
+  const masterEntry = master || findSiteMasterEntry(getAllSiteMasters(), item);
   if (!masterEntry) return item;
 
   const mMeta = masterEntry.metaA;
@@ -137,24 +401,41 @@ export function applyMasterToItem(item: InspectionItem, master?: SiteInspectionM
       newMetaA.webEntryType = mMeta.webEntryType;
       newMetaA.webEntryDone = false;
     }
+
+    // 時間帯区分（未定/AM/PM/時間指定）を引き継ぐ
+    if (mMeta.timeSlotType && !newMetaA.timeSlotType) {
+      newMetaA.timeSlotType = mMeta.timeSlotType;
+    }
   }
 
-  // 仮配置時の時間枠を引き継ぐ（未設定の場合）
-  const assignedStartTime = item.assignedStartTime || masterEntry.lastPlacedStartTime;
-  const assignedEndTime = item.assignedEndTime || masterEntry.lastPlacedEndTime;
+  const inheritedTimeSlotType = item.timeSlotType || newMetaA.timeSlotType;
+  let assignedStartTime = item.assignedStartTime || masterEntry.lastPlacedStartTime;
+  let assignedEndTime = item.assignedEndTime || masterEntry.lastPlacedEndTime;
+
+  if (inheritedTimeSlotType === 'undecided' || inheritedTimeSlotType === 'am') {
+    assignedStartTime = '09:00';
+    assignedEndTime = '10:00';
+  } else if (inheritedTimeSlotType === 'pm') {
+    assignedStartTime = '13:00';
+    assignedEndTime = '14:00';
+  }
 
   return {
     ...item,
     metaA: newMetaA,
+    timeSlotType: inheritedTimeSlotType,
     assignedStartTime,
     assignedEndTime,
   };
 }
 
 /** アイテム配列全体にマスターを適用する */
-export function batchApplyMasterToItems(items: InspectionItem[]): InspectionItem[] {
-  const masters = getAllSiteMasters();
-  return items.map((item) => applyMasterToItem(item, masters[item.jobNo] || (item.siteCode ? masters[item.siteCode] : undefined)));
+export function batchApplyMasterToItems(
+  items: InspectionItem[],
+  mastersOverride?: Record<string, SiteInspectionMasterEntry>
+): InspectionItem[] {
+  const masters = mastersOverride || getAllSiteMasters();
+  return items.map((item) => applyMasterToItem(item, findSiteMasterEntry(masters, item)));
 }
 
 /**
@@ -174,7 +455,7 @@ export function duplicateInspectionItem(
 ): InspectionItem {
   const ym = options?.targetYearMonth || sourceItem.targetYearMonth;
   const masters = getAllSiteMasters();
-  const masterEntry = (sourceItem.jobNo ? masters[sourceItem.jobNo] : null) || (sourceItem.siteCode ? masters[sourceItem.siteCode] : null);
+  const masterEntry = findSiteMasterEntry(masters, sourceItem);
 
   // メタデータ構築
   const srcMeta = sourceItem.metaA || {};
@@ -210,10 +491,19 @@ export function duplicateInspectionItem(
     webEntryDone: false,
   };
 
+  const inheritedTimeSlotType = sourceItem.timeSlotType || srcMeta.timeSlotType || masterMeta.timeSlotType;
+  if (inheritedTimeSlotType) {
+    newMetaA.timeSlotType = inheritedTimeSlotType;
+  }
+
   // 時間引き継ぎ:
-  // マスターに記録されたカスタム時間があるか、または元アイテムで時間がカスタマイズされていた場合はそれを引き継ぐ
-  const assignedStartTime = masterEntry?.lastPlacedStartTime || (sourceItem.assignedStartTime && sourceItem.assignedStartTime !== '09:00' ? sourceItem.assignedStartTime : undefined) || '09:00';
-  const assignedEndTime = masterEntry?.lastPlacedEndTime || (sourceItem.assignedEndTime && sourceItem.assignedEndTime !== '10:00' ? sourceItem.assignedEndTime : undefined) || '10:00';
+  // 時間帯区分（未定/AM/PM）があれば規定時刻を適用し、それ以外はカスタム時間を引き継ぐ
+  const resolvedTimes = inheritedTimeSlotType && inheritedTimeSlotType !== 'custom'
+    ? resolveCalendarTimesForItem({ timeSlotType: inheritedTimeSlotType })
+    : {
+        startTime: masterEntry?.lastPlacedStartTime || (sourceItem.assignedStartTime && sourceItem.assignedStartTime !== '09:00' ? sourceItem.assignedStartTime : undefined) || '09:00',
+        endTime: masterEntry?.lastPlacedEndTime || (sourceItem.assignedEndTime && sourceItem.assignedEndTime !== '10:00' ? sourceItem.assignedEndTime : undefined) || '10:00',
+      };
 
   const newStatus = options?.status !== undefined ? options.status : (options?.newDate ? 'placed' : sourceItem.status);
 
@@ -222,8 +512,9 @@ export function duplicateInspectionItem(
     id: `insp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     targetYearMonth: ym,
     assignedDate: options?.newDate !== undefined ? options.newDate : (options?.targetYearMonth ? undefined : sourceItem.assignedDate),
-    assignedStartTime,
-    assignedEndTime,
+    timeSlotType: inheritedTimeSlotType,
+    assignedStartTime: resolvedTimes.startTime,
+    assignedEndTime: resolvedTimes.endTime,
     status: newStatus,
     metaA: newMetaA,
     isConfirmed: false,
@@ -298,6 +589,7 @@ export interface InspectionItem {
 
   // 日付・時刻配置 (Step 3 & 4)
   assignedDate?: string;      // YYYY-MM-DD
+  timeSlotType?: InspectionTimeSlotType; // 'custom' | 'undecided' | 'am' | 'pm'
   assignedStartTime?: string; // HH:mm
   assignedEndTime?: string;   // HH:mm
 
@@ -798,8 +1090,15 @@ export async function exportInspectionCalendarMatrixToExcel(
       // テキスト行の構築
       const lines: string[] = [];
 
-      // 1行目: 物件名 + 開始時間 + 台数 + 地区
-      const timeStr = item.assignedStartTime ? (item.assignedEndTime ? `${item.assignedStartTime}〜${item.assignedEndTime}` : item.assignedStartTime) : '';
+      // 1行目: 物件名 + 時間帯（未定/AM/PM/時刻） + 台数 + 地区
+      const slotType = getInspectionTimeSlotType(item);
+      const timeStr = slotType === 'undecided'
+        ? '未定'
+        : slotType === 'am'
+        ? 'AM'
+        : slotType === 'pm'
+        ? 'PM'
+        : (item.assignedStartTime ? (item.assignedEndTime ? `${item.assignedStartTime}〜${item.assignedEndTime}` : item.assignedStartTime) : '');
       const qtyStr = item.quantity ? `${item.quantity}台` : '';
       const areaStr = item.area ? `${item.area}` : '';
       const line1 = [item.siteName, timeStr, qtyStr, areaStr].filter(Boolean).join(' ');

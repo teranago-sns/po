@@ -2336,6 +2336,150 @@ async function startServer() {
   });
 
   // ==========================================
+  // 点検スケジューラー: 現場コード主軸マスター (備考・連絡/手配区分・時間帯) API
+  // ==========================================
+  const inspectionSiteMastersPath = path.join(dataDir, 'inspection_site_masters.json');
+
+  function normalizeSiteMasterKey(raw: any): string {
+    if (raw === null || raw === undefined) return '';
+    return String(raw)
+      .replace(/[０-９Ａ-Ｚａ-ｚ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+      .trim()
+      .slice(0, 100);
+  }
+
+  function sanitizeSiteMasterMetaA(raw: any): Record<string, any> | undefined {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const allowedFaxMail = new Set(['none', 'required', 'sent', 'confirmed']);
+    const allowedTel = new Set(['none', 'required', 'confirmed']);
+    const allowedPoster = new Set(['none', 'direct', 'mail', 'fax', 'post', 'postal']);
+    const allowedWorkNotice = new Set(['none', 'mail', 'fax']);
+    const allowedWebEntry = new Set(['none', 'required']);
+    const allowedTimeSlot = new Set(['custom', 'undecided', 'am', 'pm']);
+    const cleaned: Record<string, any> = {};
+
+    if (typeof raw.remarks === 'string') cleaned.remarks = raw.remarks.slice(0, 4000);
+    if (typeof raw.faxStatus === 'string' && allowedFaxMail.has(raw.faxStatus)) cleaned.faxStatus = raw.faxStatus;
+    if (typeof raw.mailStatus === 'string' && allowedFaxMail.has(raw.mailStatus)) cleaned.mailStatus = raw.mailStatus;
+    if (typeof raw.telStatus === 'string' && allowedTel.has(raw.telStatus)) cleaned.telStatus = raw.telStatus;
+    if (typeof raw.posterType === 'string' && allowedPoster.has(raw.posterType)) cleaned.posterType = raw.posterType;
+    if (typeof raw.posterDone === 'boolean') cleaned.posterDone = raw.posterDone;
+    if (typeof raw.workNoticeType === 'string' && allowedWorkNotice.has(raw.workNoticeType)) cleaned.workNoticeType = raw.workNoticeType;
+    if (typeof raw.workNoticeDone === 'boolean') cleaned.workNoticeDone = raw.workNoticeDone;
+    if (typeof raw.webEntryType === 'string' && allowedWebEntry.has(raw.webEntryType)) cleaned.webEntryType = raw.webEntryType;
+    if (typeof raw.webEntryDone === 'boolean') cleaned.webEntryDone = raw.webEntryDone;
+    if (typeof raw.timeSlotType === 'string' && allowedTimeSlot.has(raw.timeSlotType)) cleaned.timeSlotType = raw.timeSlotType;
+
+    return cleaned;
+  }
+
+  function loadInspectionSiteMasters(): Record<string, any> {
+    if (!fs.existsSync(inspectionSiteMastersPath)) return {};
+    try {
+      const parsed = JSON.parse(fs.readFileSync(inspectionSiteMastersPath, 'utf8'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function saveInspectionSiteMasters(masters: Record<string, any>) {
+    try {
+      fs.writeFileSync(inspectionSiteMastersPath, JSON.stringify(masters, null, 2), 'utf8');
+    } catch (e) {
+      console.error('Failed to save inspection site masters:', e);
+    }
+  }
+
+  app.get('/api/inspection/site-masters', (_req, res) => {
+    try {
+      const masters = loadInspectionSiteMasters();
+      res.json({
+        masters,
+        count: Object.keys(masters).length,
+        storage: Object.keys(masters).length > 0 ? 'file' : 'none',
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  const handleSaveInspectionSiteMasters = (req: express.Request, res: express.Response) => {
+    try {
+      const body = req.body || {};
+      const rawEntries = Array.isArray(body.entries)
+        ? body.entries
+        : (body.masters && typeof body.masters === 'object' && !Array.isArray(body.masters))
+        ? Object.entries(body.masters).map(([k, v]: [string, any]) => ({ ...(v || {}), siteCode: v?.siteCode || k }))
+        : [body];
+
+      const masters = loadInspectionSiteMasters();
+      const savedRecords: any[] = [];
+
+      for (const entry of rawEntries) {
+        if (!entry || typeof entry !== 'object') continue;
+        const key = normalizeSiteMasterKey(entry.siteCode || entry.masterKey || entry.jobNo);
+        if (!key) continue;
+
+        const existing = masters[key] || null;
+        if (body.onlyIfNewer && existing?.updatedAt && entry.updatedAt) {
+          const existingTs = Date.parse(existing.updatedAt);
+          const incomingTs = Date.parse(entry.updatedAt);
+          if (!Number.isNaN(existingTs) && !Number.isNaN(incomingTs) && existingTs >= incomingTs) {
+            continue;
+          }
+        }
+
+        const incomingMetaA = sanitizeSiteMasterMetaA(entry.metaA);
+        const merged = {
+          siteCode: key,
+          jobNo: normalizeSiteMasterKey(entry.jobNo || existing?.jobNo || '') || key,
+          siteName: typeof entry.siteName === 'string' && entry.siteName.trim()
+            ? entry.siteName.trim().slice(0, 300)
+            : (existing?.siteName || undefined),
+          metaA: incomingMetaA ? { ...(existing?.metaA || {}), ...incomingMetaA } : (existing?.metaA || undefined),
+          lastPlacedStartTime: typeof entry.lastPlacedStartTime === 'string' && entry.lastPlacedStartTime.trim()
+            ? entry.lastPlacedStartTime.trim().slice(0, 20)
+            : existing?.lastPlacedStartTime,
+          lastPlacedEndTime: typeof entry.lastPlacedEndTime === 'string' && entry.lastPlacedEndTime.trim()
+            ? entry.lastPlacedEndTime.trim().slice(0, 20)
+            : existing?.lastPlacedEndTime,
+          updatedBy: typeof entry.updatedBy === 'string' && entry.updatedBy.trim()
+            ? entry.updatedBy.trim().slice(0, 100)
+            : (existing?.updatedBy || undefined),
+          updatedAt: typeof entry.updatedAt === 'string' && !Number.isNaN(Date.parse(entry.updatedAt))
+            ? entry.updatedAt
+            : new Date().toISOString(),
+        };
+
+        masters[key] = merged;
+        savedRecords.push(merged);
+      }
+
+      if (savedRecords.length === 0 && !body.onlyIfNewer) {
+        return res.status(400).json({ error: '有効な現場コード（siteCode）が必要です。' });
+      }
+
+      saveInspectionSiteMasters(masters);
+      res.json({
+        success: true,
+        savedCount: savedRecords.length,
+        entry: savedRecords.length === 1 ? savedRecords[0] : undefined,
+        storage: 'file',
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  };
+
+  app.post('/api/inspection/site-masters', handleSaveInspectionSiteMasters);
+  app.put('/api/inspection/site-masters', handleSaveInspectionSiteMasters);
+  app.post('/api/inspection/site-masters/bulk', (req, res) => {
+    req.body = { ...(req.body || {}), onlyIfNewer: req.body?.onlyIfNewer !== false };
+    return handleSaveInspectionSiteMasters(req, res);
+  });
+
+  // ==========================================
   // 通知 (Notifications) API & ヘルパー
   // ==========================================
   const notificationsPath = path.join(dataDir, 'notifications.json');
