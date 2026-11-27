@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   DailyReport, 
   User, 
@@ -50,7 +50,8 @@ import {
   MessageSquare,
   ArrowRight,
   ShieldCheck,
-  Undo2
+  Undo2,
+  X
 } from 'lucide-react';
 import { getAvatarUrl } from '../utils/avatar';
 import { triggerOpenUserModal } from '../utils/userModal';
@@ -896,8 +897,12 @@ export function MaintenanceDailyReportView({
 
   // allReports が渡されていない場合の補完フェッチ
   const [fetchedReports, setFetchedReports] = useState<DailyReport[]>([]);
+  const [isReportsReady, setIsReportsReady] = useState<boolean>(() => Boolean(allReports && allReports.length > 0));
   useEffect(() => {
-    if (allReports && allReports.length > 0) return;
+    if (allReports && allReports.length > 0) {
+      setIsReportsReady(true);
+      return;
+    }
     let isMounted = true;
     fetch(`${API_BASE_URL}/work-reports`)
       .then(res => res.json())
@@ -907,7 +912,10 @@ export function MaintenanceDailyReportView({
           setFetchedReports(data);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (isMounted) setIsReportsReady(true);
+      });
     return () => { isMounted = false; };
   }, [allReports]);
 
@@ -1551,16 +1559,40 @@ export function MaintenanceDailyReportView({
   ]);
 
   // ---------------- スケジュールからの自動読み込み ----------------
-  const handleAutoLoadSchedule = () => {
-    if (!reportDate) {
-      alert('日付を選択してください。');
-      return;
-    }
+  const [autoImportNotice, setAutoImportNotice] = useState<string | null>(null);
+  const hasAutoImportedOnInitRef = useRef<boolean>(false);
 
-    const targetDateStr = reportDate.split('T')[0];
-    const [y, m, d] = targetDateStr.split('-').map(Number);
-    const viewStart = new Date(y, m - 1, d, 0, 0, 0);
-    const viewEnd = new Date(y, m - 1, d, 23, 59, 59);
+  // 指定日に本人の保守日報（提出済・確認済・下書き含む）がすでに存在するか判定
+  const hasExistingMaintenanceReportForDate = (targetDateStr: string): boolean => {
+    if (!targetDateStr) return false;
+    return effectiveAllReports.some((r) => {
+      const rAuthorId = r.author?.id || r.authorId || (r as any).author_id;
+      const rAuthorName = r.author?.name || '';
+      const isMyReport =
+        (rAuthorId && currentUser.id && String(rAuthorId) === String(currentUser.id)) ||
+        (!rAuthorId && rAuthorName && currentUser.name && rAuthorName.trim() === currentUser.name.trim());
+      if (!isMyReport) return false;
+
+      const rDate = String(r.date || (r as any).report_date || (r as any).reportDate || '').slice(0, 10);
+      if (rDate !== targetDateStr) return false;
+
+      const isMaintenance =
+        r.reportType === 'maintenance_daily' ||
+        (r as any).report_type === 'maintenance_daily' ||
+        Boolean((r as any).maintenanceData) ||
+        Boolean((r as any).maintenance_data) ||
+        Boolean((r as any).report_data?.maintenanceData) ||
+        Boolean((r as any).tasks?.includes('【保守点検】'));
+      return isMaintenance;
+    });
+  };
+
+  // 指定日付のスケジュールから作業行データを生成する共通ロジック（JST基準）
+  const buildScheduleImportedRows = (
+    targetDateStr: string
+  ): { status: 'no_events' | 'no_target_events' | 'ok'; rows?: MaintenanceWorkRow[]; count: number } => {
+    const viewStart = new Date(`${targetDateStr}T00:00:00+09:00`);
+    const viewEnd = new Date(`${targetDateStr}T23:59:59+09:00`);
 
     // 対象日付範囲で繰り返しイベント（定期点検・毎朝業務等）を展開
     const expanded = expandRecurringEvents(
@@ -1575,7 +1607,7 @@ export function MaintenanceDailyReportView({
       if (evStartLocalDate !== targetDateStr) return false;
 
       // 自分が参加メンバー(attendees)または作成者(createdBy)に含まれているかチェック
-      const isAttendee = ev.attendees && ev.attendees.some(a => 
+      const isAttendee = ev.attendees && ev.attendees.some(a =>
         a.id === currentUser.id || (a.name && currentUser.name && a.name.trim() === currentUser.name.trim())
       );
       const isCreator = ev.createdById === currentUser.id || ev.createdBy?.id === currentUser.id || ev.createdBy?.name === currentUser.name;
@@ -1584,8 +1616,7 @@ export function MaintenanceDailyReportView({
     });
 
     if (dayEvents.length === 0) {
-      alert(`${targetDateStr} のスケジュール（参加・担当予定）が見つかりませんでした。`);
-      return;
+      return { status: 'no_events', count: 0 };
     }
 
     // イベントからの自動セット (JST基準で正確な開始・終了時刻と作業時間を抽出)
@@ -1606,8 +1637,7 @@ export function MaintenanceDailyReportView({
       : dayEvents;
 
     if (targetEvents.length === 0) {
-      alert(`${targetDateStr} のスケジュールに「点検」「取替」「修理」に該当する予定が見つかりませんでした。`);
-      return;
+      return { status: 'no_target_events', count: 0 };
     }
 
     targetEvents.slice(0, 10).forEach((ev, idx) => {
@@ -1748,8 +1778,85 @@ export function MaintenanceDailyReportView({
       };
     });
 
-    setMainWorkRows(newRows);
-    alert(`${targetEvents.length} 件のスケジュールを自動取り込みしました！（様式: ${selectedOfficeName}）`);
+    return { status: 'ok', rows: newRows, count: targetEvents.length };
+  };
+
+  // 新規作成時、当日の日報・下書きが存在しない場合は自動で当日のスケジュールを取り込む
+  useEffect(() => {
+    if (report) return;
+    if (hasAutoImportedOnInitRef.current) return;
+    if (!isConfigReady || !isReportsReady) return;
+    if (!reportDate) return;
+    if (!calendarEvents || calendarEvents.length === 0) return;
+
+    const targetDateStr = reportDate.split('T')[0];
+
+    // 当日の本人分保守日報（提出済・確認済・下書き）がすでに存在する場合は自動取込をスキップ
+    if (hasExistingMaintenanceReportForDate(targetDateStr)) {
+      hasAutoImportedOnInitRef.current = true;
+      return;
+    }
+
+    // すでに行に入力がある場合は上書きしない
+    const hasAnyInput = mainWorkRows.some(r =>
+      Boolean(
+        r.siteName?.trim() ||
+        r.workDescription?.trim() ||
+        r.contentType ||
+        r.startTime ||
+        r.endTime ||
+        (r.inspectionCount && r.inspectionCount > 0) ||
+        (r.replacementCount && r.replacementCount > 0) ||
+        (r.oncallAmount && r.oncallAmount > 0)
+      )
+    );
+    if (hasAnyInput) {
+      hasAutoImportedOnInitRef.current = true;
+      return;
+    }
+
+    hasAutoImportedOnInitRef.current = true;
+    const result = buildScheduleImportedRows(targetDateStr);
+    if (result.status === 'ok' && result.rows && result.count > 0) {
+      setMainWorkRows(result.rows);
+      setAutoImportNotice(
+        `${targetDateStr} のスケジュールから ${result.count} 件を自動取り込みしました（様式: ${selectedOfficeName}）`
+      );
+    }
+  }, [
+    report,
+    isConfigReady,
+    isReportsReady,
+    reportDate,
+    calendarEvents,
+    effectiveAllReports,
+    currentOfficeConfig,
+    selectedOfficeName,
+    currentUser.id,
+    currentUser.name,
+  ]);
+
+  const handleAutoLoadSchedule = () => {
+    if (!reportDate) {
+      alert('日付を選択してください。');
+      return;
+    }
+
+    const targetDateStr = reportDate.split('T')[0];
+    const result = buildScheduleImportedRows(targetDateStr);
+
+    if (result.status === 'no_events') {
+      alert(`${targetDateStr} のスケジュール（参加・担当予定）が見つかりませんでした。`);
+      return;
+    }
+    if (result.status === 'no_target_events' || !result.rows) {
+      alert(`${targetDateStr} のスケジュールに「点検」「取替」「修理」に該当する予定が見つかりませんでした。`);
+      return;
+    }
+
+    setMainWorkRows(result.rows);
+    setAutoImportNotice(null);
+    alert(`${result.count} 件のスケジュールを自動取り込みしました！（様式: ${selectedOfficeName}）`);
   };
 
   // ---------------- 保存・提出処理 ----------------
@@ -2251,6 +2358,24 @@ export function MaintenanceDailyReportView({
       </div>
 
       <div className="max-w-7xl mx-auto px-2 sm:px-6 pt-4 space-y-4">
+        {/* 新規作成時のスケジュール自動取り込み通知バナー */}
+        {autoImportNotice && !isSubmittedMode && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-2.5 shadow-2xs flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-xs font-bold text-amber-900">
+              <Sparkles className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{autoImportNotice}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setAutoImportNotice(null)}
+              className="p-1 text-amber-600 hover:text-amber-800 hover:bg-amber-100 rounded-lg transition-colors cursor-pointer shrink-0"
+              aria-label="通知を閉じる"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
         {/* 差し戻し時の専用アラートバナー（コメント有無にかかわらず理由・状況を明確表示） */}
         {isRemanded && status === 'draft' && (
           <div className="bg-rose-50 border-2 border-rose-300 rounded-xl p-4 shadow-sm flex flex-wrap items-start justify-between gap-3 animate-in fade-in">

@@ -2119,6 +2119,204 @@ export function InspectionScheduler({
     setCurrentStep('completed');
   };
 
+  // ------------------------------------------
+  // 共通UIヘルパー: ステータスボタン群（Fax/Mail/Tel/貼紙/作業届/WEB入力）
+  // 未配置・仮配置・確定済（報告書受領済含む）のいずれでもクリック編集可能
+  // ------------------------------------------
+  const renderMetaStatusButtons = (item: InspectionItem, wrapperClassName = 'flex items-center gap-1 flex-wrap') => {
+    const hasAnyStatus =
+      (item.metaA?.faxStatus && item.metaA.faxStatus !== 'none') ||
+      (item.metaA?.mailStatus && item.metaA.mailStatus !== 'none') ||
+      (item.metaA?.telStatus && item.metaA.telStatus !== 'none') ||
+      (item.metaA?.posterType && item.metaA.posterType !== 'none') ||
+      (item.metaA?.workNoticeType && item.metaA.workNoticeType !== 'none') ||
+      (item.metaA?.webEntryType && item.metaA.webEntryType !== 'none');
+
+    if (!hasAnyStatus) return null;
+
+    return (
+      <div className={wrapperClassName} onMouseDown={(e) => e.stopPropagation()}>
+        {/* Faxボタン (必要:赤 -> 送付済:黄 -> 確定済:緑) */}
+        {item.metaA?.faxStatus && item.metaA.faxStatus !== 'none' && (
+          <button
+            type="button"
+            onClick={(e) => handleCycleFaxStatus(item.id, e)}
+            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
+              item.metaA.faxStatus === 'required'
+                ? 'bg-rose-600 text-white hover:bg-rose-700'
+                : item.metaA.faxStatus === 'sent'
+                ? 'bg-amber-400 text-slate-950 font-black hover:bg-amber-500'
+                : 'bg-emerald-600 text-white hover:bg-emerald-700'
+            }`}
+            title={`Fax: ${
+              item.metaA.faxStatus === 'required'
+                ? '必要(赤)'
+                : item.metaA.faxStatus === 'sent'
+                ? '送付済(黄)'
+                : '確定済(緑)'
+            } (クリックで切替)`}
+          >
+            Fax
+          </button>
+        )}
+
+        {/* Mailボタン (必要:赤 -> 送付済:黄 -> 確定済:緑) */}
+        {item.metaA?.mailStatus && item.metaA.mailStatus !== 'none' && (
+          <button
+            type="button"
+            onClick={(e) => handleCycleMailStatus(item.id, e)}
+            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
+              item.metaA.mailStatus === 'required'
+                ? 'bg-rose-600 text-white hover:bg-rose-700'
+                : item.metaA.mailStatus === 'sent'
+                ? 'bg-amber-400 text-slate-950 font-black hover:bg-amber-500'
+                : 'bg-emerald-600 text-white hover:bg-emerald-700'
+            }`}
+            title={`Mail: ${
+              item.metaA.mailStatus === 'required'
+                ? '必要(赤)'
+                : item.metaA.mailStatus === 'sent'
+                ? '送付済(黄)'
+                : '確定済(緑)'
+            } (クリックで切替)`}
+          >
+            Mail
+          </button>
+        )}
+
+        {/* Telボタン (必要:赤 -> 確認済:緑) */}
+        {item.metaA?.telStatus && item.metaA.telStatus !== 'none' && (
+          <button
+            type="button"
+            onClick={(e) => handleCycleTelStatus(item.id, e)}
+            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
+              item.metaA.telStatus === 'required'
+                ? 'bg-rose-600 text-white hover:bg-rose-700'
+                : 'bg-emerald-600 text-white hover:bg-emerald-700'
+            }`}
+            title={`Tel: ${item.metaA.telStatus === 'required' ? '必要(赤)' : '確認済(緑)'} (クリックで切替)`}
+          >
+            Tel
+          </button>
+        )}
+
+        {/* 貼紙ボタン (貼紙＋区分、クリックで未済:赤 ⇄ 済:濃い緑) */}
+        {item.metaA?.posterType && item.metaA.posterType !== 'none' && (() => {
+          const pType = item.metaA.posterType;
+          const label = pType === 'direct' ? '直接' : pType === 'mail' ? 'Mail' : pType === 'fax' ? 'Fax' : '郵送';
+          const isDone = Boolean(item.metaA.posterDone);
+          return (
+            <button
+              type="button"
+              onClick={(e) => handleTogglePosterDone(item.id, e)}
+              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-sky-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
+              title={`貼紙${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
+            >
+              <span className="px-1 py-0.5 bg-sky-100 text-sky-900 font-bold border-r border-sky-300">
+                貼紙
+              </span>
+              <span
+                className={`px-1.5 py-0.5 font-black transition-colors ${
+                  isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
+                }`}
+              >
+                {label}
+              </span>
+            </button>
+          );
+        })()}
+
+        {/* 作業届ボタン (作業届＋区分、クリックで未済:赤 ⇄ 済:濃い緑) */}
+        {item.metaA?.workNoticeType && item.metaA.workNoticeType !== 'none' && (() => {
+          const label = item.metaA.workNoticeType === 'mail' ? 'Mail' : 'Fax';
+          const isDone = Boolean(item.metaA.workNoticeDone);
+          return (
+            <button
+              type="button"
+              onClick={(e) => handleToggleWorkNoticeDone(item.id, e)}
+              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-indigo-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
+              title={`作業届${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
+            >
+              <span className="px-1 py-0.5 bg-indigo-100 text-indigo-900 font-bold border-r border-indigo-300">
+                作業届
+              </span>
+              <span
+                className={`px-1.5 py-0.5 font-black transition-colors ${
+                  isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
+                }`}
+              >
+                {label}
+              </span>
+            </button>
+          );
+        })()}
+
+        {/* WEB入力ボタン (WEB＋入力、クリックで未済:赤 ⇄ 済:濃い緑) */}
+        {item.metaA?.webEntryType && item.metaA.webEntryType !== 'none' && (() => {
+          const isDone = Boolean(item.metaA.webEntryDone);
+          return (
+            <button
+              type="button"
+              onClick={(e) => handleToggleWebEntryDone(item.id, e)}
+              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-purple-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
+              title={`WEB入力: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
+            >
+              <span className="px-1 py-0.5 bg-purple-100 text-purple-900 font-bold border-r border-purple-300">
+                WEB
+              </span>
+              <span
+                className={`px-1.5 py-0.5 font-black transition-colors ${
+                  isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
+                }`}
+              >
+                入力
+              </span>
+            </button>
+          );
+        })()}
+      </div>
+    );
+  };
+
+  // 共通UIヘルパー: 付箋風の備考欄（クリックで備考・全ステータス設定モーダルを開く）
+  const renderRemarksStickyNote = (item: InspectionItem, compact = false) => (
+    <div className={compact ? 'mt-1.5 flex justify-end' : 'mt-1 flex justify-end'}>
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => handleOpenMetaModal(item, e)}
+        className="relative group/note w-full bg-amber-100 hover:bg-amber-200 text-amber-950 px-2 py-1 rounded-md border border-amber-300 shadow-2xs transform rotate-0.5 hover:rotate-0 transition-all cursor-pointer"
+        title={
+          item.metaA?.remarks
+            ? `備考: ${item.metaA.remarks} (クリックで備考・ステータスを編集)`
+            : 'クリックして備考・全ステータス（Fax/Mail/Tel/貼紙/作業届/WEB入力）を変更'
+        }
+      >
+        <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-900 leading-tight">
+          <StickyNote className="w-3 h-3 text-amber-700 shrink-0" />
+          <span className="truncate">
+            {item.metaA?.remarks ? item.metaA.remarks : '＋ 備考・ステータス設定'}
+          </span>
+        </div>
+
+        {item.metaA?.remarks && (
+          <div className="hidden group-hover/note:block absolute bottom-full right-0 mb-1.5 z-30 w-64 max-w-xs p-2.5 bg-amber-950 text-amber-50 text-[11px] font-normal rounded-lg shadow-xl whitespace-normal break-words pointer-events-none animate-in fade-in zoom-in-95 duration-100">
+            <div className="font-bold text-amber-300 text-[10px] mb-1 flex items-center gap-1 border-b border-amber-800/80 pb-0.5">
+              <StickyNote className="w-3 h-3 text-amber-400 shrink-0" />
+              <span>備考メモ（全文）</span>
+            </div>
+            <div className="leading-relaxed whitespace-pre-wrap">{item.metaA.remarks}</div>
+            <div className="absolute top-full right-6 -mt-1 border-4 border-transparent border-t-amber-950" />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  // 詳細モーダル表示中の最新アイテム参照（ステータス・備考更新を即座に反映するため）
+  const activeDetailItem = detailModalItem
+    ? items.find((i) => i.id === detailModalItem.id) || detailModalItem
+    : null;
+
   return (
     <div className="w-full max-w-7xl mx-auto space-y-6 pb-12">
       {/* 画面ヘッダー */}
@@ -4099,6 +4297,30 @@ export function InspectionScheduler({
                                       {reg.quantity}台
                                     </span>
                                   </div>
+
+                                  {/* 確定済でもステータスボタン（Fax/Mail/Tel/貼紙/作業届/WEB入力）をクリック編集可能 */}
+                                  {renderMetaStatusButtons(reg, 'flex items-center gap-1 flex-wrap mt-1.5')}
+
+                                  {/* 客先規則 */}
+                                  {reg.customerRules && (
+                                    <div
+                                      className="relative group/rule text-[10px] text-amber-800 bg-amber-50/90 border border-amber-200/80 px-1.5 py-0.5 rounded mt-1 truncate font-medium cursor-help"
+                                      title={`客先規則: ${reg.customerRules}`}
+                                    >
+                                      <span className="font-bold text-amber-900">客先規則:</span> {reg.customerRules}
+
+                                      <div className="hidden group-hover/rule:block absolute bottom-full left-0 mb-1.5 z-30 w-64 max-w-xs p-2 bg-slate-900 text-white text-[11px] font-normal rounded-lg shadow-xl whitespace-normal break-words pointer-events-none animate-in fade-in zoom-in-95 duration-100">
+                                        <div className="font-bold text-amber-300 text-[10px] mb-0.5 flex items-center gap-1">
+                                          <span>客先規則（全文）</span>
+                                        </div>
+                                        {reg.customerRules}
+                                        <div className="absolute top-full left-4 -mt-1 border-4 border-transparent border-t-slate-900" />
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  {/* 確定済でも付箋クリックで備考・全ステータスを編集可能 */}
+                                  {renderRemarksStickyNote(reg)}
                                 </div>
 
                                 <div className="pt-2 border-t border-slate-200/60 flex items-center justify-between text-[10px] text-slate-600 gap-1 flex-wrap">
@@ -4594,7 +4816,7 @@ export function InspectionScheduler({
                             </div>
                           </td>
 
-                          {/* 地区 / 客先規則 */}
+                          {/* 地区 / 客先規則 / 備考・ステータス */}
                           <td className="py-3 px-3 align-top min-w-0">
                             <div className="text-slate-700 truncate font-medium" title={item.area ? `${item.area}${item.address ? ` (${item.address})` : ''}` : item.address}>
                               {item.area || item.address || '-'}
@@ -4604,6 +4826,8 @@ export function InspectionScheduler({
                                 規則: {item.customerRules}
                               </div>
                             )}
+                            {renderMetaStatusButtons(item, 'flex items-center gap-1 flex-wrap mt-1')}
+                            {renderRemarksStickyNote(item, true)}
                           </td>
 
                           {/* カレンダー参加メンバー (保守) */}
@@ -5157,7 +5381,7 @@ export function InspectionScheduler({
                                 </div>
                               </div>
 
-                              {/* 中段: 現場名 ＆ 区分・台数 */}
+                              {/* 中段: 現場名 ＆ 区分・台数 ＆ ステータス・備考 */}
                               <div>
                                 <h4
                                   className="text-xs font-bold text-slate-900 truncate"
@@ -5176,6 +5400,23 @@ export function InspectionScheduler({
                                   <span className="font-semibold text-slate-700">{item.quantity}台</span>
                                   {item.area && <span className="truncate max-w-[100px]">({item.area})</span>}
                                 </div>
+                                {renderMetaStatusButtons(item, 'flex items-center gap-1 flex-wrap mt-1.5')}
+                                {item.customerRules && (
+                                  <div
+                                    className="relative group/rule text-[10px] text-amber-800 bg-amber-50/90 border border-amber-200/80 px-1.5 py-0.5 rounded mt-1 truncate font-medium cursor-help"
+                                    title={`客先規則: ${item.customerRules}`}
+                                  >
+                                    <span className="font-bold text-amber-900">客先規則:</span> {item.customerRules}
+                                    <div className="hidden group-hover/rule:block absolute bottom-full left-0 mb-1.5 z-30 w-64 max-w-xs p-2 bg-slate-900 text-white text-[11px] font-normal rounded-lg shadow-xl whitespace-normal break-words pointer-events-none animate-in fade-in zoom-in-95 duration-100">
+                                      <div className="font-bold text-amber-300 text-[10px] mb-0.5 flex items-center gap-1">
+                                        <span>客先規則（全文）</span>
+                                      </div>
+                                      {item.customerRules}
+                                      <div className="absolute top-full left-4 -mt-1 border-4 border-transparent border-t-slate-900" />
+                                    </div>
+                                  </div>
+                                )}
+                                {renderRemarksStickyNote(item, true)}
                               </div>
 
                               {/* 下段: メンバー表示 ＆ クリックでメンバー増減ポップオーバー */}
@@ -5352,7 +5593,7 @@ export function InspectionScheduler({
       )}
 
       {/* 現場詳細ポップアップモーダル */}
-      {detailModalItem && (
+      {activeDetailItem && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl p-6 sm:p-7 max-w-lg w-full shadow-2xl space-y-4 animate-in fade-in zoom-in-95 duration-150 border border-slate-200 max-h-[90vh] overflow-y-auto">
             {/* ヘッダー */}
@@ -5363,11 +5604,11 @@ export function InspectionScheduler({
                 </div>
                 <div>
                   <h3 className="text-base font-black text-slate-900 leading-snug">
-                    {detailModalItem.siteName}
+                    {activeDetailItem.siteName}
                   </h3>
                   <div className="flex items-center gap-2 mt-0.5 text-xs text-slate-500 font-mono">
-                    <span>作業No: {detailModalItem.jobNo}</span>
-                    {detailModalItem.siteCode && <span>/ コード: {detailModalItem.siteCode}</span>}
+                    <span>作業No: {activeDetailItem.jobNo}</span>
+                    {activeDetailItem.siteCode && <span>/ コード: {activeDetailItem.siteCode}</span>}
                   </div>
                 </div>
               </div>
@@ -5383,12 +5624,12 @@ export function InspectionScheduler({
             {/* ステータスバナー */}
             <div className="flex items-center justify-between p-3 rounded-2xl border text-xs bg-slate-50/70 border-slate-200">
               <div className="flex items-center gap-2">
-                {isItemReportLocked(detailModalItem) ? (
+                {isItemReportLocked(activeDetailItem) ? (
                   <span className="px-2.5 py-1 bg-slate-200 text-slate-800 font-bold rounded-lg flex items-center gap-1.5 border border-slate-300">
                     <Lock className="w-3.5 h-3.5 text-slate-600" />
-                    🔒 点検報告書受領済（変更不可・完全ロック）
+                    🔒 点検報告書受領済（日程ロック・備考/ステータス編集可）
                   </span>
-                ) : detailModalItem.status === 'registered' ? (
+                ) : activeDetailItem.status === 'registered' ? (
                   <span className="px-2.5 py-1 bg-emerald-100 text-emerald-900 font-bold rounded-lg flex items-center gap-1.5 border border-emerald-300">
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
                     確定済 (再調整・移動可能)
@@ -5400,7 +5641,7 @@ export function InspectionScheduler({
                   </span>
                 )}
               </div>
-              <span className="font-bold text-slate-700">{detailModalItem.quantity}台</span>
+              <span className="font-bold text-slate-700">{activeDetailItem.quantity}台</span>
             </div>
 
             {/* 基本情報グリッド */}
@@ -5408,32 +5649,32 @@ export function InspectionScheduler({
               <div className="grid grid-cols-3 gap-2">
                 <span className="font-bold text-slate-500">点検予定日時:</span>
                 <span className="col-span-2 font-black text-indigo-950 font-mono">
-                  {detailModalItem.assignedDate || '未配置'} {detailModalItem.assignedStartTime || '09:00'} - {detailModalItem.assignedEndTime || '10:00'}
+                  {activeDetailItem.assignedDate || '未配置'} {activeDetailItem.assignedStartTime || '09:00'} - {activeDetailItem.assignedEndTime || '10:00'}
                 </span>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <span className="font-bold text-slate-500">作業名 (区分):</span>
                 <span className="col-span-2 font-bold text-slate-800">
-                  {detailModalItem.workName || '点検'}{detailModalItem.workCategory ? ` (${detailModalItem.workCategory})` : ''}
+                  {activeDetailItem.workName || '点検'}{activeDetailItem.workCategory ? ` (${activeDetailItem.workCategory})` : ''}
                 </span>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <span className="font-bold text-slate-500">地区 / 住所:</span>
                 <span className="col-span-2 text-slate-800 leading-relaxed">
-                  {detailModalItem.area ? `[${detailModalItem.area}] ` : ''}{detailModalItem.address || '-'}
+                  {activeDetailItem.area ? `[${activeDetailItem.area}] ` : ''}{activeDetailItem.address || '-'}
                 </span>
               </div>
               <div className="grid grid-cols-3 gap-2">
                 <span className="font-bold text-slate-500">客先規則:</span>
                 <span className="col-span-2 text-slate-800 leading-relaxed">
-                  {detailModalItem.customerRules || 'なし'}
+                  {activeDetailItem.customerRules || 'なし'}
                 </span>
               </div>
-              {detailModalItem.conditions && (
+              {activeDetailItem.conditions && (
                 <div className="grid grid-cols-3 gap-2">
                   <span className="font-bold text-slate-500">注意事項:</span>
                   <span className="col-span-2 text-amber-900 font-medium leading-relaxed">
-                    {detailModalItem.conditions}
+                    {activeDetailItem.conditions}
                   </span>
                 </div>
               )}
@@ -5441,7 +5682,7 @@ export function InspectionScheduler({
 
             {/* CRM物件マッピング情報（物件No・設置場所・型式） */}
             {(() => {
-              const matchedCrm = crmByJobNoMap.get(normalizeJobNo(detailModalItem.jobNo));
+              const matchedCrm = crmByJobNoMap.get(normalizeJobNo(activeDetailItem.jobNo));
               if (!matchedCrm || !matchedCrm.doors || matchedCrm.doors.length === 0) return null;
               return (
                 <div className="bg-teal-50/60 rounded-2xl p-3.5 border border-teal-200 space-y-2 text-xs">
@@ -5484,8 +5725,8 @@ export function InspectionScheduler({
             <div className="space-y-1.5">
               <span className="text-xs font-bold text-slate-700 block">担当メンバー:</span>
               <div className="flex items-center gap-1.5 flex-wrap">
-                {detailModalItem.assignedUsers && detailModalItem.assignedUsers.length > 0 ? (
-                  detailModalItem.assignedUsers.map((u) => (
+                {activeDetailItem.assignedUsers && activeDetailItem.assignedUsers.length > 0 ? (
+                  activeDetailItem.assignedUsers.map((u) => (
                     <span
                       key={u.id}
                       onClick={(e) => {
@@ -5505,50 +5746,57 @@ export function InspectionScheduler({
               </div>
             </div>
 
-            {/* 貼紙・作業届・WEB入力ステータス */}
-            <div className="grid grid-cols-3 gap-2 pt-2 border-t border-slate-100 text-xs">
-              <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-                <div className="text-[10px] font-bold text-slate-500 mb-1">貼紙</div>
-                <div className="font-bold text-slate-800">
-                  {detailModalItem.metaA?.posterType && detailModalItem.metaA.posterType !== 'none'
-                    ? `貼紙${
-                        detailModalItem.metaA.posterType === 'post' || detailModalItem.metaA.posterType === 'postal'
-                          ? '郵送'
-                          : detailModalItem.metaA.posterType === 'mail'
-                          ? 'Mail'
-                          : detailModalItem.metaA.posterType === 'fax'
-                          ? 'Fax'
-                          : '直接'
-                      } (${detailModalItem.metaA.posterDone ? '✓済' : '未済'})`
-                    : 'なし'}
-                </div>
+            {/* 備考・連絡/手配ステータス（確定済でも編集可能） */}
+            <div className="pt-3 border-t border-slate-100 space-y-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-slate-700 flex items-center gap-1.5">
+                  <StickyNote className="w-3.5 h-3.5 text-amber-600" />
+                  備考・連絡／手配ステータス
+                </span>
+                <button
+                  type="button"
+                  onClick={(e) => handleOpenMetaModal(activeDetailItem, e)}
+                  className="px-2.5 py-1 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 rounded-lg text-[11px] font-bold transition-colors cursor-pointer inline-flex items-center gap-1 whitespace-nowrap"
+                >
+                  <Edit3 className="w-3 h-3 text-amber-700" />
+                  <span>備考・ステータスを編集</span>
+                </button>
               </div>
-              <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-                <div className="text-[10px] font-bold text-slate-500 mb-1">作業届</div>
-                <div className="font-bold text-slate-800">
-                  {detailModalItem.metaA?.workNoticeType && detailModalItem.metaA.workNoticeType !== 'none'
-                    ? `${detailModalItem.metaA.workNoticeType.toUpperCase()} (${detailModalItem.metaA.workNoticeDone ? '✓済' : '未済'})`
-                    : 'なし'}
-                </div>
+
+              {/* クリックで備考モーダルを開く付箋欄 */}
+              <div
+                onClick={(e) => handleOpenMetaModal(activeDetailItem, e)}
+                className="bg-amber-50 hover:bg-amber-100/80 border border-amber-200 rounded-xl p-3 cursor-pointer transition-colors"
+                title="クリックして備考・全ステータスを編集"
+              >
+                <div className="text-[10px] font-bold text-amber-700 mb-1">備考メモ</div>
+                {activeDetailItem.metaA?.remarks ? (
+                  <div className="text-xs font-medium text-amber-950 whitespace-pre-wrap leading-relaxed">
+                    {activeDetailItem.metaA.remarks}
+                  </div>
+                ) : (
+                  <div className="text-xs text-amber-700/80 font-medium">
+                    備考は未設定です（クリックして入力）
+                  </div>
+                )}
               </div>
-              <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-                <div className="text-[10px] font-bold text-slate-500 mb-1">WEB入力</div>
-                <div className="font-bold text-slate-800">
-                  {detailModalItem.metaA?.webEntryType && detailModalItem.metaA.webEntryType !== 'none'
-                    ? `必要 (${detailModalItem.metaA.webEntryDone ? '✓済' : '未済'})`
-                    : 'なし'}
+
+              {/* クリックで即切替可能なステータスボタン群 */}
+              {renderMetaStatusButtons(activeDetailItem, 'flex items-center gap-1.5 flex-wrap') || (
+                <div className="text-[11px] text-slate-400">
+                  連絡・手配ステータス（Fax / Mail / Tel / 貼紙 / 作業届 / WEB入力）は未設定です
                 </div>
-              </div>
+              )}
             </div>
 
             {/* 操作・閉じるボタン */}
             <div className="flex items-center justify-between pt-3 border-t border-slate-100">
               <div>
-                {!isItemReportLocked(detailModalItem) && detailModalItem.status === 'registered' && (
+                {!isItemReportLocked(activeDetailItem) && activeDetailItem.status === 'registered' && (
                   <button
                     type="button"
                     onClick={() => {
-                      handleRevertToPlaced(detailModalItem.id);
+                      handleRevertToPlaced(activeDetailItem.id);
                       setDetailModalItem(null);
                     }}
                     className="px-3 py-1.5 text-xs font-bold text-rose-600 hover:bg-rose-50 rounded-xl transition-colors cursor-pointer border border-rose-200"
@@ -5733,7 +5981,7 @@ export function InspectionScheduler({
               setMetaModalItem(null);
             }
           }}
-          className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs z-50 flex items-center justify-center p-4"
+          className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs z-[60] flex items-center justify-center p-4"
         >
           <div className="bg-white rounded-3xl p-6 sm:p-7 max-w-lg w-full shadow-2xl space-y-5 animate-in fade-in zoom-in-95 duration-150 border border-slate-200">
             {/* モーダルヘッダー */}
