@@ -2410,7 +2410,7 @@ export function InspectionScheduler({
           <button
             type="button"
             onClick={(e) => handleCycleFaxStatus(item.id, e)}
-            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
+            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs whitespace-nowrap shrink-0 ${
               item.metaA.faxStatus === 'required'
                 ? 'bg-rose-600 text-white hover:bg-rose-700'
                 : item.metaA.faxStatus === 'sent'
@@ -2434,7 +2434,7 @@ export function InspectionScheduler({
           <button
             type="button"
             onClick={(e) => handleCycleMailStatus(item.id, e)}
-            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
+            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs whitespace-nowrap shrink-0 ${
               item.metaA.mailStatus === 'required'
                 ? 'bg-rose-600 text-white hover:bg-rose-700'
                 : item.metaA.mailStatus === 'sent'
@@ -2458,7 +2458,7 @@ export function InspectionScheduler({
           <button
             type="button"
             onClick={(e) => handleCycleTelStatus(item.id, e)}
-            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
+            className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs whitespace-nowrap shrink-0 ${
               item.metaA.telStatus === 'required'
                 ? 'bg-rose-600 text-white hover:bg-rose-700'
                 : 'bg-emerald-600 text-white hover:bg-emerald-700'
@@ -2478,14 +2478,14 @@ export function InspectionScheduler({
             <button
               type="button"
               onClick={(e) => handleTogglePosterDone(item.id, e)}
-              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-sky-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
+              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-sky-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all whitespace-nowrap shrink-0"
               title={`貼紙${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
             >
-              <span className="px-1 py-0.5 bg-sky-100 text-sky-900 font-bold border-r border-sky-300">
+              <span className="px-1 py-0.5 bg-sky-100 text-sky-900 font-bold border-r border-sky-300 whitespace-nowrap">
                 貼紙
               </span>
               <span
-                className={`px-1.5 py-0.5 font-black transition-colors ${
+                className={`px-1.5 py-0.5 font-black transition-colors whitespace-nowrap ${
                   isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
                 }`}
               >
@@ -2503,14 +2503,14 @@ export function InspectionScheduler({
             <button
               type="button"
               onClick={(e) => handleToggleWorkNoticeDone(item.id, e)}
-              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-indigo-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
+              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-indigo-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all whitespace-nowrap shrink-0"
               title={`作業届${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
             >
-              <span className="px-1 py-0.5 bg-indigo-100 text-indigo-900 font-bold border-r border-indigo-300">
+              <span className="px-1 py-0.5 bg-indigo-100 text-indigo-900 font-bold border-r border-indigo-300 whitespace-nowrap">
                 作業届
               </span>
               <span
-                className={`px-1.5 py-0.5 font-black transition-colors ${
+                className={`px-1.5 py-0.5 font-black transition-colors whitespace-nowrap ${
                   isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
                 }`}
               >
@@ -2527,14 +2527,14 @@ export function InspectionScheduler({
             <button
               type="button"
               onClick={(e) => handleToggleWebEntryDone(item.id, e)}
-              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-purple-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
+              className="inline-flex items-center rounded text-[9px] overflow-hidden border border-purple-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all whitespace-nowrap shrink-0"
               title={`WEB入力: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
             >
-              <span className="px-1 py-0.5 bg-purple-100 text-purple-900 font-bold border-r border-purple-300">
+              <span className="px-1 py-0.5 bg-purple-100 text-purple-900 font-bold border-r border-purple-300 whitespace-nowrap">
                 WEB
               </span>
               <span
-                className={`px-1.5 py-0.5 font-black transition-colors ${
+                className={`px-1.5 py-0.5 font-black transition-colors whitespace-nowrap ${
                   isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
                 }`}
               >
@@ -2547,39 +2547,53 @@ export function InspectionScheduler({
     );
   };
 
-  // 共通UIヘルパー: 付箋風の備考欄（クリックで備考・全ステータス設定モーダルを開く）
-  const renderRemarksStickyNote = (item: InspectionItem, compact = false) => (
-    <div className={compact ? 'mt-1.5 flex justify-end' : 'mt-1 flex justify-end'}>
-      <div
-        onMouseDown={(e) => e.stopPropagation()}
-        onClick={(e) => handleOpenMetaModal(item, e)}
-        className="relative group/note w-full bg-amber-100 hover:bg-amber-200 text-amber-950 px-2 py-1 rounded-md border border-amber-300 shadow-2xs transform rotate-0.5 hover:rotate-0 transition-all cursor-pointer"
-        title={
-          item.metaA?.remarks
-            ? `備考: ${item.metaA.remarks} (クリックで備考・ステータスを編集)`
-            : 'クリックして備考・全ステータス（Fax/Mail/Tel/貼紙/作業届/WEB入力）を変更'
-        }
-      >
-        <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-900 leading-tight">
-          <StickyNote className="w-3 h-3 text-amber-700 shrink-0" />
-          <span className="truncate">
-            {item.metaA?.remarks ? item.metaA.remarks : '＋ 備考・ステータス設定'}
-          </span>
-        </div>
+  // 共通UIヘルパー: 付箋風の備考欄（備考あり＝全幅付箋表示、未記入＝コンパクトな「アイコン＋」ボタン）
+  const renderRemarksStickyNote = (item: InspectionItem, compact = false) => {
+    const trimmedRemarks = item.metaA?.remarks?.trim() || '';
+    const hasRemarks = trimmedRemarks.length > 0;
 
-        {item.metaA?.remarks && (
+    if (!hasRemarks) {
+      return (
+        <div className={compact ? 'mt-1.5 flex justify-end' : 'mt-1 flex justify-end'}>
+          <button
+            type="button"
+            onMouseDown={(e) => e.stopPropagation()}
+            onClick={(e) => handleOpenMetaModal(item, e)}
+            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md bg-slate-50/90 hover:bg-amber-50 text-slate-400 hover:text-amber-700 border border-dashed border-slate-300 hover:border-amber-300 transition-colors cursor-pointer text-[10px] font-bold leading-none whitespace-nowrap"
+            title="クリックして備考・全ステータス（Fax/Mail/Tel/貼紙/作業届/WEB入力）を設定"
+          >
+            <StickyNote className="w-3 h-3 shrink-0" />
+            <span>＋</span>
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className={compact ? 'mt-1.5 flex justify-end' : 'mt-1 flex justify-end'}>
+        <div
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={(e) => handleOpenMetaModal(item, e)}
+          className="relative group/note w-full bg-amber-100 hover:bg-amber-200 text-amber-950 px-2 py-1 rounded-md border border-amber-300 shadow-2xs transform rotate-0.5 hover:rotate-0 transition-all cursor-pointer"
+          title={`備考: ${trimmedRemarks} (クリックで備考・ステータスを編集)`}
+        >
+          <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-900 leading-tight">
+            <StickyNote className="w-3 h-3 text-amber-700 shrink-0" />
+            <span className="truncate">{trimmedRemarks}</span>
+          </div>
+
           <div className="hidden group-hover/note:block absolute bottom-full right-0 mb-1.5 z-30 w-64 max-w-xs p-2.5 bg-amber-950 text-amber-50 text-[11px] font-normal rounded-lg shadow-xl whitespace-normal break-words pointer-events-none animate-in fade-in zoom-in-95 duration-100">
             <div className="font-bold text-amber-300 text-[10px] mb-1 flex items-center gap-1 border-b border-amber-800/80 pb-0.5">
               <StickyNote className="w-3 h-3 text-amber-400 shrink-0" />
               <span>備考メモ（全文）</span>
             </div>
-            <div className="leading-relaxed whitespace-pre-wrap">{item.metaA.remarks}</div>
+            <div className="leading-relaxed whitespace-pre-wrap">{trimmedRemarks}</div>
             <div className="absolute top-full right-6 -mt-1 border-4 border-transparent border-t-amber-950" />
           </div>
-        )}
+        </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   // 詳細モーダル表示中の最新アイテム参照（ステータス・備考更新を即座に反映するため）
   const activeDetailItem = detailModalItem
@@ -3532,129 +3546,8 @@ export function InspectionScheduler({
                                 )}
                               </div>
 
-                              {/* 右上: 「なし」以外のステータスボタン（Fax/Mail/Tel）＆済切替ボタン（貼紙/作業届/WEB入力） */}
-                              <div className="flex items-center gap-1 flex-wrap justify-end">
-                                {/* Faxボタン (必要:赤 -> 送付済:黄 -> 確定済:緑) */}
-                                {item.metaA?.faxStatus && item.metaA.faxStatus !== 'none' && (
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleCycleFaxStatus(item.id, e)}
-                                    className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
-                                      item.metaA.faxStatus === 'required'
-                                        ? 'bg-rose-600 text-white hover:bg-rose-700'
-                                        : item.metaA.faxStatus === 'sent'
-                                        ? 'bg-amber-400 text-slate-950 font-black hover:bg-amber-500'
-                                        : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                    }`}
-                                    title={`Fax: ${item.metaA.faxStatus === 'required' ? '必要(赤)' : item.metaA.faxStatus === 'sent' ? '送付済(黄)' : '確定済(緑)'} (クリックで切替)`}
-                                  >
-                                    Fax
-                                  </button>
-                                )}
-
-                                {/* Mailボタン (必要:赤 -> 送付済:黄 -> 確定済:緑) */}
-                                {item.metaA?.mailStatus && item.metaA.mailStatus !== 'none' && (
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleCycleMailStatus(item.id, e)}
-                                    className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
-                                      item.metaA.mailStatus === 'required'
-                                        ? 'bg-rose-600 text-white hover:bg-rose-700'
-                                        : item.metaA.mailStatus === 'sent'
-                                        ? 'bg-amber-400 text-slate-950 font-black hover:bg-amber-500'
-                                        : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                    }`}
-                                    title={`Mail: ${item.metaA.mailStatus === 'required' ? '必要(赤)' : item.metaA.mailStatus === 'sent' ? '送付済(黄)' : '確定済(緑)'} (クリックで切替)`}
-                                  >
-                                    Mail
-                                  </button>
-                                )}
-
-                                {/* Telボタン (必要:赤 -> 確認済:緑) */}
-                                {item.metaA?.telStatus && item.metaA.telStatus !== 'none' && (
-                                  <button
-                                    type="button"
-                                    onClick={(e) => handleCycleTelStatus(item.id, e)}
-                                    className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
-                                      item.metaA.telStatus === 'required'
-                                        ? 'bg-rose-600 text-white hover:bg-rose-700'
-                                        : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                    }`}
-                                    title={`Tel: ${item.metaA.telStatus === 'required' ? '必要(赤)' : '確認済(緑)'} (クリックで切替)`}
-                                  >
-                                    Tel
-                                  </button>
-                                )}
-
-                                {/* 貼紙ボタン (貼紙＋区分、クリックで未済:赤 ⇄ 済:濃い緑) */}
-                                {item.metaA?.posterType && item.metaA.posterType !== 'none' && (() => {
-                                  const pType = item.metaA.posterType;
-                                  const label = pType === 'direct' ? '直接' : pType === 'mail' ? 'Mail' : pType === 'fax' ? 'Fax' : '郵送';
-                                  const isDone = Boolean(item.metaA.posterDone);
-                                  return (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => handleTogglePosterDone(item.id, e)}
-                                      className="inline-flex items-center rounded text-[9px] overflow-hidden border border-sky-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
-                                      title={`貼紙${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
-                                    >
-                                      <span className="px-1 py-0.5 bg-sky-100 text-sky-900 font-bold border-r border-sky-300">
-                                        貼紙
-                                      </span>
-                                      <span className={`px-1.5 py-0.5 font-black transition-colors ${
-                                        isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
-                                      }`}>
-                                        {label}
-                                      </span>
-                                    </button>
-                                  );
-                                })()}
-
-                                {/* 作業届ボタン (作業届＋区分、クリックで未済:赤 ⇄ 済:濃い緑) */}
-                                {item.metaA?.workNoticeType && item.metaA.workNoticeType !== 'none' && (() => {
-                                  const label = item.metaA.workNoticeType === 'mail' ? 'Mail' : 'Fax';
-                                  const isDone = Boolean(item.metaA.workNoticeDone);
-                                  return (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => handleToggleWorkNoticeDone(item.id, e)}
-                                      className="inline-flex items-center rounded text-[9px] overflow-hidden border border-indigo-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
-                                      title={`作業届${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
-                                    >
-                                      <span className="px-1 py-0.5 bg-indigo-100 text-indigo-900 font-bold border-r border-indigo-300">
-                                        作業届
-                                      </span>
-                                      <span className={`px-1.5 py-0.5 font-black transition-colors ${
-                                        isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
-                                      }`}>
-                                        {label}
-                                      </span>
-                                    </button>
-                                  );
-                                })()}
-
-                                {/* WEB入力ボタン (WEB＋入力、クリックで未済:赤 ⇄ 済:濃い緑) */}
-                                {item.metaA?.webEntryType && item.metaA.webEntryType !== 'none' && (() => {
-                                  const isDone = Boolean(item.metaA.webEntryDone);
-                                  return (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => handleToggleWebEntryDone(item.id, e)}
-                                      className="inline-flex items-center rounded text-[9px] overflow-hidden border border-purple-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
-                                      title={`WEB入力: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
-                                    >
-                                      <span className="px-1 py-0.5 bg-purple-100 text-purple-900 font-bold border-r border-purple-300">
-                                        WEB
-                                      </span>
-                                      <span className={`px-1.5 py-0.5 font-black transition-colors ${
-                                        isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
-                                      }`}>
-                                        入力
-                                      </span>
-                                    </button>
-                                  );
-                                })()}
-                              </div>
+                              {/* 右上: ステータスボタン群（折り返し防止・共通ヘルパー使用） */}
+                              {renderMetaStatusButtons(item, 'flex items-center gap-1 flex-wrap justify-end')}
                             </div>
 
                             <h4 className="text-xs font-bold text-slate-900 group-hover:text-indigo-600 transition-colors">
@@ -3694,33 +3587,8 @@ export function InspectionScheduler({
                               </div>
                             )}
 
-                            {/* 付箋風の備考欄 (客先規則の真下に重なるように配置・ホバーで全文表示) */}
-                            <div className="mt-1 flex justify-end">
-                              <div
-                                onClick={(e) => handleOpenMetaModal(item, e)}
-                                className="relative group/note w-full bg-amber-100 hover:bg-amber-200 text-amber-950 px-2 py-1 rounded-md border border-amber-300 shadow-2xs transform rotate-0.5 hover:rotate-0 transition-all cursor-pointer"
-                                title={item.metaA?.remarks ? `備考: ${item.metaA.remarks}` : 'クリックして備考・全ステータス（Fax/Mail/Tell/貼紙/作業届/WEB入力）を変更'}
-                              >
-                                <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-900 leading-tight">
-                                  <StickyNote className="w-3 h-3 text-amber-700 shrink-0" />
-                                  <span className="truncate">
-                                    {item.metaA?.remarks ? item.metaA.remarks : '＋ 備考・ステータス設定'}
-                                  </span>
-                                </div>
-
-                                {/* マウスホバーで全文表示する吹き出し */}
-                                {item.metaA?.remarks && (
-                                  <div className="hidden group-hover/note:block absolute bottom-full right-0 mb-1.5 z-30 w-64 max-w-xs p-2.5 bg-amber-950 text-amber-50 text-[11px] font-normal rounded-lg shadow-xl whitespace-normal break-words pointer-events-none animate-in fade-in zoom-in-95 duration-100">
-                                    <div className="font-bold text-amber-300 text-[10px] mb-1 flex items-center gap-1 border-b border-amber-800/80 pb-0.5">
-                                      <StickyNote className="w-3 h-3 text-amber-400 shrink-0" />
-                                      <span>備考メモ（全文）</span>
-                                    </div>
-                                    <div className="leading-relaxed whitespace-pre-wrap">{item.metaA.remarks}</div>
-                                    <div className="absolute top-full right-6 -mt-1 border-4 border-transparent border-t-amber-950" />
-                                  </div>
-                                )}
-                              </div>
-                            </div>
+                            {/* 付箋風の備考欄 (備考あり＝全幅付箋、未記入＝コンパクトボタン) */}
+                            {renderRemarksStickyNote(item)}
                           </div>
                         </div>
 
@@ -4073,131 +3941,7 @@ export function InspectionScheduler({
                                         {isEditingTime && renderTimePickerPopover(placed, '時間帯・時間変更')}
                                       </div>
 
-                                      <div className="flex items-center gap-1">
-                                        {/* 右上: 「なし」以外のステータスボタン（Fax/Mail/Tel）＆済切替ボタン（貼紙/作業届/WEB入力） */}
-                                        <div className="flex items-center gap-1 flex-wrap justify-end">
-                                          {/* Faxボタン (必要:赤 -> 送付済:黄 -> 確定済:緑) */}
-                                          {placed.metaA?.faxStatus && placed.metaA.faxStatus !== 'none' && (
-                                            <button
-                                              type="button"
-                                              onClick={(e) => handleCycleFaxStatus(placed.id, e)}
-                                              className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
-                                                placed.metaA.faxStatus === 'required'
-                                                  ? 'bg-rose-600 text-white hover:bg-rose-700'
-                                                  : placed.metaA.faxStatus === 'sent'
-                                                  ? 'bg-amber-400 text-slate-950 font-black hover:bg-amber-500'
-                                                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                              }`}
-                                              title={`Fax: ${placed.metaA.faxStatus === 'required' ? '必要(赤)' : placed.metaA.faxStatus === 'sent' ? '送付済(黄)' : '確定済(緑)'} (クリックで切替)`}
-                                            >
-                                              Fax
-                                            </button>
-                                          )}
-
-                                          {/* Mailボタン (必要:赤 -> 送付済:黄 -> 確定済:緑) */}
-                                          {placed.metaA?.mailStatus && placed.metaA.mailStatus !== 'none' && (
-                                            <button
-                                              type="button"
-                                              onClick={(e) => handleCycleMailStatus(placed.id, e)}
-                                              className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
-                                                placed.metaA.mailStatus === 'required'
-                                                  ? 'bg-rose-600 text-white hover:bg-rose-700'
-                                                  : placed.metaA.mailStatus === 'sent'
-                                                  ? 'bg-amber-400 text-slate-950 font-black hover:bg-amber-500'
-                                                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                              }`}
-                                              title={`Mail: ${placed.metaA.mailStatus === 'required' ? '必要(赤)' : '送付済(黄)'} (クリックで切替)`}
-                                            >
-                                              Mail
-                                            </button>
-                                          )}
-
-                                          {/* Telボタン (必要:赤 -> 確認済:緑) */}
-                                          {placed.metaA?.telStatus && placed.metaA.telStatus !== 'none' && (
-                                            <button
-                                              type="button"
-                                              onClick={(e) => handleCycleTelStatus(placed.id, e)}
-                                              className={`px-1.5 py-0.5 rounded text-[9px] font-black tracking-tighter cursor-pointer transition-all shadow-2xs ${
-                                                placed.metaA.telStatus === 'required'
-                                                  ? 'bg-rose-600 text-white hover:bg-rose-700'
-                                                  : 'bg-emerald-600 text-white hover:bg-emerald-700'
-                                              }`}
-                                              title={`Tel: ${placed.metaA.telStatus === 'required' ? '必要(赤)' : '確認済(緑)'} (クリックで切替)`}
-                                            >
-                                              Tel
-                                            </button>
-                                          )}
-
-                                          {/* 貼紙ボタン (貼紙＋区分、クリックで未済:赤 ⇄ 済:濃い緑) */}
-                                          {placed.metaA?.posterType && placed.metaA.posterType !== 'none' && (() => {
-                                            const pType = placed.metaA.posterType;
-                                            const label = pType === 'direct' ? '直接' : pType === 'mail' ? 'Mail' : pType === 'fax' ? 'Fax' : '郵送';
-                                            const isDone = Boolean(placed.metaA.posterDone);
-                                            return (
-                                              <button
-                                                type="button"
-                                                onClick={(e) => handleTogglePosterDone(placed.id, e)}
-                                                className="inline-flex items-center rounded text-[9px] overflow-hidden border border-sky-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
-                                                title={`貼紙${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
-                                              >
-                                                <span className="px-1 py-0.5 bg-sky-100 text-sky-900 font-bold border-r border-sky-300">
-                                                  貼紙
-                                                </span>
-                                                <span className={`px-1.5 py-0.5 font-black transition-colors ${
-                                                  isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
-                                                }`}>
-                                                  {label}
-                                                </span>
-                                              </button>
-                                            );
-                                          })()}
-
-                                          {/* 作業届ボタン (作業届＋区分、クリックで未済:赤 ⇄ 済:濃い緑) */}
-                                          {placed.metaA?.workNoticeType && placed.metaA.workNoticeType !== 'none' && (() => {
-                                            const label = placed.metaA.workNoticeType === 'mail' ? 'Mail' : 'Fax';
-                                            const isDone = Boolean(placed.metaA.workNoticeDone);
-                                            return (
-                                              <button
-                                                type="button"
-                                                onClick={(e) => handleToggleWorkNoticeDone(placed.id, e)}
-                                                className="inline-flex items-center rounded text-[9px] overflow-hidden border border-indigo-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
-                                                title={`作業届${label}: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
-                                              >
-                                                <span className="px-1 py-0.5 bg-indigo-100 text-indigo-900 font-bold border-r border-indigo-300">
-                                                  作業届
-                                                </span>
-                                                <span className={`px-1.5 py-0.5 font-black transition-colors ${
-                                                  isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
-                                                }`}>
-                                                  {label}
-                                                </span>
-                                              </button>
-                                            );
-                                          })()}
-
-                                          {/* WEB入力ボタン (WEB＋入力、クリックで未済:赤 ⇄ 済:濃い緑) */}
-                                          {placed.metaA?.webEntryType && placed.metaA.webEntryType !== 'none' && (() => {
-                                            const isDone = Boolean(placed.metaA.webEntryDone);
-                                            return (
-                                              <button
-                                                type="button"
-                                                onClick={(e) => handleToggleWebEntryDone(placed.id, e)}
-                                                className="inline-flex items-center rounded text-[9px] overflow-hidden border border-purple-300 shadow-2xs cursor-pointer select-none hover:opacity-90 transition-all"
-                                                title={`WEB入力: ${isDone ? '済(濃緑)' : '未済(赤)'} (クリックで済/未済を切替)`}
-                                              >
-                                                <span className="px-1 py-0.5 bg-purple-100 text-purple-900 font-bold border-r border-purple-300">
-                                                  WEB
-                                                </span>
-                                                <span className={`px-1.5 py-0.5 font-black transition-colors ${
-                                                  isDone ? 'bg-emerald-700 text-white' : 'bg-rose-600 text-white'
-                                                }`}>
-                                                  入力
-                                                </span>
-                                              </button>
-                                            );
-                                          })()}
-                                        </div>
-
+                                      <div className="flex items-center gap-0.5 shrink-0">
                                         {/* 現場カード複製ボタン */}
                                         <button
                                           type="button"
@@ -4205,7 +3949,7 @@ export function InspectionScheduler({
                                             e.stopPropagation();
                                             handleDuplicateItem(placed);
                                           }}
-                                          className="text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 p-1 rounded-md transition-colors cursor-pointer ml-1"
+                                          className="text-slate-300 hover:text-indigo-600 hover:bg-indigo-50 p-1 rounded-md transition-colors cursor-pointer"
                                           title="この現場カードを複製（コピー）"
                                         >
                                           <Copy className="w-3.5 h-3.5" />
@@ -4247,6 +3991,9 @@ export function InspectionScheduler({
                                       </span>
                                     </div>
 
+                                    {/* ステータスボタン群（Fax/Mail/Tel/貼紙/作業届/WEB入力・横一列に崩れず配置） */}
+                                    {renderMetaStatusButtons(placed, 'flex items-center gap-1 flex-wrap mt-1.5')}
+
                                     {/* 客先規則 */}
                                     {placed.customerRules && (
                                       <div
@@ -4266,33 +4013,8 @@ export function InspectionScheduler({
                                       </div>
                                     )}
 
-                                    {/* 付箋風の備考欄 (客先規則の真下に重なるように配置・ホバーで全文表示) */}
-                                    <div className="mt-1 flex justify-end">
-                                      <div
-                                        onClick={(e) => handleOpenMetaModal(placed, e)}
-                                        className="relative group/note w-full bg-amber-100 hover:bg-amber-200 text-amber-950 px-2 py-1 rounded-md border border-amber-300 shadow-2xs transform rotate-0.5 hover:rotate-0 transition-all cursor-pointer"
-                                        title={placed.metaA?.remarks ? `備考: ${placed.metaA.remarks}` : 'クリックして備考・全ステータス（Fax/Mail/Tell/貼紙/作業届/WEB入力）を変更'}
-                                      >
-                                        <div className="flex items-center gap-1.5 text-[10px] font-bold text-amber-900 leading-tight">
-                                          <StickyNote className="w-3 h-3 text-amber-700 shrink-0" />
-                                          <span className="truncate">
-                                            {placed.metaA?.remarks ? placed.metaA.remarks : '＋ 備考・ステータス設定'}
-                                          </span>
-                                        </div>
-
-                                        {/* マウスホバーで全文表示する吹き出し */}
-                                        {placed.metaA?.remarks && (
-                                          <div className="hidden group-hover/note:block absolute bottom-full right-0 mb-1.5 z-30 w-64 max-w-xs p-2.5 bg-amber-950 text-amber-50 text-[11px] font-normal rounded-lg shadow-xl whitespace-normal break-words pointer-events-none animate-in fade-in zoom-in-95 duration-100">
-                                            <div className="font-bold text-amber-300 text-[10px] mb-1 flex items-center gap-1 border-b border-amber-800/80 pb-0.5">
-                                              <StickyNote className="w-3 h-3 text-amber-400 shrink-0" />
-                                              <span>備考メモ（全文）</span>
-                                            </div>
-                                            <div className="leading-relaxed whitespace-pre-wrap">{placed.metaA.remarks}</div>
-                                            <div className="absolute top-full right-6 -mt-1 border-4 border-transparent border-t-amber-950" />
-                                          </div>
-                                        )}
-                                      </div>
-                                    </div>
+                                    {/* 付箋風の備考欄 (備考あり＝全幅付箋、未記入＝コンパクトボタン) */}
+                                    {renderRemarksStickyNote(placed)}
                                   </div>
                                 </div>
                               );

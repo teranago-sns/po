@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.27.6',
+  version: '2026.11.27.8',
   date: '2026-11-27',
-  releaseNumber: 6,
+  releaseNumber: 8,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.27 #6 (JST)',
-  description: '点検予定管理に時間帯区分（時間指定・未定・AM・PM）を追加し、カレンダー登録時刻（未定/AM=9:00〜10:00、PM=13:00〜14:00）と現場マスター保存に対応'
+  display: 'v2026.11.27 #8 (JST)',
+  description: '点検予定カードの未記入備考欄をコンパクトな「付箋アイコン＋」ボタンに縮小し、備考記入済みカードを一目で判別できるよう改善'
 } as const;
