@@ -4,10 +4,10 @@
  * その日の何番目のバージョンかを示すデイリー番号 (#1, #2, ...) を更新してください。
  */
 export const APP_VERSION = {
-  version: '2026.11.27.1',
+  version: '2026.11.27.2',
   date: '2026-11-27',
-  releaseNumber: 1,
+  releaseNumber: 2,
   timeZone: 'Asia/Tokyo (JST)',
-  display: 'v2026.11.27 #1 (JST)',
-  description: '各建具（主要部品）の真下に該当建具の付属部品トグル・展開表示を配置し、建具符号なし・EG対象外の付属部品を下部一覧へ集約'
+  display: 'v2026.11.27 #2 (JST)',
+  description: '個人設定・プッシュ通知設定モーダルを画面遷移せず現在表示中の画面上へポップアップ表示できるよう改修'
 } as const;

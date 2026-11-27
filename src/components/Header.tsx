@@ -76,7 +76,7 @@ interface HeaderProps {
   projectTasks?: ProjectNotificationCard[];
   userRespondedSafetyEventIds?: string[];
   onSelectTab?: (tab: AppTab) => void;
-  onOpenSettings?: () => void;
+  onOpenSettings?: (options?: { focusSection?: 'push' | 'emergency' }) => void;
   onNavigateToContent?: (target: {
     tab: AppTab;
     topicId?: string;
@@ -2377,7 +2377,7 @@ export function Header({
                       type="button"
                       onClick={() => {
                         setIsOpen(false);
-                        onOpenSettings();
+                        onOpenSettings({ focusSection: 'push' });
                       }}
                       className="w-full py-0.5 px-2 text-[10.5px] font-medium text-indigo-600 hover:text-indigo-800 hover:bg-indigo-50 rounded-md transition-colors flex items-center justify-center gap-1"
                     >

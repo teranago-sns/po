@@ -39,6 +39,7 @@ const FileManager = lazyWithRetry(() => import('./components/FileManager'));
 const DocumentManager = lazyWithRetry(() => import('./components/DocumentManager'));
 const PhotoReportsTab = lazyWithRetry(() => import('./components/PhotoReportsTab').then(m => ({ default: m.PhotoReportsTab })));
 import { SchedulePollModal } from './components/SchedulePollModal';
+import { PersonalSettingsModal, PersonalSettingsFocusSection } from './components/PersonalSettingsModal';
 import { SchedulePoll } from './types/schedulePoll';
 import { Post, CalendarEvent, WorkflowApplication, User, OfficeMaster, DivisionMaster, PositionMaster, BoardTopic, ChatRoom, ApprovalFlowRule, ApprovalStepConfig, ItemMaster, ApplicationStatus, DailyReport, Memo, SafetyConfirmationEvent, SafetyConfirmationResponse } from './types';
 import { 
@@ -808,16 +809,21 @@ export default function App() {
       setIsUtilityOpen(!!userState.preferences.isUtilityOpen);
     }
   }, [userState?.id, userState?.preferences?.isUtilityOpen]);
-  const [autoOpenSettings, setAutoOpenSettings] = useState(() => {
+  const [isPersonalSettingsOpen, setIsPersonalSettingsOpen] = useState(() => {
     return !!(initialUrlParams.openSettings || initialUrlParams.openEmergencyContact);
   });
-  const [autoOpenEmergencyContact, setAutoOpenEmergencyContact] = useState(() => {
-    return !!initialUrlParams.openEmergencyContact;
+  const [personalSettingsFocusSection, setPersonalSettingsFocusSection] = useState<PersonalSettingsFocusSection>(() => {
+    return initialUrlParams.openEmergencyContact ? 'emergency' : null;
   });
 
-  const handleOpenPersonalSettings = () => {
-    setActiveTab('mypage');
-    setAutoOpenSettings(true);
+  const handleOpenPersonalSettings = (options?: { focusSection?: 'push' | 'emergency' }) => {
+    setPersonalSettingsFocusSection(options?.focusSection ?? null);
+    setIsPersonalSettingsOpen(true);
+  };
+
+  const handleClosePersonalSettings = () => {
+    setIsPersonalSettingsOpen(false);
+    setPersonalSettingsFocusSection(null);
   };
 
   const handleRecordError = useCallback((key: string, message: string) => {
@@ -4704,10 +4710,6 @@ export default function App() {
               onLogout={handleLogout}
               impersonatorAdmin={impersonatorAdmin}
               onRevertToAdmin={handleRevertToAdmin}
-              autoOpenSettings={autoOpenSettings}
-              onCloseSettings={() => setAutoOpenSettings(false)}
-              autoOpenEmergencyContact={autoOpenEmergencyContact}
-              onCloseEmergencyContact={() => setAutoOpenEmergencyContact(false)}
               onAddEvent={handleAddEvent}
               onUpdateEvent={handleUpdateEvent}
               onDeleteEvent={handleDeleteEvent}
@@ -4959,6 +4961,24 @@ export default function App() {
           onEventCreated={refetchEvents}
           initialPollId={initialSchedulePollId}
           onPollChange={refetchSchedulePolls}
+        />
+      )}
+
+      {/* グローバル個人設定・プッシュ通知・カレンダー同期モーダル（現在表示中の画面上にポップアップ表示） */}
+      {userState && (
+        <PersonalSettingsModal
+          isOpen={isPersonalSettingsOpen}
+          onClose={handleClosePersonalSettings}
+          user={userState}
+          offices={offices}
+          divisions={divisions}
+          positions={positions}
+          allUsers={usersList}
+          onUpdateUser={handleUpdateUser}
+          onLogout={handleLogout}
+          impersonatorAdmin={impersonatorAdmin}
+          onRevertToAdmin={handleRevertToAdmin}
+          initialFocusSection={personalSettingsFocusSection}
         />
       )}
     </div>
